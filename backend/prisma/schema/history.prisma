@@ -1,0 +1,29 @@
+model ApprovalHistory {
+  id             String           @id @default(uuid()) @db.Uuid
+  application_id String           @db.Uuid
+  approver_id    String           @db.Uuid
+  decision       ApprovalDecision
+  comments       String?
+  decision_date  DateTime
+  created_at     DateTime         @default(now())
+
+  application PolicyApplication @relation(fields: [application_id], references: [id])
+  approver    User              @relation(fields: [approver_id], references: [id])
+
+  @@index([application_id])
+}
+
+model CancellationHistory {
+  id            String               @id @default(uuid()) @db.Uuid
+  policy_id     String               @db.Uuid
+  approver_id   String               @db.Uuid
+  decision      CancellationDecision
+  comments      String?
+  decision_date DateTime
+  created_at    DateTime             @default(now())
+
+  policy   Policy @relation(fields: [policy_id], references: [id])
+  approver User   @relation(fields: [approver_id], references: [id])
+
+  @@index([policy_id])
+}

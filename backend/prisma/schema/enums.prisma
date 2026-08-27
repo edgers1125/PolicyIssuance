@@ -1,0 +1,59 @@
+enum UserStatus {
+  AWAITING_EMAIL_VERIFICATION
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+enum RecordStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum CustomerStatus {
+  ACTIVE
+  INACTIVE
+  BLACKLISTED
+}
+
+enum AddressType {
+  RESIDENTIAL
+  OFFICE
+  WAREHOUSE
+  BRANCH
+  RISK_LOCATION
+}
+
+enum InsuredType {
+  INDIVIDUAL
+  CORPORATE
+}
+
+enum ApplicationStatus {
+  DRAFT
+  SUBMITTED
+  FOR_EDIT_MANAGER
+  FOR_EDIT_UNDERWRITING
+  PENDING_MANAGER_APPROVAL
+  PENDING_UNDERWRITING_APPROVAL
+  APPROVED
+  REJECTED
+}
+
+enum PolicyStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+  LAPSED
+}
+
+enum ApprovalDecision {
+  APPROVED
+  REJECTED
+  RETURNED_FOR_EDIT
+}
+
+enum CancellationDecision {
+  APPROVED
+  REJECTED
+}

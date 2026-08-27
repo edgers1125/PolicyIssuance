@@ -1,0 +1,75 @@
+model PolicyApplication {
+  id                    String            @id @default(uuid()) @db.Uuid
+  insured_type          InsuredType
+  application_number    String            @unique @db.VarChar(50)
+  customer_id           String?           @db.Uuid
+  company_id            String?           @db.Uuid
+  company_name_snapshot String?           @db.VarChar(255)
+  agent_id              String            @db.Uuid
+  agent_name_snapshot   String?           @db.VarChar(255)
+  product_variant_id    String            @db.Uuid
+  coverage_start_at     DateTime
+  coverage_end_at       DateTime
+  application_date      DateTime          @db.Date
+  submission_date       DateTime?         @db.Date
+  status                ApplicationStatus
+  remarks               String?
+  document_folder_name  String?           @db.VarChar(255)
+  created_at            DateTime          @default(now())
+  updated_at            DateTime          @updatedAt
+
+  customer        Customer?      @relation(fields: [customer_id], references: [id])
+  company         Company?       @relation(fields: [company_id], references: [id])
+  agent           Agent          @relation(fields: [agent_id], references: [id])
+  product_variant ProductVariant @relation(fields: [product_variant_id], references: [id])
+
+  vehicles         PolicyApplicationVehicle[]
+  addresses        PolicyApplicationAddress[]
+  coverages        ApplicationCoverage[]
+  approval_history ApprovalHistory[]
+  policy           Policy?
+
+  @@index([status])
+  @@index([customer_id])
+  @@index([company_id])
+  @@index([agent_id])
+}
+
+model PolicyApplicationVehicle {
+  id                    String   @id @default(uuid()) @db.Uuid
+  policy_application_id String   @db.Uuid
+  vehicle_id            String   @db.Uuid
+  created_at            DateTime @default(now())
+
+  policy_application PolicyApplication @relation(fields: [policy_application_id], references: [id])
+  vehicle            Vehicle           @relation(fields: [vehicle_id], references: [id])
+
+  @@index([policy_application_id])
+}
+
+model PolicyApplicationAddress {
+  id                    String   @id @default(uuid()) @db.Uuid
+  policy_application_id String   @db.Uuid
+  address_id            String   @db.Uuid
+  created_at            DateTime @default(now())
+
+  policy_application PolicyApplication @relation(fields: [policy_application_id], references: [id])
+  address            Address           @relation(fields: [address_id], references: [id])
+
+  @@index([policy_application_id])
+}
+
+model ApplicationCoverage {
+  id              String   @id @default(uuid()) @db.Uuid
+  application_id  String   @db.Uuid
+  coverage_id     String   @db.Uuid
+  coverage_amount Decimal  @db.Decimal(18, 2)
+  premium_amount  Decimal  @db.Decimal(18, 2)
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  application PolicyApplication @relation(fields: [application_id], references: [id])
+  coverage    ProductCoverage   @relation(fields: [coverage_id], references: [id])
+
+  @@index([application_id])
+}

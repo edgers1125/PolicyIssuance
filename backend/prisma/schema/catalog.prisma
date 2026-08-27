@@ -1,0 +1,46 @@
+model InsuranceClass {
+  id          String       @id @default(uuid()) @db.Uuid
+  class_name  String       @unique @db.VarChar(100)
+  description String?
+  status      RecordStatus
+  created_at  DateTime     @default(now())
+  updated_at  DateTime     @updatedAt
+
+  product_variants ProductVariant[]
+}
+
+model ProductVariant {
+  id                 String       @id @default(uuid()) @db.Uuid
+  insurance_class_id String       @db.Uuid
+  variant_code       String       @unique @db.VarChar(50)
+  variant_name       String       @db.VarChar(255)
+  description        String?
+  status             RecordStatus
+  created_at         DateTime     @default(now())
+  updated_at         DateTime     @updatedAt
+
+  insurance_class     InsuranceClass      @relation(fields: [insurance_class_id], references: [id])
+  product_coverages   ProductCoverage[]
+  policy_applications PolicyApplication[]
+  policies            Policy[]
+
+  @@index([insurance_class_id])
+}
+
+model ProductCoverage {
+  id                 String       @id @default(uuid()) @db.Uuid
+  product_variant_id String       @db.Uuid
+  coverage_code      String       @unique @db.VarChar(50)
+  coverage_name      String       @db.VarChar(255)
+  maximum_coverage   Decimal      @db.Decimal(18, 2)
+  status             RecordStatus
+  created_at         DateTime     @default(now())
+  updated_at         DateTime     @updatedAt
+
+  product_variant       ProductVariant        @relation(fields: [product_variant_id], references: [id])
+  agent_netrates        AgentNetrate[]
+  application_coverages ApplicationCoverage[]
+  policy_coverages      PolicyCoverage[]
+
+  @@index([product_variant_id])
+}

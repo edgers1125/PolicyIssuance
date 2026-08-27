@@ -1,0 +1,95 @@
+model Address {
+  id                String      @id @default(uuid()) @db.Uuid
+  address_line_1    String      @db.VarChar(255)
+  address_line_2    String?     @db.VarChar(255)
+  barangay          String?     @db.VarChar(100)
+  city              String?     @db.VarChar(100)
+  province          String?     @db.VarChar(100)
+  postal_code       String?     @db.VarChar(20)
+  country           String?     @db.VarChar(100)
+  latitude          Decimal?    @db.Decimal(10, 7)
+  longitude         Decimal?    @db.Decimal(10, 7)
+  google_place_id   String?     @db.VarChar(255)
+  formatted_address String?
+  address_type      AddressType
+  created_at        DateTime    @default(now())
+  updated_at        DateTime    @updatedAt
+
+  customer_addresses           CustomerAddress[]
+  company_addresses            CompanyAddress[]
+  policy_application_addresses PolicyApplicationAddress[]
+  policy_addresses             PolicyAddress[]
+}
+
+model CustomerAddress {
+  id          String   @id @default(uuid()) @db.Uuid
+  customer_id String   @db.Uuid
+  address_id  String   @db.Uuid
+  is_primary  Boolean  @default(false)
+  created_at  DateTime @default(now())
+
+  customer Customer @relation(fields: [customer_id], references: [id])
+  address  Address  @relation(fields: [address_id], references: [id])
+
+  @@index([customer_id])
+}
+
+model CompanyAddress {
+  id         String   @id @default(uuid()) @db.Uuid
+  company_id String   @db.Uuid
+  address_id String   @db.Uuid
+  is_primary Boolean  @default(false)
+  created_at DateTime @default(now())
+
+  company Company @relation(fields: [company_id], references: [id])
+  address Address @relation(fields: [address_id], references: [id])
+
+  @@index([company_id])
+}
+
+model Vehicle {
+  id             String   @id @default(uuid()) @db.Uuid
+  plate_number   String?  @db.VarChar(50)
+  engine_number  String   @unique @db.VarChar(100)
+  chassis_number String   @unique @db.VarChar(100)
+  make           String?  @db.VarChar(100)
+  model          String?  @db.VarChar(100)
+  year_model     Int?
+  vehicle_type   String?  @db.VarChar(50)
+  color          String?  @db.VarChar(50)
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  customer_vehicles           CustomerVehicle[]
+  company_vehicles            CompanyVehicle[]
+  policy_application_vehicles PolicyApplicationVehicle[]
+  policy_vehicles             PolicyVehicle[]
+}
+
+model CustomerVehicle {
+  id                   String    @id @default(uuid()) @db.Uuid
+  customer_id          String    @db.Uuid
+  vehicle_id           String    @db.Uuid
+  ownership_start_date DateTime? @db.Date
+  ownership_end_date   DateTime? @db.Date
+  created_at           DateTime  @default(now())
+
+  customer Customer @relation(fields: [customer_id], references: [id])
+  vehicle  Vehicle  @relation(fields: [vehicle_id], references: [id])
+
+  @@index([customer_id])
+}
+
+model CompanyVehicle {
+  id                   String    @id @default(uuid()) @db.Uuid
+  company_id           String    @db.Uuid
+  vehicle_id           String    @db.Uuid
+  ownership_start_date DateTime? @db.Date
+  ownership_end_date   DateTime? @db.Date
+  created_at           DateTime  @default(now())
+
+  company Company @relation(fields: [company_id], references: [id])
+  vehicle Vehicle @relation(fields: [vehicle_id], references: [id])
+
+  @@index([company_id])
+}

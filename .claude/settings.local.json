@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(node -v)",
+      "PowerShell(npm -v)",
+      "Bash(npm -v)",
+      "Bash(docker -v)",
+      "Bash(docker compose *)"
+    ]
+  }
+}

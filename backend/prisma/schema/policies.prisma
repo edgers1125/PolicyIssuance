@@ -1,0 +1,74 @@
+model Policy {
+  id                  String       @id @default(uuid()) @db.Uuid
+  policy_number       String       @unique @db.VarChar(50)
+  application_id      String       @unique @db.Uuid
+  customer_id         String?      @db.Uuid
+  company_id          String?      @db.Uuid
+  agent_id            String       @db.Uuid
+  agent_name_snapshot String?      @db.VarChar(255)
+  product_variant_id  String       @db.Uuid
+  issue_date          DateTime     @db.Date
+  effective_date      DateTime     @db.Date
+  expiry_date         DateTime     @db.Date
+  policy_status       PolicyStatus
+  added_to_inlease    Boolean      @default(false)
+  inlease_added_at    DateTime?
+  created_at          DateTime     @default(now())
+  updated_at          DateTime     @updatedAt
+
+  application     PolicyApplication @relation(fields: [application_id], references: [id])
+  customer        Customer?         @relation(fields: [customer_id], references: [id])
+  company         Company?          @relation(fields: [company_id], references: [id])
+  agent           Agent             @relation(fields: [agent_id], references: [id])
+  product_variant ProductVariant    @relation(fields: [product_variant_id], references: [id])
+
+  vehicles             PolicyVehicle[]
+  addresses            PolicyAddress[]
+  coverages            PolicyCoverage[]
+  cancellation_history CancellationHistory[]
+
+  @@index([policy_status])
+  @@index([customer_id])
+  @@index([company_id])
+  @@index([agent_id])
+  @@index([expiry_date])
+}
+
+model PolicyVehicle {
+  id         String   @id @default(uuid()) @db.Uuid
+  policy_id  String   @db.Uuid
+  vehicle_id String   @db.Uuid
+  created_at DateTime @default(now())
+
+  policy  Policy  @relation(fields: [policy_id], references: [id])
+  vehicle Vehicle @relation(fields: [vehicle_id], references: [id])
+
+  @@index([policy_id])
+}
+
+model PolicyAddress {
+  id         String   @id @default(uuid()) @db.Uuid
+  policy_id  String   @db.Uuid
+  address_id String   @db.Uuid
+  created_at DateTime @default(now())
+
+  policy  Policy  @relation(fields: [policy_id], references: [id])
+  address Address @relation(fields: [address_id], references: [id])
+
+  @@index([policy_id])
+}
+
+model PolicyCoverage {
+  id              String   @id @default(uuid()) @db.Uuid
+  policy_id       String   @db.Uuid
+  coverage_id     String   @db.Uuid
+  coverage_amount Decimal  @db.Decimal(18, 2)
+  premium_amount  Decimal  @db.Decimal(18, 2)
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  policy   Policy          @relation(fields: [policy_id], references: [id])
+  coverage ProductCoverage @relation(fields: [coverage_id], references: [id])
+
+  @@index([policy_id])
+}

@@ -1,0 +1,98 @@
+model Company {
+  id           String       @id @default(uuid()) @db.Uuid
+  company_code String       @unique @db.VarChar(50)
+  company_name String       @db.VarChar(255)
+  tin_no       String?      @db.VarChar(100)
+  email        String       @unique @db.VarChar(255)
+  status       RecordStatus
+  created_at   DateTime     @default(now())
+  updated_at   DateTime     @updatedAt
+
+  customers           Customer[]
+  company_addresses   CompanyAddress[]
+  company_vehicles    CompanyVehicle[]
+  policy_applications PolicyApplication[]
+  policies            Policy[]
+  company_agents      CompanyAgent[]
+}
+
+model Customer {
+  id            String         @id @default(uuid()) @db.Uuid
+  first_name    String         @db.VarChar(100)
+  last_name     String         @db.VarChar(100)
+  middle_name   String?        @db.VarChar(100)
+  birthday      DateTime?      @db.Date
+  gender        String?        @db.VarChar(20)
+  email         String         @unique @db.VarChar(255)
+  mobile_number String?        @db.VarChar(50)
+  company_id    String?        @db.Uuid
+  status        CustomerStatus
+  created_at    DateTime       @default(now())
+  updated_at    DateTime       @updatedAt
+
+  company             Company?            @relation(fields: [company_id], references: [id])
+  users               User[]
+  customer_addresses  CustomerAddress[]
+  customer_vehicles   CustomerVehicle[]
+  policy_applications PolicyApplication[]
+  policies            Policy[]
+  customer_agents     CustomerAgent[]
+}
+
+model Agent {
+  id         String       @id @default(uuid()) @db.Uuid
+  agent_code String       @unique @db.VarChar(50)
+  agent_name String       @db.VarChar(255)
+  work_email String       @unique @db.VarChar(255)
+  status     RecordStatus
+  created_at DateTime     @default(now())
+  updated_at DateTime     @updatedAt
+
+  users               User[]
+  agent_netrates      AgentNetrate[]
+  policy_applications PolicyApplication[]
+  policies            Policy[]
+  customer_agents     CustomerAgent[]
+  company_agents      CompanyAgent[]
+}
+
+model CustomerAgent {
+  id          String   @id @default(uuid()) @db.Uuid
+  customer_id String   @db.Uuid
+  agent_id    String   @db.Uuid
+  created_at  DateTime @default(now())
+
+  customer Customer @relation(fields: [customer_id], references: [id])
+  agent    Agent    @relation(fields: [agent_id], references: [id])
+
+  @@unique([customer_id, agent_id])
+  @@index([agent_id])
+}
+
+model CompanyAgent {
+  id         String   @id @default(uuid()) @db.Uuid
+  company_id String   @db.Uuid
+  agent_id   String   @db.Uuid
+  created_at DateTime @default(now())
+
+  company Company @relation(fields: [company_id], references: [id])
+  agent   Agent   @relation(fields: [agent_id], references: [id])
+
+  @@unique([company_id, agent_id])
+  @@index([agent_id])
+}
+
+model AgentNetrate {
+  id                  String   @id @default(uuid()) @db.Uuid
+  agent_id            String   @db.Uuid
+  product_coverage_id String   @db.Uuid
+  netrate             Decimal  @db.Decimal(10, 6)
+  maximum_coverage    Decimal  @db.Decimal(18, 2)
+  created_at          DateTime @default(now())
+  updated_at          DateTime @updatedAt
+
+  agent            Agent           @relation(fields: [agent_id], references: [id])
+  product_coverage ProductCoverage @relation(fields: [product_coverage_id], references: [id])
+
+  @@index([agent_id])
+}
