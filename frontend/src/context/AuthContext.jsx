@@ -10,15 +10,23 @@ export function AuthProvider({ children }) {
     return stored ? JSON.parse(stored) : null;
   });
   const [permissions, setPermissions] = useState(null);
+  const [agent, setAgent] = useState(null);
 
   useEffect(() => {
     if (!token) {
       setPermissions(null);
+      setAgent(null);
       return;
     }
     getMe(token)
-      .then((me) => setPermissions(me.permissions))
-      .catch(() => setPermissions([]));
+      .then((me) => {
+        setPermissions(me.permissions);
+        setAgent(me.agent || null);
+      })
+      .catch(() => {
+        setPermissions([]);
+        setAgent(null);
+      });
   }, [token]);
 
   async function login(email, password) {
@@ -38,7 +46,7 @@ export function AuthProvider({ children }) {
   }
 
   return (
-    <AuthContext.Provider value={{ token, user, permissions, login, logout }}>
+    <AuthContext.Provider value={{ token, user, permissions, agent, login, logout }}>
       {children}
     </AuthContext.Provider>
   );

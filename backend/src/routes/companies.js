@@ -34,13 +34,23 @@ router.get("/", async (req, res, next) => {
             tin_no: true,
             email: true,
             status: true,
+            company_vehicles: { select: { vehicle: true } },
+            company_addresses: { select: { address: true } },
           },
         },
       },
       orderBy: { company: { company_name: "asc" } },
     });
 
-    res.json(links.map((l) => l.company));
+    res.json(
+      links.map((l) => ({
+        ...l.company,
+        vehicles: l.company.company_vehicles.map((cv) => cv.vehicle),
+        addresses: l.company.company_addresses.map((ca) => ca.address),
+        company_vehicles: undefined,
+        company_addresses: undefined,
+      }))
+    );
   } catch (err) {
     next(err);
   }
@@ -80,6 +90,47 @@ router.post("/", async (req, res, next) => {
     });
 
     res.status(201).json(company);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch("/:id", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const agentId = await getCurrentAgentId(req);
+    if (!agentId) {
+      return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+    }
+
+    const link = await prisma.companyAgent.findUnique({
+      where: { company_id_agent_id: { company_id: id, agent_id: agentId } },
+    });
+    if (!link) {
+      return res.status(403).json({ error: "This company isn't connected to your agent account" });
+    }
+
+    const { company_code, company_name, tin_no, email } = req.body;
+
+    if (!company_code || !company_name || !email) {
+      return res.status(400).json({ error: "company_code, company_name, and email are required" });
+    }
+
+    const existingCode = await prisma.company.findUnique({ where: { company_code } });
+    if (existingCode && existingCode.id !== id) {
+      return res.status(409).json({ error: "A company with this code already exists" });
+    }
+    const existingEmail = await prisma.company.findUnique({ where: { email } });
+    if (existingEmail && existingEmail.id !== id) {
+      return res.status(409).json({ error: "A company with this email already exists" });
+    }
+
+    const company = await prisma.company.update({
+      where: { id },
+      data: { company_code, company_name, tin_no: tin_no || null, email },
+    });
+
+    res.json(company);
   } catch (err) {
     next(err);
   }

@@ -1,9 +1,12 @@
 const express = require("express");
+const crypto = require("crypto");
 const bcrypt = require("bcrypt");
 const prisma = require("../lib/prisma");
 const { signToken } = require("../utils/jwt");
 
 const router = express.Router();
+
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 router.post("/login", async (req, res, next) => {
   try {
@@ -36,6 +39,42 @@ router.post("/login", async (req, res, next) => {
         status: user.status,
       },
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/forgot-password", async (req, res, next) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: "email is required" });
+    }
+
+    const user = await prisma.user.findUnique({ where: { email } });
+
+    // Always respond the same way whether or not the email is on file,
+    // so this endpoint can't be used to enumerate registered users.
+    if (user) {
+      const resetToken = crypto.randomBytes(32).toString("hex");
+
+      await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          invite_token: resetToken,
+          invite_token_expires_at: new Date(Date.now() + RESET_TOKEN_TTL_MS),
+        },
+      });
+
+      const resetLink = `${process.env.FRONTEND_URL}/set-password?token=${resetToken}`;
+
+      // No email provider configured yet — log the link so the reset flow
+      // can be tested end-to-end without real email delivery.
+      console.log(`[mock email] Password reset link for ${email}: ${resetLink}`);
+    }
+
+    res.json({ message: "If an account with that email exists, a password reset link has been sent." });
   } catch (err) {
     next(err);
   }

@@ -19,7 +19,6 @@ import {
   DialogActions,
   TextField,
   MenuItem,
-  ListSubheader,
   Alert,
   CircularProgress,
   Stack,
@@ -30,7 +29,7 @@ import AddIcon from "@mui/icons-material/Add";
 import EditIcon from "@mui/icons-material/Edit";
 import { useAuth } from "../context/AuthContext";
 import { listUsers, listRoles, listPermissions, createUser, updateUser } from "../api/client";
-import { groupPermissions } from "../utils/permissionGroups";
+import { PermissionChecklist } from "../components/PermissionChecklist";
 
 const STATUS_COLOR = {
   ACTIVE: "success",
@@ -51,7 +50,6 @@ function availableSpecialPermissions(permissions, roles, roleId) {
 
 function RoleAndPermissionsFields({ roles, permissions, roleId, onRoleChange, permissionIds, onPermissionIdsChange }) {
   const selectable = availableSpecialPermissions(permissions, roles, roleId);
-  const selectableGroups = groupPermissions(selectable);
 
   function togglePermission(id) {
     onPermissionIdsChange(
@@ -69,51 +67,37 @@ function RoleAndPermissionsFields({ roles, permissions, roleId, onRoleChange, pe
         ))}
       </TextField>
 
-      <TextField
-        select
-        label="Special permissions (optional)"
-        value={permissionIds}
-        onChange={(e) => onPermissionIdsChange(e.target.value)}
-        helperText="Permissions already granted by the selected role aren't shown here."
-        slotProps={{
-          select: {
-            multiple: true,
-            renderValue: (selected) =>
-              permissions
-                .filter((p) => selected.includes(p.id))
-                .map((p) => p.permission_name)
-                .join(", "),
-          },
-        }}
-        fullWidth
-      >
-        {selectableGroups.flatMap((group) => [
-          <ListSubheader key={`header-${group.name}`}>{group.name}</ListSubheader>,
-          ...group.items.map((perm) => (
-            <MenuItem key={perm.id} value={perm.id} onClick={() => togglePermission(perm.id)}>
-              {perm.permission_name}
-            </MenuItem>
-          )),
-        ])}
-      </TextField>
+      <Typography variant="body2" sx={{ fontWeight: 600 }}>
+        Special permissions (optional)
+      </Typography>
+      <Typography variant="caption" color="text.secondary">
+        Permissions already granted by the selected role aren't shown here.
+      </Typography>
+      <PermissionChecklist permissions={selectable} checkedIds={permissionIds} onToggle={togglePermission} />
     </>
   );
 }
 
 function AddUserDialog({ open, onClose, roles, permissions, token, onCreated }) {
   const [email, setEmail] = useState("");
-  const [fullName, setFullName] = useState("");
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
   const [roleId, setRoleId] = useState("");
   const [permissionIds, setPermissionIds] = useState([]);
+  const [makeAgent, setMakeAgent] = useState(false);
+  const [agentCode, setAgentCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [inviteLink, setInviteLink] = useState("");
 
   function reset() {
     setEmail("");
-    setFullName("");
+    setFirstName("");
+    setLastName("");
     setRoleId("");
     setPermissionIds([]);
+    setMakeAgent(false);
+    setAgentCode("");
     setError("");
     setInviteLink("");
   }
@@ -125,9 +109,12 @@ function AddUserDialog({ open, onClose, roles, permissions, token, onCreated }) 
     try {
       const result = await createUser(token, {
         email,
-        full_name: fullName,
+        first_name: firstName,
+        last_name: lastName,
         role_id: roleId,
         permission_ids: permissionIds,
+        make_agent: makeAgent,
+        agent_code: makeAgent ? agentCode : undefined,
       });
       setInviteLink(result.inviteLink);
       onCreated();
@@ -174,14 +161,24 @@ function AddUserDialog({ open, onClose, roles, permissions, token, onCreated }) 
                 required
                 fullWidth
                 autoFocus
+                helperText="Every user is also registered as a customer under this email."
               />
-              <TextField
-                label="Full name"
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
-                required
-                fullWidth
-              />
+              <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
+                <TextField
+                  label="First name"
+                  value={firstName}
+                  onChange={(e) => setFirstName(e.target.value)}
+                  required
+                  fullWidth
+                />
+                <TextField
+                  label="Last name"
+                  value={lastName}
+                  onChange={(e) => setLastName(e.target.value)}
+                  required
+                  fullWidth
+                />
+              </Stack>
               <RoleAndPermissionsFields
                 roles={roles}
                 permissions={permissions}
@@ -190,6 +187,21 @@ function AddUserDialog({ open, onClose, roles, permissions, token, onCreated }) 
                 permissionIds={permissionIds}
                 onPermissionIdsChange={setPermissionIds}
               />
+
+              <FormControlLabel
+                control={<Checkbox checked={makeAgent} onChange={(e) => setMakeAgent(e.target.checked)} />}
+                label="Also register this person as an agent"
+              />
+              {makeAgent && (
+                <TextField
+                  label="Agent code"
+                  value={agentCode}
+                  onChange={(e) => setAgentCode(e.target.value)}
+                  required
+                  fullWidth
+                />
+              )}
+
               {error && <Alert severity="error">{error}</Alert>}
             </Stack>
           </DialogContent>
@@ -212,6 +224,8 @@ function EditUserDialog({ open, onClose, user, roles, permissions, token, onSave
   const [roleId, setRoleId] = useState("");
   const [permissionIds, setPermissionIds] = useState([]);
   const [resetPassword, setResetPassword] = useState(false);
+  const [makeAgent, setMakeAgent] = useState(false);
+  const [agentCode, setAgentCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [inviteLink, setInviteLink] = useState("");
@@ -222,11 +236,18 @@ function EditUserDialog({ open, onClose, user, roles, permissions, token, onSave
       setEmail(user.email);
       setStatus(user.status === "AWAITING_EMAIL_VERIFICATION" ? "ACTIVE" : user.status);
       setRoleId(user.roles[0]?.id || "");
-      setPermissionIds(user.specialPermissions.map((p) => p.id));
+      // specialPermissions can include a hidden page-access permission that was
+      // auto-granted alongside a real one — drop it here so it isn't silently
+      // carried forward once its last visible sibling gets unchecked.
+      const selectableIds = new Set(permissions.map((p) => p.id));
+      setPermissionIds(user.specialPermissions.map((p) => p.id).filter((id) => selectableIds.has(id)));
       setResetPassword(false);
+      setMakeAgent(false);
+      setAgentCode("");
       setError("");
       setInviteLink("");
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
   async function handleSubmit(e) {
@@ -241,6 +262,8 @@ function EditUserDialog({ open, onClose, user, roles, permissions, token, onSave
         role_id: roleId,
         permission_ids: permissionIds,
         reset_password: resetPassword,
+        make_agent: makeAgent,
+        agent_code: makeAgent ? agentCode : undefined,
       });
       if (result.inviteLink) {
         setInviteLink(result.inviteLink);
@@ -320,6 +343,28 @@ function EditUserDialog({ open, onClose, user, roles, permissions, token, onSave
                 label="Force password reset (invalidates current password, sends a new invite link)"
               />
 
+              {user.agent ? (
+                <Alert severity="info">
+                  Already an agent — code <strong>{user.agent.agent_code}</strong>
+                </Alert>
+              ) : (
+                <>
+                  <FormControlLabel
+                    control={<Checkbox checked={makeAgent} onChange={(e) => setMakeAgent(e.target.checked)} />}
+                    label="Make this person an agent"
+                  />
+                  {makeAgent && (
+                    <TextField
+                      label="Agent code"
+                      value={agentCode}
+                      onChange={(e) => setAgentCode(e.target.value)}
+                      required
+                      fullWidth
+                    />
+                  )}
+                </>
+              )}
+
               {error && <Alert severity="error">{error}</Alert>}
             </Stack>
           </DialogContent>
@@ -388,6 +433,7 @@ export function ManageUsers() {
                 <TableCell>Status</TableCell>
                 <TableCell>Roles</TableCell>
                 <TableCell>Special Permissions</TableCell>
+                <TableCell>Agent</TableCell>
                 <TableCell align="right">Actions</TableCell>
               </TableRow>
             </TableHead>
@@ -422,6 +468,13 @@ export function ManageUsers() {
                         />
                       ))}
                     </Stack>
+                  </TableCell>
+                  <TableCell>
+                    {u.agent ? (
+                      <Chip label={u.agent.agent_code} size="small" color="primary" variant="outlined" />
+                    ) : (
+                      "—"
+                    )}
                   </TableCell>
                   <TableCell align="right">
                     <IconButton size="small" onClick={() => setEditingUser(u)} title="Edit user">

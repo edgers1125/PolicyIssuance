@@ -2,6 +2,9 @@ import { useNavigate } from "react-router-dom";
 import { Container, Typography, Paper, List, ListItemButton, ListItemText, ListItemIcon, Divider } from "@mui/material";
 import AdminPanelSettingsIcon from "@mui/icons-material/AdminPanelSettings";
 import AddModeratorIcon from "@mui/icons-material/AddModerator";
+import GavelIcon from "@mui/icons-material/Gavel";
+import TuneIcon from "@mui/icons-material/Tune";
+import PaymentsIcon from "@mui/icons-material/Payments";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 
 const settingsLinks = [
@@ -16,6 +19,24 @@ const settingsLinks = [
     description: "Create a new role with a chosen set of permissions",
     path: "/settings/create-role",
     icon: AddModeratorIcon,
+  },
+  {
+    label: "Edit Clauses",
+    description: "Edit the legal clause text attached to each coverage",
+    path: "/settings/edit-clauses",
+    icon: GavelIcon,
+  },
+  {
+    label: "Edit Coverage Defaults",
+    description: "Edit each coverage's standard rate and maximum coverage",
+    path: "/settings/edit-coverage-defaults",
+    icon: TuneIcon,
+  },
+  {
+    label: "Authorized Payment Methods",
+    description: "Add or remove which payment methods Bethel accepts directly",
+    path: "/settings/payment-methods",
+    icon: PaymentsIcon,
   },
 ];
 

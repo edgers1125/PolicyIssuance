@@ -87,12 +87,13 @@ model AgentNetrate {
   agent_id            String   @db.Uuid
   product_coverage_id String   @db.Uuid
   netrate             Decimal  @db.Decimal(10, 6)
-  maximum_coverage    Decimal  @db.Decimal(18, 2)
+  maximum_coverage    Decimal? @db.Decimal(18, 2)
   created_at          DateTime @default(now())
   updated_at          DateTime @updatedAt
 
   agent            Agent           @relation(fields: [agent_id], references: [id])
   product_coverage ProductCoverage @relation(fields: [product_coverage_id], references: [id])
 
+  @@unique([agent_id, product_coverage_id])
   @@index([agent_id])
 }

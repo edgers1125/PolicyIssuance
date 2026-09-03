@@ -57,3 +57,26 @@ enum CancellationDecision {
   APPROVED
   REJECTED
 }
+
+enum PaymentMethod {
+  CASH
+  CHECK
+  CREDIT_CARD
+  BANK_TRANSFER
+  ONLINE_PAYMENT
+}
+
+// Who the customer's payment actually goes to first — straight to Bethel, or
+// to the agent, who then remits it on their own agreed credit terms.
+enum PaymentRemittance {
+  DIRECT_TO_BETHEL
+  THROUGH_AGENT
+}
+
+// Distinguishes the two addresses an application can carry: the property
+// actually being insured (Property class only) vs. the address the policy
+// itself is named on (every class).
+enum AddressRole {
+  RISK
+  INSURED
+}

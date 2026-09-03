@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { Box, Paper, TextField, Button, Typography, Alert } from "@mui/material";
+import { useNavigate, Link as RouterLink } from "react-router-dom";
+import { Box, Paper, TextField, Button, Typography, Alert, Link } from "@mui/material";
 import { useAuth } from "../context/AuthContext";
 import { BrandMark } from "../components/BrandMark";
 
@@ -74,6 +74,12 @@ export function Login() {
             fullWidth
             margin="normal"
           />
+
+          <Typography sx={{ textAlign: "right", mt: 0.5 }}>
+            <Link component={RouterLink} to="/forgot-password" variant="body2">
+              Forgot password?
+            </Link>
+          </Typography>
 
           {error && (
             <Alert severity="error" sx={{ mt: 1 }}>

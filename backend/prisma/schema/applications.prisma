@@ -13,15 +13,32 @@ model PolicyApplication {
   application_date      DateTime          @db.Date
   submission_date       DateTime?         @db.Date
   status                ApplicationStatus
+  // Total premium is just the sum of every selected coverage's premium_amount.
+  // Doc stamps/VAT/LGT are computed from it at the statutory rates in effect at
+  // submission time; misc is a flat amount the agent can enter. total_amount is
+  // the grand total (total_premium + doc_stamps + vat + lgt + misc).
+  total_premium         Decimal           @db.Decimal(18, 2)
+  doc_stamps            Decimal           @db.Decimal(18, 2)
+  vat                   Decimal           @db.Decimal(18, 2)
+  lgt                   Decimal           @db.Decimal(18, 2)
+  misc                  Decimal           @db.Decimal(18, 2)
+  total_amount          Decimal           @db.Decimal(18, 2)
+  send_policy_to_email  Boolean           @default(false)
+  payment_method        PaymentMethod
+  payment_remittance    PaymentRemittance
+  // Only set when payment_remittance is DIRECT_TO_BETHEL — which of Bethel's
+  // own authorized payment methods the customer will use.
+  bethel_payment_method_id String?       @db.Uuid
   remarks               String?
   document_folder_name  String?           @db.VarChar(255)
   created_at            DateTime          @default(now())
   updated_at            DateTime          @updatedAt
 
-  customer        Customer?      @relation(fields: [customer_id], references: [id])
-  company         Company?       @relation(fields: [company_id], references: [id])
-  agent           Agent          @relation(fields: [agent_id], references: [id])
-  product_variant ProductVariant @relation(fields: [product_variant_id], references: [id])
+  customer              Customer?                @relation(fields: [customer_id], references: [id])
+  company               Company?                 @relation(fields: [company_id], references: [id])
+  agent                 Agent                    @relation(fields: [agent_id], references: [id])
+  product_variant       ProductVariant           @relation(fields: [product_variant_id], references: [id])
+  bethel_payment_method  AuthorizedPaymentMethod? @relation(fields: [bethel_payment_method_id], references: [id])
 
   vehicles         PolicyApplicationVehicle[]
   addresses        PolicyApplicationAddress[]
@@ -48,14 +65,16 @@ model PolicyApplicationVehicle {
 }
 
 model PolicyApplicationAddress {
-  id                    String   @id @default(uuid()) @db.Uuid
-  policy_application_id String   @db.Uuid
-  address_id            String   @db.Uuid
-  created_at            DateTime @default(now())
+  id                    String      @id @default(uuid()) @db.Uuid
+  policy_application_id String      @db.Uuid
+  address_id            String      @db.Uuid
+  role                  AddressRole
+  created_at            DateTime    @default(now())
 
   policy_application PolicyApplication @relation(fields: [policy_application_id], references: [id])
   address            Address           @relation(fields: [address_id], references: [id])
 
+  @@unique([policy_application_id, role])
   @@index([policy_application_id])
 }
 
@@ -65,6 +84,9 @@ model ApplicationCoverage {
   coverage_id     String   @db.Uuid
   coverage_amount Decimal  @db.Decimal(18, 2)
   premium_amount  Decimal  @db.Decimal(18, 2)
+  // The net rate actually in effect for the agent at submission time — frozen
+  // here so historical branch revenue stays accurate even if rates change later.
+  applied_rate    Decimal  @db.Decimal(10, 6)
   created_at      DateTime @default(now())
   updated_at      DateTime @updatedAt
 

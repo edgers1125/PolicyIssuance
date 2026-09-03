@@ -5,9 +5,37 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>frontend</title>
+    <style>
+      #print-root {
+        display: none;
+      }
+      @media print {
+        @page {
+          size: legal;
+          margin: 0.4in;
+        }
+        /* MUI's Dialog/Modal portals render directly under <body>, as
+           siblings of #root — not inside it — so #root alone isn't enough
+           to hide everything else. Hide every body child except print-root. */
+        body > *:not(#print-root) {
+          display: none !important;
+        }
+        #print-root {
+          display: block !important;
+        }
+        /* Force background images/colors (the logo watermark) to print even
+           when the browser's own "Background graphics" print option is off. */
+        * {
+          -webkit-print-color-adjust: exact !important;
+          print-color-adjust: exact !important;
+          color-adjust: exact !important;
+        }
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
+    <div id="print-root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

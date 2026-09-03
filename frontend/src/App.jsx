@@ -1,12 +1,17 @@
 import { Routes, Route, Navigate } from "react-router-dom";
 import { Login } from "./pages/Login";
+import { ForgotPassword } from "./pages/ForgotPassword";
 import { SetPassword } from "./pages/SetPassword";
 import { Dashboard } from "./pages/Dashboard";
 import { ManageUsers } from "./pages/ManageUsers";
 import { Settings } from "./pages/Settings";
 import { RoleDefaultPermissions } from "./pages/RoleDefaultPermissions";
 import { CreateRole } from "./pages/CreateRole";
+import { EditClauses } from "./pages/EditClauses";
+import { EditCoverageDefaults } from "./pages/EditCoverageDefaults";
+import { AuthorizedPaymentMethods } from "./pages/AuthorizedPaymentMethods";
 import { PolicyApplication } from "./pages/PolicyApplication";
+import { MyAgents } from "./pages/MyAgents";
 import { AppLayout } from "./layouts/AppLayout";
 import { ProtectedRoute } from "./components/ProtectedRoute";
 import { RequirePermission } from "./components/RequirePermission";
@@ -16,6 +21,7 @@ function App() {
   return (
     <Routes>
       <Route path="/login" element={<Login />} />
+      <Route path="/forgot-password" element={<ForgotPassword />} />
       <Route path="/set-password" element={<SetPassword />} />
 
       <Route
@@ -70,7 +76,7 @@ function App() {
           path="/my-agents"
           element={
             <RequirePermission permission="MANAGE_AGENTS">
-              <PlaceholderPage title="My Agents" />
+              <MyAgents />
             </RequirePermission>
           }
         />
@@ -95,6 +101,30 @@ function App() {
           element={
             <RequirePermission permission="CREATE_ROLE">
               <CreateRole />
+            </RequirePermission>
+          }
+        />
+        <Route
+          path="/settings/edit-clauses"
+          element={
+            <RequirePermission permission="EDIT_CLAUSES">
+              <EditClauses />
+            </RequirePermission>
+          }
+        />
+        <Route
+          path="/settings/edit-coverage-defaults"
+          element={
+            <RequirePermission permission="EDIT_COVERAGE_DEFAULTS">
+              <EditCoverageDefaults />
+            </RequirePermission>
+          }
+        />
+        <Route
+          path="/settings/payment-methods"
+          element={
+            <RequirePermission permission="MANAGE_PAYMENT_METHODS">
+              <AuthorizedPaymentMethods />
             </RequirePermission>
           }
         />

@@ -33,6 +33,8 @@ model ProductCoverage {
   coverage_code      String       @unique @db.VarChar(50)
   coverage_name      String       @db.VarChar(255)
   maximum_coverage   Decimal      @db.Decimal(18, 2)
+  standard_rate      Decimal      @db.Decimal(10, 6)
+  clause             String       @db.Text
   status             RecordStatus
   created_at         DateTime     @default(now())
   updated_at         DateTime     @updatedAt

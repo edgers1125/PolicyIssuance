@@ -22,6 +22,15 @@ function sameIds(a, b) {
   return a.every((id) => setB.has(id));
 }
 
+// A role's permissionIds can include a hidden page-access permission that was
+// auto-granted alongside a real one — drop it here so it isn't silently carried
+// forward (and thus un-removable, since the checklist never shows it) once its
+// last visible sibling gets unchecked.
+function selectableOnly(ids, selectablePermissions) {
+  const selectableIds = new Set(selectablePermissions.map((p) => p.id));
+  return ids.filter((id) => selectableIds.has(id));
+}
+
 export function RoleDefaultPermissions() {
   const { token } = useAuth();
   const navigate = useNavigate();
@@ -43,8 +52,9 @@ export function RoleDefaultPermissions() {
         setPermissions(permissionsData);
         if (rolesData.length > 0) {
           setRoleId(rolesData[0].id);
-          setCheckedIds(rolesData[0].permissionIds);
-          setOriginalIds(rolesData[0].permissionIds);
+          const ids = selectableOnly(rolesData[0].permissionIds, permissionsData);
+          setCheckedIds(ids);
+          setOriginalIds(ids);
         }
       })
       .catch((err) => setError(err.message))
@@ -53,9 +63,10 @@ export function RoleDefaultPermissions() {
 
   function handleRoleChange(newRoleId) {
     const role = roles.find((r) => r.id === newRoleId);
+    const ids = role ? selectableOnly(role.permissionIds, permissions) : [];
     setRoleId(newRoleId);
-    setCheckedIds(role ? role.permissionIds : []);
-    setOriginalIds(role ? role.permissionIds : []);
+    setCheckedIds(ids);
+    setOriginalIds(ids);
     setSaved(false);
     setError("");
   }

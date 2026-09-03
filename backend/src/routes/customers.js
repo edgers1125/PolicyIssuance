@@ -37,13 +37,23 @@ router.get("/", async (req, res, next) => {
             birthday: true,
             gender: true,
             status: true,
+            customer_vehicles: { select: { vehicle: true } },
+            customer_addresses: { select: { address: true } },
           },
         },
       },
       orderBy: { customer: { last_name: "asc" } },
     });
 
-    res.json(links.map((l) => l.customer));
+    res.json(
+      links.map((l) => ({
+        ...l.customer,
+        vehicles: l.customer.customer_vehicles.map((cv) => cv.vehicle),
+        addresses: l.customer.customer_addresses.map((ca) => ca.address),
+        customer_vehicles: undefined,
+        customer_addresses: undefined,
+      }))
+    );
   } catch (err) {
     next(err);
   }
@@ -82,6 +92,51 @@ router.post("/", async (req, res, next) => {
     });
 
     res.status(201).json(customer);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch("/:id", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const agentId = await getCurrentAgentId(req);
+    if (!agentId) {
+      return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+    }
+
+    const link = await prisma.customerAgent.findUnique({
+      where: { customer_id_agent_id: { customer_id: id, agent_id: agentId } },
+    });
+    if (!link) {
+      return res.status(403).json({ error: "This customer isn't connected to your agent account" });
+    }
+
+    const { first_name, last_name, middle_name, birthday, gender, email, mobile_number } = req.body;
+
+    if (!first_name || !last_name || !email) {
+      return res.status(400).json({ error: "first_name, last_name, and email are required" });
+    }
+
+    const existing = await prisma.customer.findUnique({ where: { email } });
+    if (existing && existing.id !== id) {
+      return res.status(409).json({ error: "A customer with this email already exists" });
+    }
+
+    const customer = await prisma.customer.update({
+      where: { id },
+      data: {
+        first_name,
+        last_name,
+        middle_name: middle_name || null,
+        birthday: birthday ? new Date(birthday) : null,
+        gender: gender || null,
+        email,
+        mobile_number: mobile_number || null,
+      },
+    });
+
+    res.json(customer);
   } catch (err) {
     next(err);
   }

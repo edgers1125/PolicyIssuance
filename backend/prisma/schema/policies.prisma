@@ -47,14 +47,16 @@ model PolicyVehicle {
 }
 
 model PolicyAddress {
-  id         String   @id @default(uuid()) @db.Uuid
-  policy_id  String   @db.Uuid
-  address_id String   @db.Uuid
-  created_at DateTime @default(now())
+  id         String      @id @default(uuid()) @db.Uuid
+  policy_id  String      @db.Uuid
+  address_id String      @db.Uuid
+  role       AddressRole
+  created_at DateTime    @default(now())
 
   policy  Policy  @relation(fields: [policy_id], references: [id])
   address Address @relation(fields: [address_id], references: [id])
 
+  @@unique([policy_id, role])
   @@index([policy_id])
 }
 

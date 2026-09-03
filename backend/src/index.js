@@ -7,8 +7,11 @@ const authRouter = require("./routes/auth");
 const usersRouter = require("./routes/users");
 const customersRouter = require("./routes/customers");
 const companiesRouter = require("./routes/companies");
+const agentsRouter = require("./routes/agents");
+const vehiclesRouter = require("./routes/vehicles");
 const catalogRouter = require("./routes/catalog");
 const policyApplicationsRouter = require("./routes/policyApplications");
+const paymentMethodsRouter = require("./routes/paymentMethods");
 const { requireAuth } = require("./middleware/auth");
 const { getUserPermissionCodes } = require("./middleware/permissions");
 
@@ -21,8 +24,11 @@ app.use("/auth", authRouter);
 app.use("/users", usersRouter);
 app.use("/customers", customersRouter);
 app.use("/companies", companiesRouter);
+app.use("/agents", agentsRouter);
+app.use("/vehicles", vehiclesRouter);
 app.use("/", catalogRouter);
 app.use("/policy-applications", policyApplicationsRouter);
+app.use("/payment-methods", paymentMethodsRouter);
 
 app.get("/me", requireAuth, async (req, res, next) => {
   try {
@@ -35,6 +41,7 @@ app.get("/me", requireAuth, async (req, res, next) => {
         status: true,
         agent_id: true,
         customer_id: true,
+        agent: { select: { agent_code: true, agent_name: true } },
       },
     });
     const permissionCodes = await getUserPermissionCodes(req.user.userId);

@@ -48,6 +48,8 @@ router.get("/", requirePermission("MANAGE_USERS"), async (req, res, next) => {
         full_name: true,
         status: true,
         created_at: true,
+        customer_id: true,
+        agent: { select: { id: true, agent_code: true, agent_name: true, status: true } },
         user_roles: {
           select: {
             role: {
@@ -65,7 +67,9 @@ router.get("/", requirePermission("MANAGE_USERS"), async (req, res, next) => {
         },
         user_permissions: {
           select: {
-            permission: { select: { id: true, permission_code: true, permission_name: true } },
+            permission: {
+              select: { id: true, permission_code: true, permission_name: true, is_page_access: true },
+            },
           },
         },
       },
@@ -85,9 +89,15 @@ router.get("/", requirePermission("MANAGE_USERS"), async (req, res, next) => {
         full_name: u.full_name,
         status: u.status,
         created_at: u.created_at,
+        is_customer: Boolean(u.customer_id),
+        agent: u.agent,
         roles: u.user_roles.map((ur) => ({ id: ur.role.id, role_name: ur.role.role_name })),
         permissions: Array.from(rolePermissionsById.values()),
-        specialPermissions: u.user_permissions.map((up) => up.permission),
+        // Page access is implicit/hidden — only surface the real sub-permissions here.
+        specialPermissions: u.user_permissions
+          .map((up) => up.permission)
+          .filter((p) => !p.is_page_access)
+          .map(({ id, permission_code, permission_name }) => ({ id, permission_code, permission_name })),
       };
     });
 
@@ -181,10 +191,13 @@ router.post("/", requirePermission("MANAGE_USERS"), async (req, res, next) => {
       return res.status(403).json({ error: "Missing required permission: ADD_USER" });
     }
 
-    const { email, full_name, role_id, permission_ids } = req.body;
+    const { email, first_name, last_name, role_id, permission_ids, make_agent, agent_code } = req.body;
 
-    if (!email || !full_name || !role_id) {
-      return res.status(400).json({ error: "email, full_name, and role_id are required" });
+    if (!email || !first_name || !last_name || !role_id) {
+      return res.status(400).json({ error: "email, first_name, last_name, and role_id are required" });
+    }
+    if (make_agent && !agent_code) {
+      return res.status(400).json({ error: "agent_code is required to register this user as an agent" });
     }
 
     const existing = await prisma.user.findUnique({ where: { email } });
@@ -197,22 +210,62 @@ router.post("/", requirePermission("MANAGE_USERS"), async (req, res, next) => {
       return res.status(400).json({ error: "role_id does not match an existing role" });
     }
 
+    if (make_agent) {
+      const existingAgentCode = await prisma.agent.findUnique({ where: { agent_code } });
+      if (existingAgentCode) {
+        return res.status(409).json({ error: "An agent with this agent code already exists" });
+      }
+      const existingAgentEmail = await prisma.agent.findUnique({ where: { work_email: email } });
+      if (existingAgentEmail) {
+        return res.status(409).json({ error: "An agent with this work email already exists" });
+      }
+    }
+
+    const full_name = `${first_name} ${last_name}`;
     const inviteToken = crypto.randomBytes(32).toString("hex");
     const expandedPermissionIds = await expandWithPageAccess(permission_ids);
 
-    const user = await prisma.user.create({
-      data: {
-        email,
-        full_name,
-        status: "AWAITING_EMAIL_VERIFICATION",
-        invite_token: inviteToken,
-        invite_token_expires_at: new Date(Date.now() + INVITE_TOKEN_TTL_MS),
-        user_roles: { create: { role_id } },
-        user_permissions: expandedPermissionIds.length > 0
-          ? { create: expandedPermissionIds.map((permission_id) => ({ permission_id })) }
-          : undefined,
-      },
-      select: { id: true, email: true, full_name: true, status: true },
+    const user = await prisma.$transaction(async (tx) => {
+      // Every user is also a customer — reuse an existing customer record with a
+      // matching email (e.g. one an agent already filed applications for) rather
+      // than creating a duplicate, otherwise create a fresh one.
+      let customerId;
+      const existingCustomer = await tx.customer.findUnique({ where: { email } });
+      if (existingCustomer) {
+        customerId = existingCustomer.id;
+      } else {
+        const customer = await tx.customer.create({
+          data: { first_name, last_name, email, status: "ACTIVE" },
+          select: { id: true },
+        });
+        customerId = customer.id;
+      }
+
+      let agentId;
+      if (make_agent) {
+        const agent = await tx.agent.create({
+          data: { agent_code, agent_name: full_name, work_email: email, status: "ACTIVE" },
+          select: { id: true },
+        });
+        agentId = agent.id;
+      }
+
+      return tx.user.create({
+        data: {
+          email,
+          full_name,
+          status: "AWAITING_EMAIL_VERIFICATION",
+          invite_token: inviteToken,
+          invite_token_expires_at: new Date(Date.now() + INVITE_TOKEN_TTL_MS),
+          customer_id: customerId,
+          agent_id: agentId,
+          user_roles: { create: { role_id } },
+          user_permissions: expandedPermissionIds.length > 0
+            ? { create: expandedPermissionIds.map((permission_id) => ({ permission_id })) }
+            : undefined,
+        },
+        select: { id: true, email: true, full_name: true, status: true },
+      });
     });
 
     const inviteLink = `${process.env.FRONTEND_URL}/set-password?token=${inviteToken}`;
@@ -230,7 +283,7 @@ router.post("/", requirePermission("MANAGE_USERS"), async (req, res, next) => {
 router.patch("/:id", requirePermission("MANAGE_USERS"), async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { full_name, email, status, role_id, permission_ids, reset_password } = req.body;
+    const { full_name, email, status, role_id, permission_ids, reset_password, make_agent, agent_code } = req.body;
 
     const targetUser = await prisma.user.findUnique({ where: { id } });
     if (!targetUser) {
@@ -249,6 +302,27 @@ router.patch("/:id", requirePermission("MANAGE_USERS"), async (req, res, next) =
     }
     if (permission_ids !== undefined && !actingPermissions.has("EDIT_SPECIAL_PERMISSIONS")) {
       return res.status(403).json({ error: "Missing required permission: EDIT_SPECIAL_PERMISSIONS" });
+    }
+    if (make_agent && !actingPermissions.has("EDIT_USER_DETAILS")) {
+      return res.status(403).json({ error: "Missing required permission: EDIT_USER_DETAILS" });
+    }
+
+    if (make_agent && targetUser.agent_id) {
+      return res.status(409).json({ error: "This user is already an agent" });
+    }
+    if (make_agent && !agent_code) {
+      return res.status(400).json({ error: "agent_code is required to make this user an agent" });
+    }
+    if (make_agent) {
+      const existingAgentCode = await prisma.agent.findUnique({ where: { agent_code } });
+      if (existingAgentCode) {
+        return res.status(409).json({ error: "An agent with this agent code already exists" });
+      }
+      const workEmail = email !== undefined ? email : targetUser.email;
+      const existingAgentEmail = await prisma.agent.findUnique({ where: { work_email: workEmail } });
+      if (existingAgentEmail) {
+        return res.status(409).json({ error: "An agent with this work email already exists" });
+      }
     }
 
     const data = {};
@@ -275,6 +349,19 @@ router.patch("/:id", requirePermission("MANAGE_USERS"), async (req, res, next) =
       data.invite_token = inviteToken;
       data.invite_token_expires_at = new Date(Date.now() + INVITE_TOKEN_TTL_MS);
       inviteLink = `${process.env.FRONTEND_URL}/set-password?token=${inviteToken}`;
+    }
+
+    if (make_agent) {
+      const agent = await prisma.agent.create({
+        data: {
+          agent_code,
+          agent_name: data.full_name || targetUser.full_name,
+          work_email: data.email || targetUser.email,
+          status: "ACTIVE",
+        },
+        select: { id: true },
+      });
+      data.agent_id = agent.id;
     }
 
     await prisma.user.update({ where: { id }, data });
