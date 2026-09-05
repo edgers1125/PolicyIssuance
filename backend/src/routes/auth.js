@@ -3,18 +3,16 @@ const crypto = require("crypto");
 const bcrypt = require("bcrypt");
 const prisma = require("../lib/prisma");
 const { signToken } = require("../utils/jwt");
+const { validateBody } = require("../middleware/validate");
+const { loginSchema, forgotPasswordSchema, setPasswordSchema } = require("../schemas/auth");
 
 const router = express.Router();
 
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
 
-router.post("/login", async (req, res, next) => {
+router.post("/login", validateBody(loginSchema), async (req, res, next) => {
   try {
     const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ error: "email and password are required" });
-    }
 
     const user = await prisma.user.findUnique({ where: { email } });
 
@@ -44,13 +42,9 @@ router.post("/login", async (req, res, next) => {
   }
 });
 
-router.post("/forgot-password", async (req, res, next) => {
+router.post("/forgot-password", validateBody(forgotPasswordSchema), async (req, res, next) => {
   try {
     const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({ error: "email is required" });
-    }
 
     const user = await prisma.user.findUnique({ where: { email } });
 
@@ -80,17 +74,9 @@ router.post("/forgot-password", async (req, res, next) => {
   }
 });
 
-router.post("/set-password", async (req, res, next) => {
+router.post("/set-password", validateBody(setPasswordSchema), async (req, res, next) => {
   try {
     const { token, password } = req.body;
-
-    if (!token || !password) {
-      return res.status(400).json({ error: "token and password are required" });
-    }
-
-    if (password.length < 8) {
-      return res.status(400).json({ error: "Password must be at least 8 characters" });
-    }
 
     const user = await prisma.user.findUnique({ where: { invite_token: token } });
 

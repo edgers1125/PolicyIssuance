@@ -1,7 +1,9 @@
 const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { getUserPermissionCodes } = require("../middleware/permissions");
+const { ensurePermission, getUserPermissionCodes } = require("../middleware/permissions");
+const { validateBody } = require("../middleware/validate");
+const { createPaymentMethodSchema } = require("../schemas/paymentMethods");
 
 const router = express.Router();
 
@@ -20,17 +22,12 @@ router.get("/", async (req, res, next) => {
   }
 });
 
-router.post("/", async (req, res, next) => {
+router.post("/", validateBody(createPaymentMethodSchema), async (req, res, next) => {
   try {
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
-    if (!actingPermissions.has("MANAGE_PAYMENT_METHODS")) {
-      return res.status(403).json({ error: "Missing required permission: MANAGE_PAYMENT_METHODS" });
-    }
+    if (!ensurePermission(res, actingPermissions, "MANAGE_PAYMENT_METHODS")) return;
 
     const { name } = req.body;
-    if (!name) {
-      return res.status(400).json({ error: "name is required" });
-    }
 
     const existing = await prisma.authorizedPaymentMethod.findUnique({ where: { name } });
     if (existing) {
@@ -47,9 +44,7 @@ router.post("/", async (req, res, next) => {
 router.delete("/:id", async (req, res, next) => {
   try {
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
-    if (!actingPermissions.has("MANAGE_PAYMENT_METHODS")) {
-      return res.status(403).json({ error: "Missing required permission: MANAGE_PAYMENT_METHODS" });
-    }
+    if (!ensurePermission(res, actingPermissions, "MANAGE_PAYMENT_METHODS")) return;
 
     const { id } = req.params;
     const method = await prisma.authorizedPaymentMethod.findUnique({ where: { id } });

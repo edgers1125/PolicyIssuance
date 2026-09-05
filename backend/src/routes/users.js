@@ -2,7 +2,14 @@ const express = require("express");
 const crypto = require("crypto");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { requirePermission, getUserPermissionCodes } = require("../middleware/permissions");
+const { requirePermission, ensurePermission, getUserPermissionCodes } = require("../middleware/permissions");
+const { validateBody } = require("../middleware/validate");
+const {
+  createRoleSchema,
+  createUserSchema,
+  updateUserSchema,
+  updateRolePermissionsSchema,
+} = require("../schemas/users");
 
 const router = express.Router();
 
@@ -152,13 +159,9 @@ router.get("/permissions", async (req, res, next) => {
   }
 });
 
-router.post("/roles", requirePermission("CREATE_ROLE"), async (req, res, next) => {
+router.post("/roles", requirePermission("CREATE_ROLE"), validateBody(createRoleSchema), async (req, res, next) => {
   try {
     const { role_name, description, permission_ids } = req.body;
-
-    if (!role_name) {
-      return res.status(400).json({ error: "role_name is required" });
-    }
 
     const existing = await prisma.role.findUnique({ where: { role_name } });
     if (existing) {
@@ -184,21 +187,12 @@ router.post("/roles", requirePermission("CREATE_ROLE"), async (req, res, next) =
   }
 });
 
-router.post("/", requirePermission("MANAGE_USERS"), async (req, res, next) => {
+router.post("/", requirePermission("MANAGE_USERS"), validateBody(createUserSchema), async (req, res, next) => {
   try {
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
-    if (!actingPermissions.has("ADD_USER")) {
-      return res.status(403).json({ error: "Missing required permission: ADD_USER" });
-    }
+    if (!ensurePermission(res, actingPermissions, "ADD_USER")) return;
 
     const { email, first_name, last_name, role_id, permission_ids, make_agent, agent_code } = req.body;
-
-    if (!email || !first_name || !last_name || !role_id) {
-      return res.status(400).json({ error: "email, first_name, last_name, and role_id are required" });
-    }
-    if (make_agent && !agent_code) {
-      return res.status(400).json({ error: "agent_code is required to register this user as an agent" });
-    }
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
@@ -280,7 +274,7 @@ router.post("/", requirePermission("MANAGE_USERS"), async (req, res, next) => {
   }
 });
 
-router.patch("/:id", requirePermission("MANAGE_USERS"), async (req, res, next) => {
+router.patch("/:id", requirePermission("MANAGE_USERS"), validateBody(updateUserSchema), async (req, res, next) => {
   try {
     const { id } = req.params;
     const { full_name, email, status, role_id, permission_ids, reset_password, make_agent, agent_code } = req.body;
@@ -293,19 +287,10 @@ router.patch("/:id", requirePermission("MANAGE_USERS"), async (req, res, next) =
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
 
     const wantsDetailsChange =
-      full_name !== undefined || email !== undefined || status !== undefined || reset_password;
-    if (wantsDetailsChange && !actingPermissions.has("EDIT_USER_DETAILS")) {
-      return res.status(403).json({ error: "Missing required permission: EDIT_USER_DETAILS" });
-    }
-    if (role_id !== undefined && !actingPermissions.has("EDIT_ROLE")) {
-      return res.status(403).json({ error: "Missing required permission: EDIT_ROLE" });
-    }
-    if (permission_ids !== undefined && !actingPermissions.has("EDIT_SPECIAL_PERMISSIONS")) {
-      return res.status(403).json({ error: "Missing required permission: EDIT_SPECIAL_PERMISSIONS" });
-    }
-    if (make_agent && !actingPermissions.has("EDIT_USER_DETAILS")) {
-      return res.status(403).json({ error: "Missing required permission: EDIT_USER_DETAILS" });
-    }
+      full_name !== undefined || email !== undefined || status !== undefined || reset_password || make_agent;
+    if (wantsDetailsChange && !ensurePermission(res, actingPermissions, "EDIT_USER_DETAILS")) return;
+    if (role_id !== undefined && !ensurePermission(res, actingPermissions, "EDIT_ROLE")) return;
+    if (permission_ids !== undefined && !ensurePermission(res, actingPermissions, "EDIT_SPECIAL_PERMISSIONS")) return;
 
     if (make_agent && targetUser.agent_id) {
       return res.status(409).json({ error: "This user is already an agent" });
@@ -391,35 +376,36 @@ router.patch("/:id", requirePermission("MANAGE_USERS"), async (req, res, next) =
   }
 });
 
-router.put("/roles/:id/permissions", requirePermission("EDIT_ROLE_PERMISSIONS"), async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const { permission_ids } = req.body;
+router.put(
+  "/roles/:id/permissions",
+  requirePermission("EDIT_ROLE_PERMISSIONS"),
+  validateBody(updateRolePermissionsSchema),
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      const { permission_ids } = req.body;
 
-    if (!Array.isArray(permission_ids)) {
-      return res.status(400).json({ error: "permission_ids must be an array" });
+      const role = await prisma.role.findUnique({ where: { id } });
+      if (!role) {
+        return res.status(404).json({ error: "Role not found" });
+      }
+
+      const expandedPermissionIds = await expandWithPageAccess(permission_ids);
+
+      // Replace the role's permission set entirely: drop whatever isn't in the
+      // new list, add whatever's newly checked.
+      await prisma.rolePermission.deleteMany({ where: { role_id: id } });
+      if (expandedPermissionIds.length > 0) {
+        await prisma.rolePermission.createMany({
+          data: expandedPermissionIds.map((permission_id) => ({ role_id: id, permission_id })),
+        });
+      }
+
+      res.json({ message: "Role permissions updated" });
+    } catch (err) {
+      next(err);
     }
-
-    const role = await prisma.role.findUnique({ where: { id } });
-    if (!role) {
-      return res.status(404).json({ error: "Role not found" });
-    }
-
-    const expandedPermissionIds = await expandWithPageAccess(permission_ids);
-
-    // Replace the role's permission set entirely: drop whatever isn't in the
-    // new list, add whatever's newly checked.
-    await prisma.rolePermission.deleteMany({ where: { role_id: id } });
-    if (expandedPermissionIds.length > 0) {
-      await prisma.rolePermission.createMany({
-        data: expandedPermissionIds.map((permission_id) => ({ role_id: id, permission_id })),
-      });
-    }
-
-    res.json({ message: "Role permissions updated" });
-  } catch (err) {
-    next(err);
   }
-});
+);
 
 module.exports = router;

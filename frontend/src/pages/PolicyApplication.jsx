@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Container,
@@ -38,6 +38,8 @@ import {
   createCompany,
   updateCompany,
   updateVehicle,
+  lookupVehicleByPlate,
+  updateAddress,
   createPolicyApplication,
   listPaymentMethods,
 } from "../api/client";
@@ -75,6 +77,10 @@ const emptyVehicle = {
   vehicle_type: "",
   color: "",
   existing_vehicle_id: null,
+  // Set once the agent confirms a plate match against a vehicle on file for a
+  // different party — keeps the fields editable (unlike a normal same-party
+  // reuse) and tells the backend to move ownership over on submit.
+  reassign_owner: false,
 };
 
 const emptyAddress = {
@@ -457,6 +463,125 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved }) {
   );
 }
 
+function AddressEditDialog({ open, onClose, address, token, onSaved }) {
+  const [form, setForm] = useState(emptyAddress);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (address) {
+      setForm({ ...address });
+      setError("");
+    }
+  }, [address]);
+
+  async function handleSave() {
+    setError("");
+    setSubmitting(true);
+    try {
+      const updated = await updateAddress(token, form.existing_address_id, form);
+      onSaved(updated);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+      <DialogTitle>Edit Address</DialogTitle>
+      <DialogContent>
+        <Stack spacing={2} sx={{ mt: 1 }}>
+          <Grid container spacing={2}>
+            <Grid size={12}>
+              <TextField
+                label="Address line 1"
+                value={form.address_line_1}
+                onChange={(e) => setForm({ ...form, address_line_1: e.target.value })}
+                required
+                fullWidth
+              />
+            </Grid>
+            <Grid size={12}>
+              <TextField
+                label="Address line 2"
+                value={form.address_line_2}
+                onChange={(e) => setForm({ ...form, address_line_2: e.target.value })}
+                fullWidth
+              />
+            </Grid>
+            <Grid size={{ xs: 12, sm: 6 }}>
+              <TextField
+                label="Barangay"
+                value={form.barangay}
+                onChange={(e) => setForm({ ...form, barangay: e.target.value })}
+                fullWidth
+              />
+            </Grid>
+            <Grid size={{ xs: 12, sm: 6 }}>
+              <TextField
+                label="City"
+                value={form.city}
+                onChange={(e) => setForm({ ...form, city: e.target.value })}
+                required
+                fullWidth
+              />
+            </Grid>
+            <Grid size={{ xs: 12, sm: 6 }}>
+              <TextField
+                label="Province"
+                value={form.province}
+                onChange={(e) => setForm({ ...form, province: e.target.value })}
+                required
+                fullWidth
+              />
+            </Grid>
+            <Grid size={{ xs: 12, sm: 6 }}>
+              <TextField
+                label="Postal code"
+                value={form.postal_code}
+                onChange={(e) => setForm({ ...form, postal_code: e.target.value })}
+                fullWidth
+              />
+            </Grid>
+          </Grid>
+          {error && <Alert severity="error">{error}</Alert>}
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>Cancel</Button>
+        <Button variant="contained" onClick={handleSave} disabled={submitting}>
+          {submitting ? "Saving..." : "Save changes"}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+function PlateConflictDialog({ conflict, onCancel, onConfirm }) {
+  const owner = conflict?.vehicle.current_owner;
+  return (
+    <Dialog open={Boolean(conflict)} onClose={onCancel} fullWidth maxWidth="sm">
+      <DialogTitle>Plate Number Already On File</DialogTitle>
+      <DialogContent>
+        <Typography>
+          Plate number <strong>{conflict?.vehicle.plate_number}</strong> has been detected in the system,
+          currently on file for{" "}
+          <strong>{owner ? owner.name : "no one — it isn't linked to a customer or company"}</strong>. Are you
+          sure that the plate number and the owner are correct?
+        </Typography>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onCancel}>No, let me check</Button>
+        <Button variant="contained" onClick={onConfirm}>
+          Yes, this is correct
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
 export function PolicyApplication() {
   const { token, permissions, agent } = useAuth();
   const canIssue = permissions?.includes("AGENT_ISSUANCE");
@@ -476,6 +601,13 @@ export function PolicyApplication() {
   const [editCustomerOpen, setEditCustomerOpen] = useState(false);
   const [editCompanyOpen, setEditCompanyOpen] = useState(false);
   const [editingVehicleIndex, setEditingVehicleIndex] = useState(null);
+  // Which reused address is open in the edit dialog — "risk", "insured", or null.
+  const [editingAddressField, setEditingAddressField] = useState(null);
+  // { index, vehicle } for the plate-number-already-on-file confirmation dialog.
+  const [plateConflict, setPlateConflict] = useState(null);
+  // Which plate number was last checked per vehicle row, so blurring an
+  // unchanged field doesn't keep re-triggering the lookup.
+  const lastCheckedPlateRef = useRef({});
 
   const [classId, setClassId] = useState("");
   const [variantId, setVariantId] = useState("");
@@ -539,6 +671,7 @@ export function PolicyApplication() {
   // start fresh whenever the selected customer/company actually changes.
   useEffect(() => {
     setVehicles([{ ...emptyVehicle }]);
+    lastCheckedPlateRef.current = {};
     setRiskAddress({ ...emptyAddress });
     setInsuredAddress({ ...emptyAddress });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -609,6 +742,80 @@ export function PolicyApplication() {
 
   function removeVehicle(index) {
     setVehicles((prev) => prev.filter((_, i) => i !== index));
+    delete lastCheckedPlateRef.current[index];
+  }
+
+  // Fires once a plate number is typed out (on blur) and isn't already
+  // matched to one of this party's own vehicles — checks whether it's on
+  // file for someone else so it can be reassigned instead of duplicated.
+  async function handlePlateBlur(index) {
+    const v = vehicles[index];
+    if (!v.plate_number || v.existing_vehicle_id) return;
+    if (lastCheckedPlateRef.current[index] === v.plate_number) return;
+    lastCheckedPlateRef.current[index] = v.plate_number;
+
+    const found = await lookupVehicleByPlate(token, v.plate_number).catch(() => null);
+    if (!found) return;
+
+    const expectedOwnerType = insuredType === "INDIVIDUAL" ? "CUSTOMER" : "COMPANY";
+    const isSameParty =
+      found.current_owner?.type === expectedOwnerType && found.current_owner?.id === selectedPartyId;
+
+    if (isSameParty) {
+      // Already this party's own vehicle but somehow missing from their list
+      // (e.g. it was just reassigned to them elsewhere) — reuse it normally.
+      setVehicles((prev) =>
+        prev.map((vv, i) =>
+          i === index
+            ? {
+                plate_number: found.plate_number,
+                mv_file_no: found.mv_file_no,
+                engine_number: found.engine_number,
+                chassis_number: found.chassis_number,
+                make: found.make || "",
+                model: found.model || "",
+                year_model: found.year_model || "",
+                vehicle_type: found.vehicle_type || "",
+                color: found.color || "",
+                existing_vehicle_id: found.id,
+                reassign_owner: false,
+              }
+            : vv
+        )
+      );
+      return;
+    }
+
+    setPlateConflict({ index, vehicle: found });
+  }
+
+  function handleConfirmPlateMatch() {
+    const { index, vehicle } = plateConflict;
+    setVehicles((prev) =>
+      prev.map((v, i) =>
+        i === index
+          ? {
+              plate_number: vehicle.plate_number,
+              mv_file_no: vehicle.mv_file_no,
+              engine_number: vehicle.engine_number,
+              chassis_number: vehicle.chassis_number,
+              make: vehicle.make || "",
+              model: vehicle.model || "",
+              year_model: vehicle.year_model || "",
+              vehicle_type: vehicle.vehicle_type || "",
+              color: vehicle.color || "",
+              existing_vehicle_id: vehicle.id,
+              reassign_owner: true,
+            }
+          : v
+      )
+    );
+    setPlateConflict(null);
+  }
+
+  function resetVehicleRow(index) {
+    setVehicles((prev) => prev.map((v, i) => (i === index ? { ...emptyVehicle } : v)));
+    delete lastCheckedPlateRef.current[index];
   }
 
   function handlePreview(e) {
@@ -731,6 +938,7 @@ export function PolicyApplication() {
       setCoverageStartAt("");
       setCoverageEndAt("");
       setVehicles([emptyVehicle]);
+      lastCheckedPlateRef.current = {};
       setRiskAddress(emptyAddress);
       setInsuredAddress(emptyAddress);
       setRemarks("");
@@ -1249,7 +1457,7 @@ export function PolicyApplication() {
                         </IconButton>
                       </Box>
                     )}
-                    {v.existing_vehicle_id && (
+                    {v.existing_vehicle_id && !v.reassign_owner && (
                       <Alert
                         severity="info"
                         sx={{ mb: 1.5 }}
@@ -1266,6 +1474,27 @@ export function PolicyApplication() {
                         }
                       >
                         You're using a vehicle already on file for this {insuredType === "INDIVIDUAL" ? "customer" : "company"}.
+                      </Alert>
+                    )}
+                    {v.reassign_owner && (
+                      <Alert
+                        severity="warning"
+                        sx={{ mb: 1.5 }}
+                        action={
+                          <Button
+                            color="inherit"
+                            size="small"
+                            variant="outlined"
+                            onClick={() => resetVehicleRow(index)}
+                          >
+                            Use a different vehicle
+                          </Button>
+                        }
+                      >
+                        This plate number is currently on file for a different{" "}
+                        {insuredType === "INDIVIDUAL" ? "customer" : "company"}. It will be reassigned to this{" "}
+                        {insuredType === "INDIVIDUAL" ? "customer" : "company"} once this application is submitted —
+                        you can still edit its details below.
                       </Alert>
                     )}
                     <Grid container spacing={2}>
@@ -1310,12 +1539,15 @@ export function PolicyApplication() {
                                         vehicle_type: value.vehicle_type || "",
                                         color: value.color || "",
                                         existing_vehicle_id: value.id,
+                                        reassign_owner: false,
                                       }
                                     : vv
                                 )
                               );
+                              lastCheckedPlateRef.current[index] = value.plate_number;
                             }
                           }}
+                          onBlur={() => handlePlateBlur(index)}
                           renderOption={(props, option) => (
                             <li {...props} key={option.id}>
                               {option.plate_number}
@@ -1343,7 +1575,7 @@ export function PolicyApplication() {
                           onChange={(e) => updateVehicleField(index, "mv_file_no", e.target.value)}
                           required
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id)}
+                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1353,7 +1585,7 @@ export function PolicyApplication() {
                           onChange={(e) => updateVehicleField(index, "engine_number", e.target.value)}
                           required
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id)}
+                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1363,7 +1595,7 @@ export function PolicyApplication() {
                           onChange={(e) => updateVehicleField(index, "chassis_number", e.target.value)}
                           required
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id)}
+                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1372,7 +1604,7 @@ export function PolicyApplication() {
                           value={v.vehicle_type}
                           onChange={(e) => updateVehicleField(index, "vehicle_type", e.target.value)}
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id)}
+                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1381,7 +1613,7 @@ export function PolicyApplication() {
                           value={v.make}
                           onChange={(e) => updateVehicleField(index, "make", e.target.value)}
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id)}
+                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1390,7 +1622,7 @@ export function PolicyApplication() {
                           value={v.model}
                           onChange={(e) => updateVehicleField(index, "model", e.target.value)}
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id)}
+                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1400,7 +1632,7 @@ export function PolicyApplication() {
                           value={v.year_model}
                           onChange={(e) => updateVehicleField(index, "year_model", e.target.value)}
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id)}
+                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1409,7 +1641,7 @@ export function PolicyApplication() {
                           value={v.color}
                           onChange={(e) => updateVehicleField(index, "color", e.target.value)}
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id)}
+                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
                         />
                       </Grid>
                     </Grid>
@@ -1427,7 +1659,21 @@ export function PolicyApplication() {
                 Risk Address
               </Typography>
               {riskAddress.existing_address_id && (
-                <Alert severity="info" sx={{ mb: 1.5 }}>
+                <Alert
+                  severity="info"
+                  sx={{ mb: 1.5 }}
+                  icon={<EditIcon fontSize="inherit" />}
+                  action={
+                    <Button
+                      color="inherit"
+                      size="small"
+                      variant="outlined"
+                      onClick={() => setEditingAddressField("risk")}
+                    >
+                      Edit Details
+                    </Button>
+                  }
+                >
                   Using an address already on file for this {insuredType === "INDIVIDUAL" ? "customer" : "company"}.
                 </Alert>
               )}
@@ -1550,7 +1796,21 @@ export function PolicyApplication() {
                 The address the policy will be named on.
               </Typography>
               {insuredAddress.existing_address_id && (
-                <Alert severity="info" sx={{ mb: 1.5 }}>
+                <Alert
+                  severity="info"
+                  sx={{ mb: 1.5 }}
+                  icon={<EditIcon fontSize="inherit" />}
+                  action={
+                    <Button
+                      color="inherit"
+                      size="small"
+                      variant="outlined"
+                      onClick={() => setEditingAddressField("insured")}
+                    >
+                      Edit Details
+                    </Button>
+                  }
+                >
                   Using an address already on file for this {insuredType === "INDIVIDUAL" ? "customer" : "company"}.
                 </Alert>
               )}
@@ -1865,11 +2125,44 @@ export function PolicyApplication() {
                     vehicle_type: updated.vehicle_type || "",
                     color: updated.color || "",
                     existing_vehicle_id: updated.id,
+                    reassign_owner: false,
                   }
                 : v
             )
           );
           setEditingVehicleIndex(null);
+          loadParties();
+        }}
+      />
+
+      <PlateConflictDialog
+        conflict={plateConflict}
+        onCancel={() => setPlateConflict(null)}
+        onConfirm={handleConfirmPlateMatch}
+      />
+
+      <AddressEditDialog
+        open={editingAddressField !== null}
+        onClose={() => setEditingAddressField(null)}
+        address={editingAddressField === "risk" ? riskAddress : editingAddressField === "insured" ? insuredAddress : null}
+        token={token}
+        onSaved={(updated) => {
+          const updatedFields = {
+            address_line_1: updated.address_line_1,
+            address_line_2: updated.address_line_2 || "",
+            barangay: updated.barangay || "",
+            city: updated.city,
+            province: updated.province,
+            postal_code: updated.postal_code || "",
+            country: updated.country || "Philippines",
+            existing_address_id: updated.id,
+          };
+          if (editingAddressField === "risk") {
+            setRiskAddress(updatedFields);
+          } else if (editingAddressField === "insured") {
+            setInsuredAddress(updatedFields);
+          }
+          setEditingAddressField(null);
           loadParties();
         }}
       />

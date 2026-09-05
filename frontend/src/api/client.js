@@ -117,6 +117,26 @@ export function updateVehicle(token, id, payload) {
   return request(`/vehicles/${id}`, { method: "PATCH", token, body: payload });
 }
 
+// A 404 here just means the plate isn't on file anywhere — that's an expected
+// outcome (it's a new vehicle), not an error, so it resolves to null instead
+// of throwing.
+export async function lookupVehicleByPlate(token, plateNumber) {
+  const headers = { Authorization: `Bearer ${token}` };
+  const res = await fetch(`${API_URL}/vehicles/lookup?plate_number=${encodeURIComponent(plateNumber)}`, { headers });
+  if (res.status === 404) {
+    return null;
+  }
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(data?.error || `Request failed with status ${res.status}`);
+  }
+  return data;
+}
+
+export function updateAddress(token, id, payload) {
+  return request(`/addresses/${id}`, { method: "PATCH", token, body: payload });
+}
+
 export function createPolicyApplication(token, payload) {
   return request("/policy-applications", { method: "POST", token, body: payload });
 }

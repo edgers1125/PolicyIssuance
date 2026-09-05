@@ -1,7 +1,9 @@
 const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { requirePermission, getUserPermissionCodes } = require("../middleware/permissions");
+const { requirePermission, ensurePermission, getUserPermissionCodes } = require("../middleware/permissions");
+const { validateBody } = require("../middleware/validate");
+const { updateCoverageSchema } = require("../schemas/catalog");
 
 const router = express.Router();
 
@@ -125,20 +127,18 @@ router.get("/coverages", requireAuth, async (req, res, next) => {
   }
 });
 
-router.patch("/coverages/:id", requireAuth, async (req, res, next) => {
+router.patch("/coverages/:id", requireAuth, validateBody(updateCoverageSchema), async (req, res, next) => {
   try {
     const { id } = req.params;
     const { clause, standard_rate, maximum_coverage } = req.body;
 
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
-    if (clause !== undefined && !actingPermissions.has("EDIT_CLAUSES")) {
-      return res.status(403).json({ error: "Missing required permission: EDIT_CLAUSES" });
-    }
+    if (clause !== undefined && !ensurePermission(res, actingPermissions, "EDIT_CLAUSES")) return;
     if (
       (standard_rate !== undefined || maximum_coverage !== undefined) &&
-      !actingPermissions.has("EDIT_COVERAGE_DEFAULTS")
+      !ensurePermission(res, actingPermissions, "EDIT_COVERAGE_DEFAULTS")
     ) {
-      return res.status(403).json({ error: "Missing required permission: EDIT_COVERAGE_DEFAULTS" });
+      return;
     }
 
     const coverage = await prisma.productCoverage.findUnique({ where: { id } });
@@ -146,27 +146,10 @@ router.patch("/coverages/:id", requireAuth, async (req, res, next) => {
       return res.status(404).json({ error: "Coverage not found" });
     }
 
-    const data = {};
-    if (clause !== undefined) {
-      if (!clause) {
-        return res.status(400).json({ error: "clause cannot be empty" });
-      }
-      data.clause = clause;
-    }
-    if (standard_rate !== undefined) {
-      if (standard_rate === null || Number(standard_rate) <= 0) {
-        return res.status(400).json({ error: "standard_rate must be a positive number" });
-      }
-      data.standard_rate = standard_rate;
-    }
-    if (maximum_coverage !== undefined) {
-      if (maximum_coverage === null || Number(maximum_coverage) <= 0) {
-        return res.status(400).json({ error: "maximum_coverage must be a positive number" });
-      }
-      data.maximum_coverage = maximum_coverage;
-    }
-
-    const updated = await prisma.productCoverage.update({ where: { id }, data });
+    const updated = await prisma.productCoverage.update({
+      where: { id },
+      data: { clause, standard_rate, maximum_coverage },
+    });
     res.json(updated);
   } catch (err) {
     next(err);

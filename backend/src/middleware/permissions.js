@@ -56,4 +56,13 @@ function requirePermission(permissionCode) {
   };
 }
 
-module.exports = { requirePermission, getUserPermissionCodes };
+// For the field-group case a route-level requirePermission() can't express —
+// e.g. a single PATCH where different fields need different grants. Returns
+// whether the check passed; the caller must `return` immediately when it's false.
+function ensurePermission(res, permissionCodes, permissionCode) {
+  if (permissionCodes.has(permissionCode)) return true;
+  res.status(403).json({ error: `Missing required permission: ${permissionCode}` });
+  return false;
+}
+
+module.exports = { requirePermission, ensurePermission, getUserPermissionCodes };

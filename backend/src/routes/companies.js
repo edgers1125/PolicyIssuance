@@ -2,23 +2,18 @@ const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
 const { requirePermission } = require("../middleware/permissions");
+const { validateBody } = require("../middleware/validate");
+const { getCurrentAgentId } = require("../lib/agent");
+const { companyInputSchema } = require("../schemas/companies");
 
 const router = express.Router();
 
 router.use(requireAuth, requirePermission("CREATE_APPLICATION"));
 
-async function getCurrentAgentId(req) {
-  const user = await prisma.user.findUnique({
-    where: { id: req.user.userId },
-    select: { agent_id: true },
-  });
-  return user?.agent_id || null;
-}
-
 // Companies connected to the logged-in agent only — not the whole company base.
 router.get("/", async (req, res, next) => {
   try {
-    const agentId = await getCurrentAgentId(req);
+    const agentId = await getCurrentAgentId(req.user.userId);
     if (!agentId) {
       return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
     }
@@ -34,7 +29,9 @@ router.get("/", async (req, res, next) => {
             tin_no: true,
             email: true,
             status: true,
-            company_vehicles: { select: { vehicle: true } },
+            // Excludes vehicles reassigned away from this company (sold to
+            // someone else) — those no longer count as "on file" here.
+            company_vehicles: { where: { ownership_end_date: null }, select: { vehicle: true } },
             company_addresses: { select: { address: true } },
           },
         },
@@ -56,18 +53,14 @@ router.get("/", async (req, res, next) => {
   }
 });
 
-router.post("/", async (req, res, next) => {
+router.post("/", validateBody(companyInputSchema), async (req, res, next) => {
   try {
-    const agentId = await getCurrentAgentId(req);
+    const agentId = await getCurrentAgentId(req.user.userId);
     if (!agentId) {
       return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
     }
 
     const { company_code, company_name, tin_no, email } = req.body;
-
-    if (!company_code || !company_name || !email) {
-      return res.status(400).json({ error: "company_code, company_name, and email are required" });
-    }
 
     const existingCode = await prisma.company.findUnique({ where: { company_code } });
     if (existingCode) {
@@ -95,10 +88,10 @@ router.post("/", async (req, res, next) => {
   }
 });
 
-router.patch("/:id", async (req, res, next) => {
+router.patch("/:id", validateBody(companyInputSchema), async (req, res, next) => {
   try {
     const { id } = req.params;
-    const agentId = await getCurrentAgentId(req);
+    const agentId = await getCurrentAgentId(req.user.userId);
     if (!agentId) {
       return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
     }
@@ -111,10 +104,6 @@ router.patch("/:id", async (req, res, next) => {
     }
 
     const { company_code, company_name, tin_no, email } = req.body;
-
-    if (!company_code || !company_name || !email) {
-      return res.status(400).json({ error: "company_code, company_name, and email are required" });
-    }
 
     const existingCode = await prisma.company.findUnique({ where: { company_code } });
     if (existingCode && existingCode.id !== id) {

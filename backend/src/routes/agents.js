@@ -1,7 +1,9 @@
 const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { requirePermission, getUserPermissionCodes } = require("../middleware/permissions");
+const { requirePermission, ensurePermission, getUserPermissionCodes } = require("../middleware/permissions");
+const { validateBody } = require("../middleware/validate");
+const { updateNetratesSchema } = require("../schemas/agents");
 
 const router = express.Router();
 
@@ -89,9 +91,7 @@ router.get("/", async (req, res, next) => {
 router.get("/:id/netrates", async (req, res, next) => {
   try {
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
-    if (!actingPermissions.has("MANAGE_AGENT_RATES")) {
-      return res.status(403).json({ error: "Missing required permission: MANAGE_AGENT_RATES" });
-    }
+    if (!ensurePermission(res, actingPermissions, "MANAGE_AGENT_RATES")) return;
 
     const { id } = req.params;
 
@@ -140,29 +140,17 @@ router.get("/:id/netrates", async (req, res, next) => {
 
 // Replaces this agent's entire override set with the given list — any coverage
 // left out simply falls back to the product's standard rate/cap.
-router.put("/:id/netrates", async (req, res, next) => {
+router.put("/:id/netrates", validateBody(updateNetratesSchema), async (req, res, next) => {
   try {
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
-    if (!actingPermissions.has("MANAGE_AGENT_RATES")) {
-      return res.status(403).json({ error: "Missing required permission: MANAGE_AGENT_RATES" });
-    }
+    if (!ensurePermission(res, actingPermissions, "MANAGE_AGENT_RATES")) return;
 
     const { id } = req.params;
     const { netrates } = req.body;
 
-    if (!Array.isArray(netrates)) {
-      return res.status(400).json({ error: "netrates must be an array" });
-    }
-
     const agent = await prisma.agent.findUnique({ where: { id } });
     if (!agent) {
       return res.status(404).json({ error: "Agent not found" });
-    }
-
-    for (const nr of netrates) {
-      if (!nr.coverage_id || nr.netrate === undefined || nr.netrate === null) {
-        return res.status(400).json({ error: "Each entry needs a coverage_id and netrate" });
-      }
     }
 
     await prisma.$transaction(async (tx) => {

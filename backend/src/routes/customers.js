@@ -2,23 +2,18 @@ const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
 const { requirePermission } = require("../middleware/permissions");
+const { validateBody } = require("../middleware/validate");
+const { getCurrentAgentId } = require("../lib/agent");
+const { customerInputSchema } = require("../schemas/customers");
 
 const router = express.Router();
 
 router.use(requireAuth, requirePermission("CREATE_APPLICATION"));
 
-async function getCurrentAgentId(req) {
-  const user = await prisma.user.findUnique({
-    where: { id: req.user.userId },
-    select: { agent_id: true },
-  });
-  return user?.agent_id || null;
-}
-
 // Customers connected to the logged-in agent only — not the whole customer base.
 router.get("/", async (req, res, next) => {
   try {
-    const agentId = await getCurrentAgentId(req);
+    const agentId = await getCurrentAgentId(req.user.userId);
     if (!agentId) {
       return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
     }
@@ -37,7 +32,9 @@ router.get("/", async (req, res, next) => {
             birthday: true,
             gender: true,
             status: true,
-            customer_vehicles: { select: { vehicle: true } },
+            // Excludes vehicles reassigned away from this customer (sold to
+            // someone else) — those no longer count as "on file" here.
+            customer_vehicles: { where: { ownership_end_date: null }, select: { vehicle: true } },
             customer_addresses: { select: { address: true } },
           },
         },
@@ -59,18 +56,14 @@ router.get("/", async (req, res, next) => {
   }
 });
 
-router.post("/", async (req, res, next) => {
+router.post("/", validateBody(customerInputSchema), async (req, res, next) => {
   try {
-    const agentId = await getCurrentAgentId(req);
+    const agentId = await getCurrentAgentId(req.user.userId);
     if (!agentId) {
       return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
     }
 
     const { first_name, last_name, middle_name, birthday, gender, email, mobile_number } = req.body;
-
-    if (!first_name || !last_name || !email) {
-      return res.status(400).json({ error: "first_name, last_name, and email are required" });
-    }
 
     const existing = await prisma.customer.findUnique({ where: { email } });
     if (existing) {
@@ -82,7 +75,7 @@ router.post("/", async (req, res, next) => {
         first_name,
         last_name,
         middle_name: middle_name || null,
-        birthday: birthday ? new Date(birthday) : null,
+        birthday: birthday || null,
         gender: gender || null,
         email,
         mobile_number: mobile_number || null,
@@ -97,10 +90,10 @@ router.post("/", async (req, res, next) => {
   }
 });
 
-router.patch("/:id", async (req, res, next) => {
+router.patch("/:id", validateBody(customerInputSchema), async (req, res, next) => {
   try {
     const { id } = req.params;
-    const agentId = await getCurrentAgentId(req);
+    const agentId = await getCurrentAgentId(req.user.userId);
     if (!agentId) {
       return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
     }
@@ -114,10 +107,6 @@ router.patch("/:id", async (req, res, next) => {
 
     const { first_name, last_name, middle_name, birthday, gender, email, mobile_number } = req.body;
 
-    if (!first_name || !last_name || !email) {
-      return res.status(400).json({ error: "first_name, last_name, and email are required" });
-    }
-
     const existing = await prisma.customer.findUnique({ where: { email } });
     if (existing && existing.id !== id) {
       return res.status(409).json({ error: "A customer with this email already exists" });
@@ -129,7 +118,7 @@ router.patch("/:id", async (req, res, next) => {
         first_name,
         last_name,
         middle_name: middle_name || null,
-        birthday: birthday ? new Date(birthday) : null,
+        birthday: birthday || null,
         gender: gender || null,
         email,
         mobile_number: mobile_number || null,

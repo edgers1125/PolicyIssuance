@@ -11,5 +11,66 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  backend:
+    image: node:22
+    working_dir: /app
+    depends_on:
+      - db
+    environment:
+      # Overrides the localhost value in backend/.env so the container reaches
+      # the db service by its Docker network name instead.
+      DATABASE_URL: postgresql://policyapp:policyapp@db:5432/policyissuance
+      # Docker Desktop's bind mount doesn't forward host filesystem events into
+      # the container, so nodemon's default (inotify-based) watcher never sees
+      # edits made from Windows — it has to poll for changes instead.
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./backend:/app
+      # node_modules/generated client are native/platform-specific — kept out
+      # of the bind mount so the container's Linux build never clobbers the
+      # host's Windows one (or vice versa).
+      - backend_node_modules:/app/node_modules
+      - backend_generated:/app/generated
+    command: sh -c "npm install && npx prisma generate && npm run dev"
+
+  prisma-studio:
+    image: node:22
+    working_dir: /app
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgresql://policyapp:policyapp@db:5432/policyissuance
+      BROWSER: none
+    ports:
+      - "5555:5555"
+    volumes:
+      - ./backend:/app
+      - studio_node_modules:/app/node_modules
+      - studio_generated:/app/generated
+    command: sh -c "npm install && npx prisma generate && npx prisma studio --port 5555"
+
+  frontend:
+    image: node:22-alpine
+    working_dir: /app
+    depends_on:
+      - backend
+    environment:
+      # Same bind-mount limitation as the backend service — Vite's watcher
+      # needs polling to notice edits made from the Windows host.
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+
 volumes:
   pgdata:
+  backend_node_modules:
+  backend_generated:
+  studio_node_modules:
+  studio_generated:
+  frontend_node_modules:
