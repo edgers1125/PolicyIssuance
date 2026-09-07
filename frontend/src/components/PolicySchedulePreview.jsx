@@ -247,7 +247,7 @@ export function PolicySchedulePreview({
             <thead>
               <tr style={{ borderBottom: "1px solid #111" }}>
                 <td style={{ padding: "4px 0" }}>Coverage</td>
-                <td style={{ padding: "4px 0", textAlign: "right" }}>Amount</td>
+                <td style={{ padding: "4px 0", textAlign: "right" }}>Amount Covered</td>
                 <td style={{ padding: "4px 0", textAlign: "right" }}>Premium</td>
               </tr>
             </thead>

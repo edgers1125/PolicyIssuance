@@ -11,6 +11,7 @@ const agentsRouter = require("./routes/agents");
 const vehiclesRouter = require("./routes/vehicles");
 const addressesRouter = require("./routes/addresses");
 const catalogRouter = require("./routes/catalog");
+const coveragePricingRouter = require("./routes/coveragePricing");
 const policyApplicationsRouter = require("./routes/policyApplications");
 const paymentMethodsRouter = require("./routes/paymentMethods");
 const { requireAuth } = require("./middleware/auth");
@@ -29,6 +30,7 @@ app.use("/agents", agentsRouter);
 app.use("/vehicles", vehiclesRouter);
 app.use("/addresses", addressesRouter);
 app.use("/", catalogRouter);
+app.use("/", coveragePricingRouter);
 app.use("/policy-applications", policyApplicationsRouter);
 app.use("/payment-methods", paymentMethodsRouter);
 

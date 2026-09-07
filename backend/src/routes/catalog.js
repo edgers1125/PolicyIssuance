@@ -50,8 +50,11 @@ router.get(
                   coverage_code: true,
                   coverage_name: true,
                   maximum_coverage: true,
-                  standard_rate: true,
                   clause: true,
+                  pricing_mode: true,
+                  percentage_pricing: { select: { standard_rate: true } },
+                  value_percentage_tiers: { orderBy: { min_value: "asc" } },
+                  tier_based_prices: { orderBy: { coverage_amount: "asc" } },
                 },
               },
             },
@@ -69,7 +72,10 @@ router.get(
             const override = overridesByCoverageId.get(cov.id);
             return {
               ...cov,
-              rate: override ? override.netrate : cov.standard_rate,
+              // Only meaningful for PERCENTAGE-mode coverages — a
+              // VALUE_PERCENTAGE/FLAT_TIER one has no percentage_pricing row
+              // at all, so this just falls back to 0 (unused either way).
+              rate: override ? override.netrate : (cov.percentage_pricing?.standard_rate ?? 0),
               effective_maximum_coverage:
                 override && override.maximum_coverage !== null ? override.maximum_coverage : cov.maximum_coverage,
               is_custom_rate: Boolean(override),
@@ -90,8 +96,14 @@ router.get(
 router.get("/coverages", requireAuth, async (req, res, next) => {
   try {
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
-    if (!actingPermissions.has("EDIT_CLAUSES") && !actingPermissions.has("EDIT_COVERAGE_DEFAULTS")) {
-      return res.status(403).json({ error: "Missing required permission: EDIT_CLAUSES or EDIT_COVERAGE_DEFAULTS" });
+    if (
+      !actingPermissions.has("EDIT_CLAUSES") &&
+      !actingPermissions.has("EDIT_COVERAGE_DEFAULTS") &&
+      !actingPermissions.has("MANAGE_COVERAGE_PRICING")
+    ) {
+      return res.status(403).json({
+        error: "Missing required permission: EDIT_CLAUSES, EDIT_COVERAGE_DEFAULTS, or MANAGE_COVERAGE_PRICING",
+      });
     }
 
     const coverages = await prisma.productCoverage.findMany({
@@ -102,8 +114,9 @@ router.get("/coverages", requireAuth, async (req, res, next) => {
         coverage_code: true,
         coverage_name: true,
         maximum_coverage: true,
-        standard_rate: true,
         clause: true,
+        pricing_mode: true,
+        percentage_pricing: { select: { standard_rate: true } },
         product_variant: {
           select: { variant_name: true, insurance_class: { select: { class_name: true } } },
         },
@@ -118,8 +131,9 @@ router.get("/coverages", requireAuth, async (req, res, next) => {
         class_name: c.product_variant.insurance_class.class_name,
         variant_name: c.product_variant.variant_name,
         maximum_coverage: c.maximum_coverage,
-        standard_rate: c.standard_rate,
+        standard_rate: c.percentage_pricing?.standard_rate ?? null,
         clause: c.clause,
+        pricing_mode: c.pricing_mode,
       }))
     );
   } catch (err) {
@@ -130,15 +144,21 @@ router.get("/coverages", requireAuth, async (req, res, next) => {
 router.patch("/coverages/:id", requireAuth, validateBody(updateCoverageSchema), async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { clause, standard_rate, maximum_coverage } = req.body;
+    const { clause, maximum_coverage } = req.body;
 
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
     if (clause !== undefined && !ensurePermission(res, actingPermissions, "EDIT_CLAUSES")) return;
+    // Editing lives on the Manage Coverage Pricing page now, but
+    // EDIT_COVERAGE_DEFAULTS is left valid too so no existing role loses this
+    // ability just because the field moved pages.
     if (
-      (standard_rate !== undefined || maximum_coverage !== undefined) &&
-      !ensurePermission(res, actingPermissions, "EDIT_COVERAGE_DEFAULTS")
+      maximum_coverage !== undefined &&
+      !actingPermissions.has("EDIT_COVERAGE_DEFAULTS") &&
+      !actingPermissions.has("MANAGE_COVERAGE_PRICING")
     ) {
-      return;
+      return res.status(403).json({
+        error: "Missing required permission: EDIT_COVERAGE_DEFAULTS or MANAGE_COVERAGE_PRICING",
+      });
     }
 
     const coverage = await prisma.productCoverage.findUnique({ where: { id } });
@@ -148,7 +168,7 @@ router.patch("/coverages/:id", requireAuth, validateBody(updateCoverageSchema), 
 
     const updated = await prisma.productCoverage.update({
       where: { id },
-      data: { clause, standard_rate, maximum_coverage },
+      data: { clause, maximum_coverage },
     });
     res.json(updated);
   } catch (err) {

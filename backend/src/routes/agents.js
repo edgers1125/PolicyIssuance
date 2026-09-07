@@ -108,7 +108,7 @@ router.get("/:id/netrates", async (req, res, next) => {
         coverage_code: true,
         coverage_name: true,
         maximum_coverage: true,
-        standard_rate: true,
+        percentage_pricing: { select: { standard_rate: true } },
         product_variant: {
           select: { variant_name: true, insurance_class: { select: { class_name: true } } },
         },
@@ -126,7 +126,7 @@ router.get("/:id/netrates", async (req, res, next) => {
         coverage_name: c.coverage_name,
         class_name: c.product_variant.insurance_class.class_name,
         variant_name: c.product_variant.variant_name,
-        standard_rate: c.standard_rate,
+        standard_rate: c.percentage_pricing?.standard_rate ?? null,
         standard_maximum_coverage: c.maximum_coverage,
         override: c.agent_netrates[0]
           ? { netrate: c.agent_netrates[0].netrate, maximum_coverage: c.agent_netrates[0].maximum_coverage }

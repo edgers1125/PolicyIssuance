@@ -8,7 +8,7 @@ import { Settings } from "./pages/Settings";
 import { RoleDefaultPermissions } from "./pages/RoleDefaultPermissions";
 import { CreateRole } from "./pages/CreateRole";
 import { EditClauses } from "./pages/EditClauses";
-import { EditCoverageDefaults } from "./pages/EditCoverageDefaults";
+import { ManageCoveragePricing } from "./pages/ManageCoveragePricing";
 import { AuthorizedPaymentMethods } from "./pages/AuthorizedPaymentMethods";
 import { PolicyApplication } from "./pages/PolicyApplication";
 import { MyAgents } from "./pages/MyAgents";
@@ -113,18 +113,18 @@ function App() {
           }
         />
         <Route
-          path="/settings/edit-coverage-defaults"
-          element={
-            <RequirePermission permission="EDIT_COVERAGE_DEFAULTS">
-              <EditCoverageDefaults />
-            </RequirePermission>
-          }
-        />
-        <Route
           path="/settings/payment-methods"
           element={
             <RequirePermission permission="MANAGE_PAYMENT_METHODS">
               <AuthorizedPaymentMethods />
+            </RequirePermission>
+          }
+        />
+        <Route
+          path="/settings/coverage-pricing"
+          element={
+            <RequirePermission permission="MANAGE_COVERAGE_PRICING">
+              <ManageCoveragePricing />
             </RequirePermission>
           }
         />

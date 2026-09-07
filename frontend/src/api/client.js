@@ -164,3 +164,21 @@ export function createPaymentMethod(token, name) {
 export function deletePaymentMethod(token, id) {
   return request(`/payment-methods/${id}`, { method: "DELETE", token });
 }
+
+export function getCoveragePricing(token, coverageId) {
+  return request(`/coverages/${coverageId}/pricing`, { token });
+}
+
+// payload is { pricing_mode, standard_rate? } — standard_rate only applies
+// (and is only saved) when pricing_mode is PERCENTAGE.
+export function updateCoveragePricingMode(token, coverageId, payload) {
+  return request(`/coverages/${coverageId}/pricing`, { method: "PATCH", token, body: payload });
+}
+
+export function updateValuePercentageTiers(token, coverageId, tiers) {
+  return request(`/coverages/${coverageId}/value-percentage-tiers`, { method: "PUT", token, body: { tiers } });
+}
+
+export function updateFlatTiers(token, coverageId, tiers) {
+  return request(`/coverages/${coverageId}/flat-tiers`, { method: "PUT", token, body: { tiers } });
+}

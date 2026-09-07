@@ -5,6 +5,7 @@ const { requirePermission } = require("../middleware/permissions");
 const { validateBody, validateQuery } = require("../middleware/validate");
 const { getCurrentAgentId } = require("../lib/agent");
 const { updateVehicleSchema, lookupVehicleQuerySchema } = require("../schemas/vehicles");
+const { currentVehicleValue } = require("../lib/vehicleValue");
 
 const router = express.Router();
 
@@ -16,10 +17,14 @@ router.use(requireAuth, requirePermission("CREATE_APPLICATION"));
 // own details and its current owner's display name are exposed, nothing else.
 router.get("/lookup", validateQuery(lookupVehicleQuerySchema), async (req, res, next) => {
   try {
-    const { plate_number } = req.query;
+    // Case and stray whitespace shouldn't matter here — an agent typing a
+    // plate by hand won't reliably match how it happens to be cased on file,
+    // and the on-screen suggestion list already matches case-insensitively,
+    // so this lookup needs to as well or a "found" plate can silently 404.
+    const plateNumber = req.query.plate_number.trim();
 
     const vehicle = await prisma.vehicle.findFirst({
-      where: { plate_number },
+      where: { plate_number: { equals: plateNumber, mode: "insensitive" } },
       orderBy: { created_at: "desc" },
       include: {
         customer_vehicles: {
@@ -51,6 +56,9 @@ router.get("/lookup", validateQuery(lookupVehicleQuerySchema), async (req, res, 
       year_model: vehicle.year_model,
       vehicle_type: vehicle.vehicle_type,
       color: vehicle.color,
+      estimated_value: vehicle.estimated_value,
+      initial_assessment_date: vehicle.initial_assessment_date,
+      current_value: currentVehicleValue(vehicle.estimated_value, vehicle.initial_assessment_date),
       current_owner: currentCustomer
         ? { type: "CUSTOMER", id: currentCustomer.id, name: `${currentCustomer.first_name} ${currentCustomer.last_name}` }
         : currentCompany
@@ -97,8 +105,27 @@ router.patch("/:id", validateBody(updateVehicleSchema), async (req, res, next) =
       return res.status(403).json({ error: "This vehicle isn't connected to your agent account" });
     }
 
-    const { plate_number, mv_file_no, engine_number, chassis_number, make, model, year_model, vehicle_type, color } =
-      req.body;
+    const {
+      plate_number,
+      mv_file_no,
+      engine_number,
+      chassis_number,
+      make,
+      model,
+      year_model,
+      vehicle_type,
+      color,
+      estimated_value,
+    } = req.body;
+
+    // Once a vehicle has ever been assessed, both the value and the date are
+    // frozen — the value only ever moves through automatic depreciation from
+    // here on, never a direct edit, no matter what the client sends.
+    const current = await prisma.vehicle.findUnique({
+      where: { id },
+      select: { estimated_value: true, initial_assessment_date: true },
+    });
+    const alreadyAssessed = Boolean(current?.initial_assessment_date);
 
     const vehicle = await prisma.vehicle.update({
       where: { id },
@@ -112,6 +139,12 @@ router.patch("/:id", validateBody(updateVehicleSchema), async (req, res, next) =
         year_model: year_model ?? null,
         vehicle_type: vehicle_type || null,
         color: color || null,
+        estimated_value: alreadyAssessed ? current.estimated_value : (estimated_value ?? null),
+        initial_assessment_date: alreadyAssessed
+          ? current.initial_assessment_date
+          : estimated_value !== undefined
+            ? new Date()
+            : null,
       },
     });
 

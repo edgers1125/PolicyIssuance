@@ -58,6 +58,11 @@ model Vehicle {
   year_model     Int?
   vehicle_type   String?  @db.VarChar(50)
   color          String?  @db.VarChar(50)
+  estimated_value Decimal? @db.Decimal(18, 2)
+  // Stamped automatically the first time an estimated_value is ever set on
+  // this vehicle — never edited directly, and never moved once set, even if
+  // the value itself is later revised.
+  initial_assessment_date DateTime? @db.Date
   created_at     DateTime @default(now())
   updated_at     DateTime @updatedAt
 
@@ -65,6 +70,7 @@ model Vehicle {
   company_vehicles            CompanyVehicle[]
   policy_application_vehicles PolicyApplicationVehicle[]
   policy_vehicles             PolicyVehicle[]
+  application_coverages       ApplicationCoverage[]
 }
 
 model CustomerVehicle {

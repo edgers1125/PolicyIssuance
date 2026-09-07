@@ -123,6 +123,12 @@ const PERMISSIONS = [
     group: "Settings",
     description: "Add or remove which payment methods Bethel accepts directly",
   },
+  {
+    code: "MANAGE_COVERAGE_PRICING",
+    name: "Manage Coverage Pricing",
+    group: "Settings",
+    description: "Choose how a coverage is priced and manage its value/tier pricing tables",
+  },
 ];
 
 async function main() {
@@ -242,12 +248,11 @@ async function main() {
 
     for (const c of COVERAGES) {
       const coverageCode = `${v.code}_${c.code}`;
-      await prisma.productCoverage.upsert({
+      const coverage = await prisma.productCoverage.upsert({
         where: { coverage_code: coverageCode },
         update: {
           coverage_name: c.name,
           maximum_coverage: c.max,
-          standard_rate: c.rate,
           clause: c.clause,
           product_variant_id: variant.id,
         },
@@ -255,11 +260,15 @@ async function main() {
           coverage_code: coverageCode,
           coverage_name: c.name,
           maximum_coverage: c.max,
-          standard_rate: c.rate,
           clause: c.clause,
           product_variant_id: variant.id,
           status: "ACTIVE",
         },
+      });
+      await prisma.coveragePercentageBasedPricing.upsert({
+        where: { coverage_id: coverage.id },
+        update: { standard_rate: c.rate },
+        create: { coverage_id: coverage.id, standard_rate: c.rate },
       });
     }
   }
@@ -312,12 +321,11 @@ async function main() {
 
     for (const c of PROPERTY_COVERAGES) {
       const coverageCode = `${v.code}_${c.code}`;
-      await prisma.productCoverage.upsert({
+      const coverage = await prisma.productCoverage.upsert({
         where: { coverage_code: coverageCode },
         update: {
           coverage_name: c.name,
           maximum_coverage: c.max,
-          standard_rate: c.rate,
           clause: c.clause,
           product_variant_id: variant.id,
         },
@@ -325,11 +333,15 @@ async function main() {
           coverage_code: coverageCode,
           coverage_name: c.name,
           maximum_coverage: c.max,
-          standard_rate: c.rate,
           clause: c.clause,
           product_variant_id: variant.id,
           status: "ACTIVE",
         },
+      });
+      await prisma.coveragePercentageBasedPricing.upsert({
+        where: { coverage_id: coverage.id },
+        update: { standard_rate: c.rate },
+        create: { coverage_id: coverage.id, standard_rate: c.rate },
       });
     }
   }

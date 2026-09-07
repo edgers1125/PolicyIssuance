@@ -28,21 +28,71 @@ model ProductVariant {
 }
 
 model ProductCoverage {
-  id                 String       @id @default(uuid()) @db.Uuid
-  product_variant_id String       @db.Uuid
-  coverage_code      String       @unique @db.VarChar(50)
-  coverage_name      String       @db.VarChar(255)
-  maximum_coverage   Decimal      @db.Decimal(18, 2)
-  standard_rate      Decimal      @db.Decimal(10, 6)
-  clause             String       @db.Text
+  id                 String              @id @default(uuid()) @db.Uuid
+  product_variant_id String              @db.Uuid
+  coverage_code      String              @unique @db.VarChar(50)
+  coverage_name      String              @db.VarChar(255)
+  maximum_coverage   Decimal             @db.Decimal(18, 2)
+  clause             String              @db.Text
   status             RecordStatus
-  created_at         DateTime     @default(now())
-  updated_at         DateTime     @updatedAt
+  pricing_mode       CoveragePricingMode @default(PERCENTAGE)
+  created_at         DateTime            @default(now())
+  updated_at         DateTime            @updatedAt
 
-  product_variant       ProductVariant        @relation(fields: [product_variant_id], references: [id])
-  agent_netrates        AgentNetrate[]
-  application_coverages ApplicationCoverage[]
-  policy_coverages      PolicyCoverage[]
+  product_variant         ProductVariant                  @relation(fields: [product_variant_id], references: [id])
+  agent_netrates          AgentNetrate[]
+  application_coverages   ApplicationCoverage[]
+  policy_coverages        PolicyCoverage[]
+  value_percentage_tiers  CoverageValuePercentageTier[]
+  tier_based_prices       CoverageTierBasedPricing[]
+  percentage_pricing      CoveragePercentageBasedPricing?
 
   @@index([product_variant_id])
+}
+
+// PERCENTAGE mode's standard/default rate — pulled out of ProductCoverage
+// itself since a coverage might not be PERCENTAGE-priced at all, and keeping
+// it there implied every coverage had one. Absent for a VALUE_PERCENTAGE or
+// FLAT_TIER coverage; required for a PERCENTAGE one.
+model CoveragePercentageBasedPricing {
+  id            String   @id @default(uuid()) @db.Uuid
+  coverage_id   String   @unique @db.Uuid
+  standard_rate Decimal  @db.Decimal(10, 6)
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  coverage ProductCoverage @relation(fields: [coverage_id], references: [id])
+}
+
+// VALUE_PERCENTAGE mode: the rate for a given vehicle is whichever tier has
+// the highest min_value that's still <= the vehicle's current (depreciated)
+// value — same shape as a tax bracket table, so tiers can be added or removed
+// without needing to keep adjacent max values in sync.
+model CoverageValuePercentageTier {
+  id              String   @id @default(uuid()) @db.Uuid
+  coverage_id     String   @db.Uuid
+  min_value       Decimal  @db.Decimal(18, 2)
+  rate_percentage Decimal  @db.Decimal(7, 4)
+  created_at      DateTime @default(now())
+
+  coverage ProductCoverage @relation(fields: [coverage_id], references: [id])
+
+  @@unique([coverage_id, min_value])
+  @@index([coverage_id])
+}
+
+// FLAT_TIER mode: the agent picks one of these fixed coverage-amount options
+// for the coverage and the matching price is charged — no computation, no
+// agent margin.
+model CoverageTierBasedPricing {
+  id              String   @id @default(uuid()) @db.Uuid
+  coverage_id     String   @db.Uuid
+  coverage_amount Decimal  @db.Decimal(18, 2)
+  coverage_price  Decimal  @db.Decimal(18, 2)
+  created_at      DateTime @default(now())
+
+  coverage ProductCoverage @relation(fields: [coverage_id], references: [id])
+
+  @@unique([coverage_id, coverage_amount])
+  @@index([coverage_id])
 }

@@ -80,3 +80,17 @@ enum AddressRole {
   RISK
   INSURED
 }
+
+// How a coverage's premium gets computed:
+//  - PERCENTAGE: the existing model — agent enters a coverage amount and
+//    premium, floored by the standard/net rate (unchanged behavior).
+//  - VALUE_PERCENTAGE: fully computed from the insured vehicle's current
+//    (depreciated) value against this coverage's value/rate tiers — no
+//    agent-entered amount or margin.
+//  - FLAT_TIER: the agent picks one of this coverage's fixed
+//    coverage-amount/price pairs — also no agent margin.
+enum CoveragePricingMode {
+  PERCENTAGE
+  VALUE_PERCENTAGE
+  FLAT_TIER
+}

@@ -27,6 +27,10 @@ const vehicleInputSchema = z.object({
   year_model: z.preprocess((v) => (v === "" ? undefined : v), z.coerce.number().int().optional()),
   vehicle_type: z.string().optional(),
   color: z.string().optional(),
+  // The UI sends "" for a blank value field — treat that as omitted.
+  // initial_assessment_date is deliberately not accepted here — it's stamped
+  // automatically by the route the first time a value is recorded.
+  estimated_value: z.preprocess((v) => (v === "" ? undefined : v), z.coerce.number().nonnegative().optional()),
   existing_vehicle_id: z.string().nullable().optional(),
   // Set once the agent has confirmed a plate match against a vehicle on file
   // for a different customer/company — tells the route to move ownership to
@@ -38,6 +42,12 @@ const coverageSelectionSchema = z.object({
   coverage_id: requiredString("coverage_id"),
   coverage_amount: z.coerce.number({ error: "coverage_amount is required" }).nonnegative(),
   premium_amount: z.coerce.number({ error: "premium_amount is required" }).nonnegative(),
+  // Indices into the `vehicles` array this coverage applies to — null/omitted
+  // means the whole policy (every vehicle on the application); a non-empty
+  // array means exactly those vehicles (e.g. [0, 2] for vehicle 1 and 3 of a
+  // 3-vehicle fleet). An empty array is rejected — a specific selection has
+  // to name at least one vehicle.
+  vehicle_indices: z.array(z.coerce.number().int().nonnegative()).nonempty().nullable().optional(),
 });
 
 // Whether each class needs a vehicle, a risk address, etc. depends on a DB

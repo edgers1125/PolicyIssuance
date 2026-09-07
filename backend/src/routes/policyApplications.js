@@ -5,6 +5,7 @@ const { requireAuth } = require("../middleware/auth");
 const { requirePermission, ensurePermission, getUserPermissionCodes } = require("../middleware/permissions");
 const { validateBody } = require("../middleware/validate");
 const { createApplicationSchema } = require("../schemas/policyApplications");
+const { currentVehicleValue, findApplicableValueTier } = require("../lib/vehicleValue");
 
 const router = express.Router();
 
@@ -87,6 +88,28 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       return res.status(400).json({ error: "An insured address is required for this application" });
     }
 
+    // VALUE_PERCENTAGE coverages price off whichever vehicle they're scoped
+    // to (or the primary/first vehicle, for one that applies to the whole
+    // policy) — for an existing vehicle this is looked up fresh from the
+    // database (its value/date are frozen once assessed, so this is the
+    // authoritative figure); a brand-new vehicle is being assessed for the
+    // first time right now, so "now" is its assessment date.
+    async function resolveVehicleValue(v) {
+      if (!v) return null;
+      if (v.existing_vehicle_id) {
+        const dbVehicle = await prisma.vehicle.findUnique({
+          where: { id: v.existing_vehicle_id },
+          select: { estimated_value: true, initial_assessment_date: true },
+        });
+        return currentVehicleValue(dbVehicle?.estimated_value, dbVehicle?.initial_assessment_date);
+      }
+      if (v.estimated_value !== undefined) {
+        return currentVehicleValue(v.estimated_value, new Date());
+      }
+      return null;
+    }
+    const vehicleValues = className === "Motor" ? await Promise.all(vehicles.map(resolveVehicleValue)) : [];
+
     const user = await prisma.user.findUnique({
       where: { id: req.user.userId },
       select: { agent_id: true },
@@ -117,10 +140,20 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
     // given one for it, otherwise the product's standard rate. The premium the
     // agent charges can't come in under that floor, and coverage can't exceed
     // whichever maximum applies (agent-specific override, else the product's own).
+    // That's PERCENTAGE pricing specifically — VALUE_PERCENTAGE and FLAT_TIER
+    // coverages are priced entirely by the server below, with no agent margin.
     const coverageIds = coverages.map((c) => c.coverage_id);
     const coverageDetails = await prisma.productCoverage.findMany({
       where: { id: { in: coverageIds } },
-      select: { id: true, coverage_name: true, maximum_coverage: true, standard_rate: true },
+      select: {
+        id: true,
+        coverage_name: true,
+        maximum_coverage: true,
+        pricing_mode: true,
+        percentage_pricing: { select: { standard_rate: true } },
+        value_percentage_tiers: true,
+        tier_based_prices: true,
+      },
     });
     const coverageById = new Map(coverageDetails.map((c) => [c.id, c]));
     if (coverageDetails.length !== new Set(coverageIds).size) {
@@ -133,19 +166,90 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
     });
     const overrideByCoverageId = new Map(netrateOverrides.map((o) => [o.product_coverage_id, o]));
 
-    // Captured per coverage so the transaction below can freeze the rate that was
-    // actually in effect at submission time, regardless of what it becomes later.
-    const effectiveRateByCoverageId = new Map();
+    // A coverage's vehicle_indices are positions in the `vehicles` array, not
+    // real vehicle ids — the vehicles they name might not exist in the
+    // database yet (they're created further down, inside the transaction).
+    // null/omitted means the whole policy: every vehicle on the application.
+    // Rather than storing one row with a scaled-up amount, this produces one
+    // ApplicationCoverage row per targeted vehicle — a coverage picked once
+    // but meant to cover 2 vehicles becomes 2 rows, each at the entered
+    // per-vehicle amount, so the total is the same either way and each row
+    // still reads as "this coverage, for this vehicle, at this amount."
+    for (const c of coverages) {
+      if (c.vehicle_indices == null) continue;
+      if (className !== "Motor" || c.vehicle_indices.some((i) => i >= vehicles.length)) {
+        return res.status(400).json({ error: "vehicle_indices does not match any vehicle on this application" });
+      }
+    }
+
+    // One entry per (coverage, targeted vehicle) — never trusted verbatim
+    // from the client for VALUE_PERCENTAGE or FLAT_TIER, since those have no
+    // agent-editable margin.
+    const resolvedRows = [];
 
     for (const c of coverages) {
       const coverage = coverageById.get(c.coverage_id);
+      const targetIndices =
+        className === "Motor" ? (c.vehicle_indices ?? vehicles.map((_, i) => i)) : [null];
+
+      if (coverage.pricing_mode === "VALUE_PERCENTAGE") {
+        for (const vehicleIndex of targetIndices) {
+          const targetValue = vehicleIndex !== null ? vehicleValues[vehicleIndex] : null;
+          if (targetValue === null || targetValue === undefined) {
+            return res.status(400).json({
+              error: `${coverage.coverage_name} is priced from the vehicle's estimated value, which hasn't been assessed yet`,
+            });
+          }
+          const tier = findApplicableValueTier(coverage.value_percentage_tiers, targetValue);
+          if (!tier) {
+            return res.status(400).json({
+              error: `No pricing tier is configured for ${coverage.coverage_name} at this vehicle's current value`,
+            });
+          }
+          const rate = Number(tier.rate_percentage) / 100;
+          resolvedRows.push({
+            coverage_id: c.coverage_id,
+            coverage_amount: round2(targetValue),
+            premium_amount: round2(targetValue * rate),
+            applied_rate: rate,
+            vehicle_index: vehicleIndex,
+          });
+        }
+        continue;
+      }
+
+      if (coverage.pricing_mode === "FLAT_TIER") {
+        const tier = coverage.tier_based_prices.find((t) => Number(t.coverage_amount) === c.coverage_amount);
+        if (!tier) {
+          return res.status(400).json({
+            error: `coverage_amount for ${coverage.coverage_name} does not match one of its available tiers`,
+          });
+        }
+        for (const vehicleIndex of targetIndices) {
+          resolvedRows.push({
+            coverage_id: c.coverage_id,
+            coverage_amount: round2(Number(tier.coverage_amount)),
+            premium_amount: round2(Number(tier.coverage_price)),
+            applied_rate: 0,
+            vehicle_index: vehicleIndex,
+          });
+        }
+        continue;
+      }
+
+      // PERCENTAGE — the existing agent-priced model. c.coverage_amount and
+      // c.premium_amount are the agent's per-vehicle entry, validated once
+      // against the per-vehicle max/floor, then applied to every targeted
+      // vehicle as its own row.
       const override = overrideByCoverageId.get(c.coverage_id);
-      const effectiveRate = override ? Number(override.netrate) : Number(coverage.standard_rate);
+      if (!override && !coverage.percentage_pricing) {
+        return res.status(400).json({ error: `No standard rate is configured for ${coverage.coverage_name}` });
+      }
+      const effectiveRate = override ? Number(override.netrate) : Number(coverage.percentage_pricing.standard_rate);
       const effectiveMax =
         override && override.maximum_coverage !== null
           ? Number(override.maximum_coverage)
           : Number(coverage.maximum_coverage);
-      effectiveRateByCoverageId.set(c.coverage_id, effectiveRate);
 
       const coverageAmount = c.coverage_amount;
       const premiumAmount = c.premium_amount;
@@ -161,11 +265,21 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
           error: `Premium amount for ${coverage.coverage_name} is below the required minimum of ₱${minimumPremium.toLocaleString(undefined, { maximumFractionDigits: 2 })} at your net rate`,
         });
       }
+      for (const vehicleIndex of targetIndices) {
+        resolvedRows.push({
+          coverage_id: c.coverage_id,
+          coverage_amount: round2(coverageAmount),
+          premium_amount: round2(premiumAmount),
+          applied_rate: effectiveRate,
+          vehicle_index: vehicleIndex,
+        });
+      }
     }
 
-    // Total premium is just the sum of every coverage's premium — statutory
-    // charges are computed from that, and misc is whatever flat amount was entered.
-    const totalPremium = round2(coverages.reduce((sum, c) => sum + c.premium_amount, 0));
+    // Total premium is just the sum of every coverage's (server-resolved)
+    // premium — statutory charges are computed from that, and misc is
+    // whatever flat amount was entered.
+    const totalPremium = round2(resolvedRows.reduce((sum, r) => sum + r.premium_amount, 0));
     const docStamps = round2(totalPremium * DOC_STAMPS_RATE);
     const vat = round2(totalPremium * VAT_RATE);
     const lgt = round2(totalPremium * LGT_RATE);
@@ -259,15 +373,11 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
         },
       });
 
-      await tx.applicationCoverage.createMany({
-        data: coverages.map((c) => ({
-          application_id: application.id,
-          coverage_id: c.coverage_id,
-          coverage_amount: c.coverage_amount,
-          premium_amount: c.premium_amount,
-          applied_rate: effectiveRateByCoverageId.get(c.coverage_id),
-        })),
-      });
+      // Vehicles have to be resolved to real ids before the coverage rows
+      // below can reference one — a brand-new vehicle doesn't have an id
+      // until it's actually created here, in the same order as `vehicles`,
+      // so a coverage's vehicle_index can be mapped straight onto this array.
+      const vehicleIds = [];
 
       if (className === "Motor") {
         for (const v of vehicles) {
@@ -279,6 +389,15 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
             if (v.reassign_owner) {
               // The agent may have corrected/updated details while confirming
               // the match — persist those before moving ownership over.
+              // initial_assessment_date is stamped only the first time a value
+              // is recorded, and never moved again afterward — and once
+              // assessed, the value itself is frozen too (it only ever
+              // changes through automatic depreciation from here on).
+              const currentVehicle = await tx.vehicle.findUnique({
+                where: { id: vehicleId },
+                select: { estimated_value: true, initial_assessment_date: true },
+              });
+              const alreadyAssessed = Boolean(currentVehicle?.initial_assessment_date);
               await tx.vehicle.update({
                 where: { id: vehicleId },
                 data: {
@@ -291,6 +410,12 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
                   year_model: v.year_model ?? null,
                   vehicle_type: v.vehicle_type || null,
                   color: v.color || null,
+                  estimated_value: alreadyAssessed ? currentVehicle.estimated_value : (v.estimated_value ?? null),
+                  initial_assessment_date: alreadyAssessed
+                    ? currentVehicle.initial_assessment_date
+                    : v.estimated_value !== undefined
+                      ? new Date()
+                      : null,
                 },
               });
 
@@ -329,6 +454,8 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
                 year_model: v.year_model ?? null,
                 vehicle_type: v.vehicle_type || null,
                 color: v.color || null,
+                estimated_value: v.estimated_value ?? null,
+                initial_assessment_date: v.estimated_value !== undefined ? new Date() : null,
               },
             });
             vehicleId = createdVehicle.id;
@@ -347,8 +474,20 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
           await tx.policyApplicationVehicle.create({
             data: { policy_application_id: application.id, vehicle_id: vehicleId },
           });
+          vehicleIds.push(vehicleId);
         }
       }
+
+      await tx.applicationCoverage.createMany({
+        data: resolvedRows.map((r) => ({
+          application_id: application.id,
+          coverage_id: r.coverage_id,
+          vehicle_id: r.vehicle_index !== null ? vehicleIds[r.vehicle_index] : null,
+          coverage_amount: r.coverage_amount,
+          premium_amount: r.premium_amount,
+          applied_rate: r.applied_rate,
+        })),
+      });
 
       async function resolveAddressId(addr, addressType) {
         if (addr.existing_address_id) {

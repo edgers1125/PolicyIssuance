@@ -15,6 +15,7 @@ import {
   ToggleButton,
   Checkbox,
   FormControlLabel,
+  FormGroup,
   Alert,
   CircularProgress,
   Divider,
@@ -44,6 +45,7 @@ import {
   listPaymentMethods,
 } from "../api/client";
 import { formatPHP, formatRate } from "../utils/currency";
+import { currentVehicleValue, findApplicableValueTier } from "../utils/vehicleValue";
 import { NumberField } from "../components/NumberField";
 import { PolicySchedulePreview } from "../components/PolicySchedulePreview";
 
@@ -76,6 +78,10 @@ const emptyVehicle = {
   year_model: "",
   vehicle_type: "",
   color: "",
+  estimated_value: "",
+  // Set automatically the first time an estimated value is ever recorded —
+  // never entered directly, and never sent back to the server.
+  initial_assessment_date: null,
   existing_vehicle_id: null,
   // Set once the agent confirms a plate match against a vehicle on file for a
   // different party — keeps the fields editable (unlike a normal same-party
@@ -102,6 +108,8 @@ const LGT_RATE = 0.002;
 
 // A coverage's premium can never come in under the agent's own net rate for it —
 // that rate is what's owed to the branch; anything above it is the agent's cut.
+// Only meaningful for PERCENTAGE-mode coverages, where the agent enters both
+// amounts themselves — VALUE_PERCENTAGE and FLAT_TIER have no agent margin.
 function coveragePricing(cov, selection) {
   const coverageAmount = Number(selection.coverage_amount) || 0;
   const premiumAmount = Number(selection.premium_amount) || 0;
@@ -115,6 +123,94 @@ function coveragePricing(cov, selection) {
     exceedsMax: coverageAmount > Number(cov.effective_maximum_coverage),
     belowMinimum: Boolean(selection.premium_amount) && premiumAmount < minimumPremium,
     hasAmounts: Boolean(selection.coverage_amount) && Boolean(selection.premium_amount),
+  };
+}
+
+// Resolves a single vehicle's current (depreciated) value the same way the
+// server does for a brand-new one: "now" is its assessment date, since it's
+// being assessed for the first time right this moment.
+function vehicleCurrentValue(vehicle) {
+  if (!vehicle) return null;
+  return currentVehicleValue(vehicle.estimated_value, vehicle.initial_assessment_date || new Date());
+}
+
+// Resolves the actual coverage/premium amounts for a selected coverage,
+// branching on its pricing mode. This mirrors (non-authoritatively — the
+// server always recomputes and enforces it independently) what the backend
+// does in policyApplications.js, so the on-screen total and preview match
+// what will actually be charged:
+//  - PERCENTAGE: the agent's own entered amounts, used as-is per vehicle.
+//  - VALUE_PERCENTAGE: fully automatic off each targeted vehicle's own
+//    current (depreciated) value and this coverage's value tiers — no agent
+//    input, and each vehicle can land on a different tier.
+//  - FLAT_TIER: the agent chose one of this coverage's fixed tiers (stored as
+//    coverage_amount on the selection); its paired price is looked up here.
+// A selection with no vehicle_indices applies to the whole policy — every
+// vehicle on the application; one with a specific (possibly multi-vehicle)
+// list applies to just those. Either way the total is the per-vehicle amount
+// summed once per targeted vehicle — the server does the same thing as N
+// separate rows rather than one row scaled by a count.
+function resolveCoverageSelection(cov, selection, vehicles) {
+  if (!selection) return null;
+
+  // Property has no vehicle concept at all — treat it as a single virtual
+  // target so a PERCENTAGE-mode Property coverage still resolves normally
+  // instead of looking like "no vehicle selected."
+  const scopedToAll = selection.vehicle_indices === null || selection.vehicle_indices === undefined;
+  const targetIndices =
+    vehicles.length === 0 ? [null] : scopedToAll ? vehicles.map((_, i) => i) : selection.vehicle_indices;
+
+  if (targetIndices.length === 0) {
+    return { coverage_amount: 0, premium_amount: 0, pending: true, noVehicleSelected: true };
+  }
+
+  if (cov.pricing_mode === "VALUE_PERCENTAGE") {
+    let totalAmount = 0;
+    let totalPremium = 0;
+    for (const idx of targetIndices) {
+      const targetValue = vehicleCurrentValue(vehicles[idx]);
+      if (targetValue === null || targetValue === undefined) {
+        return { coverage_amount: 0, premium_amount: 0, pending: true };
+      }
+      const tier = findApplicableValueTier(cov.value_percentage_tiers, targetValue);
+      if (!tier) {
+        return { coverage_amount: 0, premium_amount: 0, pending: true, noTier: true };
+      }
+      totalAmount += targetValue;
+      totalPremium += targetValue * (Number(tier.rate_percentage) / 100);
+    }
+    return {
+      coverage_amount: totalAmount,
+      premium_amount: totalPremium,
+      pending: false,
+      // A single "rate" only makes sense to show when every targeted vehicle
+      // landed on the same tier — otherwise show the blended (weighted
+      // average) rate instead of picking one vehicle's tier arbitrarily.
+      effectiveRate: totalAmount > 0 ? totalPremium / totalAmount : 0,
+    };
+  }
+
+  if (cov.pricing_mode === "FLAT_TIER") {
+    const tier = (cov.tier_based_prices || []).find(
+      (t) => String(t.coverage_amount) === String(selection.coverage_amount)
+    );
+    if (!tier) {
+      return { coverage_amount: 0, premium_amount: 0, pending: true };
+    }
+    const count = targetIndices.length;
+    return {
+      coverage_amount: Number(tier.coverage_amount) * count,
+      premium_amount: Number(tier.coverage_price) * count,
+      pending: false,
+      tier,
+    };
+  }
+
+  const count = targetIndices.length;
+  return {
+    coverage_amount: (Number(selection.coverage_amount) || 0) * count,
+    premium_amount: (Number(selection.premium_amount) || 0) * count,
+    pending: false,
   };
 }
 
@@ -132,6 +228,13 @@ function isVehicleComplete(v) {
 
 function isAddressComplete(a) {
   return Boolean(a.address_line_1 && a.city && a.province);
+}
+
+// Display-only — this date is never entered directly, so there's no
+// corresponding parse-back function.
+function formatAssessmentDate(date) {
+  if (!date) return "Not yet assessed";
+  return new Date(date).toLocaleDateString();
 }
 
 function CustomerEditDialog({ open, onClose, customer, token, onSaved }) {
@@ -341,7 +444,13 @@ function CompanyEditDialog({ open, onClose, company, token, onSaved }) {
   );
 }
 
-function VehicleEditDialog({ open, onClose, vehicle, token, onSaved }) {
+// localOnly skips the PATCH entirely and just hands the edited fields back —
+// needed for a vehicle that's on file for a *different* party pending
+// reassignment, since agentCanEditVehicle (rightly) 403s a direct edit until
+// that reassignment actually happens at submission time. The edits still
+// take effect the same way: they're carried in local state and persisted
+// then, exactly like the rest of a reassign_owner vehicle's fields already are.
+function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly }) {
   const [form, setForm] = useState(emptyVehicle);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
@@ -354,6 +463,10 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved }) {
   }, [vehicle]);
 
   async function handleSave() {
+    if (localOnly) {
+      onSaved({ ...form, id: form.existing_vehicle_id });
+      return;
+    }
     setError("");
     setSubmitting(true);
     try {
@@ -447,6 +560,28 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved }) {
                 value={form.color}
                 onChange={(e) => setForm({ ...form, color: e.target.value })}
                 fullWidth
+              />
+            </Grid>
+            <Grid size={{ xs: 12, sm: 6 }}>
+              <NumberField
+                label="Estimated value"
+                value={form.estimated_value}
+                onChange={(v) => setForm({ ...form, estimated_value: v })}
+                fullWidth
+                // Permanently locked the moment it's ever been assessed — from
+                // then on the value only ever moves through automatic
+                // depreciation, never a direct edit.
+                disabled={Boolean(form.initial_assessment_date)}
+                helperText={form.initial_assessment_date ? "Locked once assessed — depreciates 10% per year automatically" : ""}
+                slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+              />
+            </Grid>
+            <Grid size={{ xs: 12, sm: 6 }}>
+              <TextField
+                label="Date of initial assessment of value"
+                value={formatAssessmentDate(form.initial_assessment_date)}
+                fullWidth
+                disabled
               />
             </Grid>
           </Grid>
@@ -648,13 +783,21 @@ export function PolicyApplication() {
   const isMotor = selectedClass?.class_name === "Motor";
   const isProperty = selectedClass?.class_name === "Property";
 
-  // Total premium is just the sum of every selected coverage's premium — the
-  // statutory charges below are derived from it, mirroring what the server
-  // will compute and store once this application is actually submitted.
-  const totalPremium = Object.values(coverageSelections).reduce(
-    (sum, s) => sum + (Number(s.premium_amount) || 0),
-    0
-  );
+  // resolveCoverageSelection needs the actual vehicle list to look up
+  // specific vehicle_indices, or expand to every vehicle for a coverage that
+  // applies to the whole policy — Property has no vehicles at all, so it
+  // always resolves as a single virtual target instead.
+  const coverageVehicles = isMotor ? vehicles : [];
+
+  // Total premium is the sum of every selected coverage's resolved premium —
+  // the statutory charges below are derived from it, mirroring what the
+  // server will compute and store once this application is actually submitted.
+  const totalPremium = Object.entries(coverageSelections).reduce((sum, [coverageId, selection]) => {
+    const cov = coverages.find((c) => c.id === coverageId);
+    if (!cov) return sum;
+    const resolved = resolveCoverageSelection(cov, selection, coverageVehicles);
+    return sum + (resolved?.premium_amount || 0);
+  }, 0);
   const docStamps = totalPremium * DOC_STAMPS_RATE;
   const vat = totalPremium * VAT_RATE;
   const lgt = totalPremium * LGT_RATE;
@@ -719,7 +862,10 @@ export function PolicyApplication() {
       if (next[coverageId]) {
         delete next[coverageId];
       } else {
-        next[coverageId] = { coverage_amount: "", premium_amount: "" };
+        // vehicle_indices null = applies to the whole policy (every vehicle),
+        // the default — an agent narrows it to specific vehicles only for a
+        // fleet where this coverage shouldn't apply to all of them.
+        next[coverageId] = { coverage_amount: "", premium_amount: "", vehicle_indices: null };
       }
       return next;
     });
@@ -743,6 +889,24 @@ export function PolicyApplication() {
   function removeVehicle(index) {
     setVehicles((prev) => prev.filter((_, i) => i !== index));
     delete lastCheckedPlateRef.current[index];
+    // Any coverage scoped to specific vehicles is referencing positions in
+    // that array — removing one shifts everything after it down by one, so
+    // those references need the same treatment or they'd silently point at
+    // the wrong (or a nonexistent) vehicle.
+    setCoverageSelections((prev) => {
+      const next = {};
+      for (const [coverageId, selection] of Object.entries(prev)) {
+        if (!Array.isArray(selection.vehicle_indices)) {
+          next[coverageId] = selection;
+          continue;
+        }
+        const vehicle_indices = selection.vehicle_indices
+          .filter((i) => i !== index)
+          .map((i) => (i > index ? i - 1 : i));
+        next[coverageId] = { ...selection, vehicle_indices };
+      }
+      return next;
+    });
   }
 
   // Fires once a plate number is typed out (on blur) and isn't already
@@ -777,6 +941,8 @@ export function PolicyApplication() {
                 year_model: found.year_model || "",
                 vehicle_type: found.vehicle_type || "",
                 color: found.color || "",
+                estimated_value: found.estimated_value ?? "",
+                initial_assessment_date: found.initial_assessment_date || null,
                 existing_vehicle_id: found.id,
                 reassign_owner: false,
               }
@@ -804,6 +970,8 @@ export function PolicyApplication() {
               year_model: vehicle.year_model || "",
               vehicle_type: vehicle.vehicle_type || "",
               color: vehicle.color || "",
+              estimated_value: vehicle.estimated_value ?? "",
+              initial_assessment_date: vehicle.initial_assessment_date || null,
               existing_vehicle_id: vehicle.id,
               reassign_owner: true,
             }
@@ -858,6 +1026,26 @@ export function PolicyApplication() {
     }
     for (const [coverageId, selection] of coverageEntries) {
       const cov = coverages.find((c) => c.id === coverageId);
+      if (Array.isArray(selection.vehicle_indices) && selection.vehicle_indices.length === 0) {
+        setError(`Select which vehicle(s) ${cov.coverage_name} applies to, or apply it to the whole policy.`);
+        return;
+      }
+      if (cov.pricing_mode === "VALUE_PERCENTAGE") {
+        const resolved = resolveCoverageSelection(cov, selection, coverageVehicles);
+        if (resolved.pending) {
+          setError(`${cov.coverage_name} needs its vehicle's estimated value assessed before it can be priced.`);
+          return;
+        }
+        continue;
+      }
+      if (cov.pricing_mode === "FLAT_TIER") {
+        const resolved = resolveCoverageSelection(cov, selection, coverageVehicles);
+        if (resolved.pending) {
+          setError(`Select an insured value for ${cov.coverage_name}.`);
+          return;
+        }
+        continue;
+      }
       const pricing = coveragePricing(cov, selection);
       if (pricing.exceedsMax) {
         setError(`Coverage amount for ${cov.coverage_name} exceeds the maximum for this coverage.`);
@@ -905,10 +1093,18 @@ export function PolicyApplication() {
         product_variant_id: variantId,
         coverage_start_at: coverageStartAt,
         coverage_end_at: coverageEndAt,
+        // Raw, per-vehicle, un-multiplied values — the server validates
+        // coverage_amount/premium_amount against the per-vehicle max/floor
+        // and expands each into one row per targeted vehicle itself (and for
+        // VALUE_PERCENTAGE ignores these entirely, computing its own from
+        // each target vehicle's value). coverage_amount for FLAT_TIER is the
+        // tier key the agent picked, also unmultiplied, so the server can
+        // look it up among the coverage's actual tiers.
         coverages: coverageEntries.map(([coverage_id, v]) => ({
           coverage_id,
-          coverage_amount: Number(v.coverage_amount),
-          premium_amount: Number(v.premium_amount),
+          coverage_amount: Number(v.coverage_amount) || 0,
+          premium_amount: Number(v.premium_amount) || 0,
+          vehicle_indices: v.vehicle_indices ?? null,
         })),
         vehicles: isMotor ? vehicles : undefined,
         risk_address: isProperty ? riskAddress : undefined,
@@ -988,11 +1184,23 @@ export function PolicyApplication() {
     vehicles: isMotor ? vehicles : [],
     coverages: Object.entries(coverageSelections).map(([id, sel]) => {
       const cov = coverages.find((c) => c.id === id);
+      const resolved = cov ? resolveCoverageSelection(cov, sel, coverageVehicles) : null;
+      // Only worth spelling out which vehicle(s) a coverage applies to when
+      // there's more than one on the application — otherwise it's implicit.
+      const scopedToAll = sel.vehicle_indices === null || sel.vehicle_indices === undefined;
+      const vehicleLabel =
+        coverageVehicles.length > 1
+          ? scopedToAll
+            ? " (all vehicles)"
+            : ` (${sel.vehicle_indices
+                .map((i) => coverageVehicles[i]?.plate_number || `Vehicle ${i + 1}`)
+                .join(", ")})`
+          : "";
       return {
-        name: cov?.coverage_name || "",
+        name: (cov?.coverage_name || "") + vehicleLabel,
         clause: cov?.clause || "",
-        amount: Number(sel.coverage_amount) || 0,
-        premium: Number(sel.premium_amount) || 0,
+        amount: resolved?.coverage_amount || 0,
+        premium: resolved?.premium_amount || 0,
       };
     }),
     totalPremium,
@@ -1080,6 +1288,7 @@ export function PolicyApplication() {
                     freeSolo
                     disableClearable
                     options={myCustomers}
+                    value={myCustomers.find((c) => c.id === newCustomer.existing_customer_id) || null}
                     getOptionLabel={(option) => (typeof option === "string" ? option : option.first_name)}
                     filterOptions={(options, state) =>
                       state.inputValue
@@ -1091,7 +1300,12 @@ export function PolicyApplication() {
                     inputValue={newCustomer.first_name}
                     onInputChange={(e, value, reason) => {
                       if (reason === "input") {
-                        setNewCustomer({ ...newCustomer, first_name: value, existing_customer_id: null });
+                        // Editing away from a matched customer clears every field that came
+                        // from their record, not just the id — otherwise a stale last name,
+                        // email, etc. could get submitted for whoever they search for next.
+                        setNewCustomer((prev) =>
+                          prev.existing_customer_id ? { ...emptyCustomer, first_name: value } : { ...prev, first_name: value }
+                        );
                       }
                     }}
                     onChange={(e, value) => {
@@ -1214,6 +1428,7 @@ export function PolicyApplication() {
                     freeSolo
                     disableClearable
                     options={myCompanies}
+                    value={myCompanies.find((c) => c.id === newCompany.existing_company_id) || null}
                     getOptionLabel={(option) => (typeof option === "string" ? option : option.company_name)}
                     filterOptions={(options, state) =>
                       state.inputValue
@@ -1225,7 +1440,11 @@ export function PolicyApplication() {
                     inputValue={newCompany.company_name}
                     onInputChange={(e, value, reason) => {
                       if (reason === "input") {
-                        setNewCompany({ ...newCompany, company_name: value, existing_company_id: null });
+                        // Same reasoning as the customer field — clear the whole record, not
+                        // just the id, so stale details from the old match can't slip through.
+                        setNewCompany((prev) =>
+                          prev.existing_company_id ? { ...emptyCompany, company_name: value } : { ...prev, company_name: value }
+                        );
                       }
                     }}
                     onChange={(e, value) => {
@@ -1356,14 +1575,68 @@ export function PolicyApplication() {
                   <Stack spacing={1.5} divider={<Divider />}>
                     {coverages.map((cov) => {
                       const selection = coverageSelections[cov.id];
-                      const pricing = selection ? coveragePricing(cov, selection) : null;
+                      const pricing = selection && cov.pricing_mode === "PERCENTAGE" ? coveragePricing(cov, selection) : null;
+                      const resolved =
+                        selection && cov.pricing_mode !== "PERCENTAGE"
+                          ? resolveCoverageSelection(cov, selection, coverageVehicles)
+                          : null;
                       return (
                         <Box key={cov.id}>
                           <FormControlLabel
                             control={<Checkbox checked={Boolean(selection)} onChange={() => toggleCoverage(cov.id)} />}
-                            label={`${cov.coverage_name} (max ${formatPHP(cov.effective_maximum_coverage)})`}
+                            label={
+                              cov.pricing_mode === "PERCENTAGE"
+                                ? `${cov.coverage_name} (max ${formatPHP(cov.effective_maximum_coverage)})`
+                                : cov.coverage_name
+                            }
                           />
-                          {selection && (
+                          {selection && isMotor && vehicles.length > 1 && (
+                            <Box sx={{ pl: 4, pb: 1 }}>
+                              <FormControlLabel
+                                control={
+                                  <Checkbox
+                                    size="small"
+                                    checked={
+                                      selection.vehicle_indices === null || selection.vehicle_indices === undefined
+                                    }
+                                    onChange={(e) =>
+                                      updateCoverageField(cov.id, "vehicle_indices", e.target.checked ? null : [])
+                                    }
+                                  />
+                                }
+                                label="Applies to the whole policy (every vehicle)"
+                              />
+                              {selection.vehicle_indices !== null && selection.vehicle_indices !== undefined && (
+                                <Box sx={{ pl: 3 }}>
+                                  <Typography variant="caption" color="text.secondary" component="div">
+                                    Or choose specific vehicles:
+                                  </Typography>
+                                  <FormGroup row>
+                                    {vehicles.map((v, i) => (
+                                      <FormControlLabel
+                                        key={i}
+                                        control={
+                                          <Checkbox
+                                            size="small"
+                                            checked={selection.vehicle_indices.includes(i)}
+                                            onChange={(e) => {
+                                              const current = selection.vehicle_indices;
+                                              const next = e.target.checked
+                                                ? [...current, i]
+                                                : current.filter((x) => x !== i);
+                                              updateCoverageField(cov.id, "vehicle_indices", next);
+                                            }}
+                                          />
+                                        }
+                                        label={v.plate_number ? `Vehicle ${i + 1} (${v.plate_number})` : `Vehicle ${i + 1}`}
+                                      />
+                                    ))}
+                                  </FormGroup>
+                                </Box>
+                              )}
+                            </Box>
+                          )}
+                          {selection && cov.pricing_mode === "PERCENTAGE" && (
                             <Box sx={{ pl: 4, pb: 1 }}>
                               <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 1 }}>
                                 Your net rate: <strong>{formatRate(cov.rate)}</strong>
@@ -1417,6 +1690,61 @@ export function PolicyApplication() {
                                       Customer Net Rate: <strong>{formatRate(pricing.customerRate)}</strong>
                                     </span>
                                   </Stack>
+                                </Alert>
+                              )}
+                            </Box>
+                          )}
+                          {selection && cov.pricing_mode === "VALUE_PERCENTAGE" && (
+                            <Box sx={{ pl: 4, pb: 1 }}>
+                              <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 1 }}>
+                                {cov.clause}
+                              </Typography>
+                              {resolved.pending ? (
+                                <Alert severity="info">
+                                  {resolved.noTier
+                                    ? "No pricing tier is set up yet for this coverage — contact Settings."
+                                    : "Priced automatically once the vehicle's estimated value is assessed below."}
+                                </Alert>
+                              ) : (
+                                <Alert severity="success">
+                                  <Stack spacing={0.25}>
+                                    <span>
+                                      Insured value: <strong>{formatPHP(resolved.coverage_amount)}</strong>
+                                    </span>
+                                    <span>
+                                      Rate: <strong>{formatRate(resolved.effectiveRate)}</strong>
+                                    </span>
+                                    <span>
+                                      Premium: <strong>{formatPHP(resolved.premium_amount)}</strong>
+                                    </span>
+                                  </Stack>
+                                </Alert>
+                              )}
+                            </Box>
+                          )}
+                          {selection && cov.pricing_mode === "FLAT_TIER" && (
+                            <Box sx={{ pl: 4, pb: 1 }}>
+                              <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 1 }}>
+                                {cov.clause}
+                              </Typography>
+                              <TextField
+                                select
+                                label="Insured value"
+                                value={resolved.pending ? "" : String(selection.coverage_amount)}
+                                onChange={(e) => updateCoverageField(cov.id, "coverage_amount", e.target.value)}
+                                required
+                                fullWidth
+                                size="small"
+                              >
+                                {(cov.tier_based_prices || []).map((tier) => (
+                                  <MenuItem key={tier.id} value={String(tier.coverage_amount)}>
+                                    {formatPHP(tier.coverage_amount)} — {formatPHP(tier.coverage_price)}
+                                  </MenuItem>
+                                ))}
+                              </TextField>
+                              {!resolved.pending && (
+                                <Alert severity="success" sx={{ mt: 1 }}>
+                                  Premium: <strong>{formatPHP(resolved.premium_amount)}</strong>
                                 </Alert>
                               )}
                             </Box>
@@ -1478,23 +1806,33 @@ export function PolicyApplication() {
                     )}
                     {v.reassign_owner && (
                       <Alert
-                        severity="warning"
+                        severity="info"
                         sx={{ mb: 1.5 }}
+                        icon={<EditIcon fontSize="inherit" />}
                         action={
-                          <Button
-                            color="inherit"
-                            size="small"
-                            variant="outlined"
-                            onClick={() => resetVehicleRow(index)}
-                          >
-                            Use a different vehicle
-                          </Button>
+                          <Stack direction="row" spacing={1}>
+                            <Button
+                              color="inherit"
+                              size="small"
+                              variant="outlined"
+                              onClick={() => setEditingVehicleIndex(index)}
+                            >
+                              Edit Details
+                            </Button>
+                            <Button
+                              color="inherit"
+                              size="small"
+                              variant="outlined"
+                              onClick={() => resetVehicleRow(index)}
+                            >
+                              Use a different vehicle
+                            </Button>
+                          </Stack>
                         }
                       >
                         This plate number is currently on file for a different{" "}
-                        {insuredType === "INDIVIDUAL" ? "customer" : "company"}. It will be reassigned to this{" "}
-                        {insuredType === "INDIVIDUAL" ? "customer" : "company"} once this application is submitted —
-                        you can still edit its details below.
+                        {insuredType === "INDIVIDUAL" ? "customer" : "company"}. It will be assigned to this{" "}
+                        {insuredType === "INDIVIDUAL" ? "customer" : "company"} once this policy is approved.
                       </Alert>
                     )}
                     <Grid container spacing={2}>
@@ -1503,6 +1841,11 @@ export function PolicyApplication() {
                           freeSolo
                           disableClearable
                           options={selectedParty?.vehicles || []}
+                          value={
+                            v.existing_vehicle_id
+                              ? (selectedParty?.vehicles || []).find((o) => o.id === v.existing_vehicle_id) || null
+                              : null
+                          }
                           getOptionLabel={(option) =>
                             typeof option === "string" ? option : option.plate_number
                           }
@@ -1516,9 +1859,20 @@ export function PolicyApplication() {
                           inputValue={v.plate_number}
                           onInputChange={(e, value, reason) => {
                             if (reason === "input") {
+                              // Any edit invalidates the "already checked this plate" cache —
+                              // otherwise typing it away and back to the same value (e.g.
+                              // NCV5516 -> NCV551 -> NCV5516) would silently skip the re-check.
+                              delete lastCheckedPlateRef.current[index];
+                              // Editing away from a matched vehicle clears every field that
+                              // came from it (and any pending reassignment), not just the id —
+                              // otherwise another vehicle's details could get carried over by mistake.
                               setVehicles((prev) =>
                                 prev.map((vv, i) =>
-                                  i === index ? { ...vv, plate_number: value, existing_vehicle_id: null } : vv
+                                  i === index
+                                    ? vv.existing_vehicle_id
+                                      ? { ...emptyVehicle, plate_number: value }
+                                      : { ...vv, plate_number: value }
+                                    : vv
                                 )
                               );
                             }
@@ -1538,6 +1892,8 @@ export function PolicyApplication() {
                                         year_model: value.year_model || "",
                                         vehicle_type: value.vehicle_type || "",
                                         color: value.color || "",
+                                        estimated_value: value.estimated_value ?? "",
+                                        initial_assessment_date: value.initial_assessment_date || null,
                                         existing_vehicle_id: value.id,
                                         reassign_owner: false,
                                       }
@@ -1575,7 +1931,7 @@ export function PolicyApplication() {
                           onChange={(e) => updateVehicleField(index, "mv_file_no", e.target.value)}
                           required
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
+                          disabled={Boolean(v.existing_vehicle_id)}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1585,7 +1941,7 @@ export function PolicyApplication() {
                           onChange={(e) => updateVehicleField(index, "engine_number", e.target.value)}
                           required
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
+                          disabled={Boolean(v.existing_vehicle_id)}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1595,7 +1951,7 @@ export function PolicyApplication() {
                           onChange={(e) => updateVehicleField(index, "chassis_number", e.target.value)}
                           required
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
+                          disabled={Boolean(v.existing_vehicle_id)}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1604,7 +1960,7 @@ export function PolicyApplication() {
                           value={v.vehicle_type}
                           onChange={(e) => updateVehicleField(index, "vehicle_type", e.target.value)}
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
+                          disabled={Boolean(v.existing_vehicle_id)}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1613,7 +1969,7 @@ export function PolicyApplication() {
                           value={v.make}
                           onChange={(e) => updateVehicleField(index, "make", e.target.value)}
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
+                          disabled={Boolean(v.existing_vehicle_id)}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1622,7 +1978,7 @@ export function PolicyApplication() {
                           value={v.model}
                           onChange={(e) => updateVehicleField(index, "model", e.target.value)}
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
+                          disabled={Boolean(v.existing_vehicle_id)}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1632,7 +1988,7 @@ export function PolicyApplication() {
                           value={v.year_model}
                           onChange={(e) => updateVehicleField(index, "year_model", e.target.value)}
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
+                          disabled={Boolean(v.existing_vehicle_id)}
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
@@ -1641,7 +1997,29 @@ export function PolicyApplication() {
                           value={v.color}
                           onChange={(e) => updateVehicleField(index, "color", e.target.value)}
                           fullWidth
-                          disabled={Boolean(v.existing_vehicle_id) && !v.reassign_owner}
+                          disabled={Boolean(v.existing_vehicle_id)}
+                        />
+                      </Grid>
+                      <Grid size={{ xs: 12, sm: 6 }}>
+                        <NumberField
+                          label="Estimated value"
+                          value={v.estimated_value}
+                          onChange={(value) => updateVehicleField(index, "estimated_value", value)}
+                          fullWidth
+                          // Permanently locked the moment it's ever been assessed — from
+                          // then on the value only ever moves through automatic
+                          // depreciation, never a direct edit.
+                          disabled={Boolean(v.initial_assessment_date)}
+                          helperText={v.initial_assessment_date ? "Locked once assessed — depreciates 10% per year automatically" : ""}
+                          slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                        />
+                      </Grid>
+                      <Grid size={{ xs: 12, sm: 6 }}>
+                        <TextField
+                          label="Date of initial assessment of value"
+                          value={formatAssessmentDate(v.initial_assessment_date)}
+                          fullWidth
+                          disabled
                         />
                       </Grid>
                     </Grid>
@@ -1683,6 +2061,12 @@ export function PolicyApplication() {
                     freeSolo
                     disableClearable
                     options={selectedParty?.addresses || []}
+                    value={
+                      riskAddress.existing_address_id
+                        ? (selectedParty?.addresses || []).find((o) => o.id === riskAddress.existing_address_id) ||
+                          null
+                        : null
+                    }
                     getOptionLabel={(option) =>
                       typeof option === "string" ? option : option.address_line_1
                     }
@@ -1696,7 +2080,14 @@ export function PolicyApplication() {
                     inputValue={riskAddress.address_line_1}
                     onInputChange={(e, value, reason) => {
                       if (reason === "input") {
-                        setRiskAddress({ ...riskAddress, address_line_1: value, existing_address_id: null });
+                        // Editing away from a matched address clears every field that came
+                        // from it, not just the id — otherwise a stale city/province could
+                        // get submitted alongside whatever address they search for next.
+                        setRiskAddress((prev) =>
+                          prev.existing_address_id
+                            ? { ...emptyAddress, address_line_1: value }
+                            : { ...prev, address_line_1: value }
+                        );
                       }
                     }}
                     onChange={(e, value) => {
@@ -1820,6 +2211,12 @@ export function PolicyApplication() {
                     freeSolo
                     disableClearable
                     options={selectedParty?.addresses || []}
+                    value={
+                      insuredAddress.existing_address_id
+                        ? (selectedParty?.addresses || []).find((o) => o.id === insuredAddress.existing_address_id) ||
+                          null
+                        : null
+                    }
                     getOptionLabel={(option) =>
                       typeof option === "string" ? option : option.address_line_1
                     }
@@ -1833,7 +2230,12 @@ export function PolicyApplication() {
                     inputValue={insuredAddress.address_line_1}
                     onInputChange={(e, value, reason) => {
                       if (reason === "input") {
-                        setInsuredAddress({ ...insuredAddress, address_line_1: value, existing_address_id: null });
+                        // Same reasoning as the risk address field above.
+                        setInsuredAddress((prev) =>
+                          prev.existing_address_id
+                            ? { ...emptyAddress, address_line_1: value }
+                            : { ...prev, address_line_1: value }
+                        );
                       }
                     }}
                     onChange={(e, value) => {
@@ -2109,12 +2511,14 @@ export function PolicyApplication() {
         open={editingVehicleIndex !== null}
         onClose={() => setEditingVehicleIndex(null)}
         vehicle={editingVehicleIndex !== null ? vehicles[editingVehicleIndex] : null}
+        localOnly={Boolean(editingVehicleIndex !== null && vehicles[editingVehicleIndex]?.reassign_owner)}
         token={token}
         onSaved={(updated) => {
           setVehicles((prev) =>
             prev.map((v, i) =>
               i === editingVehicleIndex
                 ? {
+                    ...v,
                     plate_number: updated.plate_number,
                     mv_file_no: updated.mv_file_no,
                     engine_number: updated.engine_number,
@@ -2124,8 +2528,12 @@ export function PolicyApplication() {
                     year_model: updated.year_model || "",
                     vehicle_type: updated.vehicle_type || "",
                     color: updated.color || "",
+                    estimated_value: updated.estimated_value ?? "",
+                    initial_assessment_date: updated.initial_assessment_date || null,
                     existing_vehicle_id: updated.id,
-                    reassign_owner: false,
+                    // reassign_owner intentionally left as-is (via the ...v
+                    // spread above) — editing details doesn't change whether
+                    // this vehicle is being reassigned to this party.
                   }
                 : v
             )
@@ -2137,7 +2545,15 @@ export function PolicyApplication() {
 
       <PlateConflictDialog
         conflict={plateConflict}
-        onCancel={() => setPlateConflict(null)}
+        onCancel={() => {
+          // Declining clears the typed plate (and the "already checked" cache
+          // via resetVehicleRow) so the agent starts fresh instead of staring
+          // at a plate number that's now silently not going anywhere.
+          if (plateConflict) {
+            resetVehicleRow(plateConflict.index);
+          }
+          setPlateConflict(null);
+        }}
         onConfirm={handleConfirmPlateMatch}
       />
 

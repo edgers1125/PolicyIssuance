@@ -82,6 +82,10 @@ model ApplicationCoverage {
   id              String   @id @default(uuid()) @db.Uuid
   application_id  String   @db.Uuid
   coverage_id     String   @db.Uuid
+  // Which vehicle (on a Motor application) this coverage was priced/applied
+  // for — null means it applies to the whole policy (every vehicle on the
+  // application), with amounts already scaled by vehicle count.
+  vehicle_id      String?  @db.Uuid
   coverage_amount Decimal  @db.Decimal(18, 2)
   premium_amount  Decimal  @db.Decimal(18, 2)
   // The net rate actually in effect for the agent at submission time — frozen
@@ -92,6 +96,8 @@ model ApplicationCoverage {
 
   application PolicyApplication @relation(fields: [application_id], references: [id])
   coverage    ProductCoverage   @relation(fields: [coverage_id], references: [id])
+  vehicle     Vehicle?          @relation(fields: [vehicle_id], references: [id])
 
   @@index([application_id])
+  @@index([vehicle_id])
 }
