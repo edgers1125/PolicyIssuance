@@ -141,16 +141,48 @@ export function createPolicyApplication(token, payload) {
   return request("/policy-applications", { method: "POST", token, body: payload });
 }
 
+export function createPolicyQuotation(token, payload) {
+  return request("/policy-quotations", { method: "POST", token, body: payload });
+}
+
+// Paginated, latest-first — the Quotation Tracker's list view.
+export function listQuotations(token, page = 1, pageSize = 20) {
+  return request(`/policy-quotations?page=${page}&page_size=${pageSize}`, { token });
+}
+
 export function listAgents(token) {
   return request("/agents", { token });
 }
 
-export function getAgentNetrates(token, agentId) {
-  return request(`/agents/${agentId}/netrates`, { token });
+// Every rate/tier below is scoped to one allowable period (coverageInDays) —
+// an agent can have a different override for a coverage's 180-day period
+// than its 365-day one.
+export function getAgentNetrates(token, agentId, coverageInDays) {
+  return request(`/agents/${agentId}/netrates?coverage_in_days=${coverageInDays}`, { token });
 }
 
-export function updateAgentNetrates(token, agentId, netrates) {
-  return request(`/agents/${agentId}/netrates`, { method: "PUT", token, body: { netrates } });
+export function updateAgentNetrates(token, agentId, coverageInDays, netrates) {
+  return request(`/agents/${agentId}/netrates`, {
+    method: "PUT",
+    token,
+    body: { coverage_in_days: coverageInDays, netrates },
+  });
+}
+
+export function updateAgentValueTiers(token, agentId, coverageId, coverageInDays, tiers) {
+  return request(`/agents/${agentId}/value-percentage-tiers/${coverageId}`, {
+    method: "PUT",
+    token,
+    body: { coverage_in_days: coverageInDays, tiers },
+  });
+}
+
+export function updateAgentFlatTiers(token, agentId, coverageId, coverageInDays, tiers) {
+  return request(`/agents/${agentId}/flat-tiers/${coverageId}`, {
+    method: "PUT",
+    token,
+    body: { coverage_in_days: coverageInDays, tiers },
+  });
 }
 
 export function listPaymentMethods(token) {
@@ -165,20 +197,42 @@ export function deletePaymentMethod(token, id) {
   return request(`/payment-methods/${id}`, { method: "DELETE", token });
 }
 
-export function getCoveragePricing(token, coverageId) {
-  return request(`/coverages/${coverageId}/pricing`, { token });
+// Every pricing read/write below is scoped to one of the coverage's
+// allowable periods (coverageInDays) — a coverage can charge differently for
+// its 180-day period than its 365-day one.
+export function getCoveragePricing(token, coverageId, coverageInDays) {
+  return request(`/coverages/${coverageId}/pricing?coverage_in_days=${coverageInDays}`, { token });
 }
 
-// payload is { pricing_mode, standard_rate? } — standard_rate only applies
-// (and is only saved) when pricing_mode is PERCENTAGE.
+// payload is { pricing_mode, coverage_in_days, standard_rate? } —
+// standard_rate only applies (and is only saved) when pricing_mode is PERCENTAGE.
 export function updateCoveragePricingMode(token, coverageId, payload) {
   return request(`/coverages/${coverageId}/pricing`, { method: "PATCH", token, body: payload });
 }
 
-export function updateValuePercentageTiers(token, coverageId, tiers) {
-  return request(`/coverages/${coverageId}/value-percentage-tiers`, { method: "PUT", token, body: { tiers } });
+export function updateValuePercentageTiers(token, coverageId, coverageInDays, tiers) {
+  return request(`/coverages/${coverageId}/value-percentage-tiers`, {
+    method: "PUT",
+    token,
+    body: { coverage_in_days: coverageInDays, tiers },
+  });
 }
 
-export function updateFlatTiers(token, coverageId, tiers) {
-  return request(`/coverages/${coverageId}/flat-tiers`, { method: "PUT", token, body: { tiers } });
+export function updateFlatTiers(token, coverageId, coverageInDays, tiers) {
+  return request(`/coverages/${coverageId}/flat-tiers`, {
+    method: "PUT",
+    token,
+    body: { coverage_in_days: coverageInDays, tiers },
+  });
+}
+
+// Adds a new allowable period to a coverage — used from the Manage Coverage
+// Pricing page's period picker when the admin wants a day count that isn't
+// already one of the coverage's options.
+export function createAllowablePeriod(token, coverageId, coverageInDays) {
+  return request(`/coverages/${coverageId}/allowable-periods`, {
+    method: "POST",
+    token,
+    body: { coverage_in_days: coverageInDays },
+  });
 }

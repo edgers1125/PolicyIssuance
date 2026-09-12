@@ -27,13 +27,12 @@ router.get("/lookup", validateQuery(lookupVehicleQuerySchema), async (req, res, 
       where: { plate_number: { equals: plateNumber, mode: "insensitive" } },
       orderBy: { created_at: "desc" },
       include: {
-        customer_vehicles: {
+        party_vehicles: {
           where: { ownership_end_date: null },
-          select: { customer: { select: { id: true, first_name: true, last_name: true } } },
-        },
-        company_vehicles: {
-          where: { ownership_end_date: null },
-          select: { company: { select: { id: true, company_name: true } } },
+          select: {
+            customer: { select: { id: true, first_name: true, last_name: true } },
+            company: { select: { id: true, company_name: true } },
+          },
         },
       },
     });
@@ -42,8 +41,8 @@ router.get("/lookup", validateQuery(lookupVehicleQuerySchema), async (req, res, 
       return res.status(404).json({ error: "No vehicle found with that plate number" });
     }
 
-    const currentCustomer = vehicle.customer_vehicles[0]?.customer;
-    const currentCompany = vehicle.company_vehicles[0]?.company;
+    const currentCustomer = vehicle.party_vehicles[0]?.customer;
+    const currentCompany = vehicle.party_vehicles[0]?.company;
 
     res.json({
       id: vehicle.id,
@@ -73,23 +72,17 @@ router.get("/lookup", validateQuery(lookupVehicleQuerySchema), async (req, res, 
 // A vehicle isn't owned directly by an agent — it's reached through whichever
 // customer/company it's on file for, and that party has to be one of this agent's.
 async function agentCanEditVehicle(agentId, vehicleId) {
-  const viaCustomer = await prisma.customerVehicle.findFirst({
+  const owned = await prisma.partyVehicle.findFirst({
     where: {
       vehicle_id: vehicleId,
       ownership_end_date: null,
-      customer: { customer_agents: { some: { agent_id: agentId } } },
+      OR: [
+        { customer: { customer_agents: { some: { agent_id: agentId } } } },
+        { company: { company_agents: { some: { agent_id: agentId } } } },
+      ],
     },
   });
-  if (viaCustomer) return true;
-
-  const viaCompany = await prisma.companyVehicle.findFirst({
-    where: {
-      vehicle_id: vehicleId,
-      ownership_end_date: null,
-      company: { company_agents: { some: { agent_id: agentId } } },
-    },
-  });
-  return Boolean(viaCompany);
+  return Boolean(owned);
 }
 
 router.patch("/:id", validateBody(updateVehicleSchema), async (req, res, next) => {

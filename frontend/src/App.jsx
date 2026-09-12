@@ -11,6 +11,8 @@ import { EditClauses } from "./pages/EditClauses";
 import { ManageCoveragePricing } from "./pages/ManageCoveragePricing";
 import { AuthorizedPaymentMethods } from "./pages/AuthorizedPaymentMethods";
 import { PolicyApplication } from "./pages/PolicyApplication";
+import { Quotations } from "./pages/Quotations";
+import { QuotationCreator } from "./pages/QuotationCreator";
 import { MyAgents } from "./pages/MyAgents";
 import { AppLayout } from "./layouts/AppLayout";
 import { ProtectedRoute } from "./components/ProtectedRoute";
@@ -37,6 +39,22 @@ function App() {
           element={
             <RequirePermission permission="CREATE_APPLICATION">
               <PolicyApplication />
+            </RequirePermission>
+          }
+        />
+        <Route
+          path="/quotation-tracker"
+          element={
+            <RequirePermission permission="CREATE_APPLICATION">
+              <Quotations />
+            </RequirePermission>
+          }
+        />
+        <Route
+          path="/quotation-tracker/create"
+          element={
+            <RequirePermission permission="CREATE_APPLICATION">
+              <QuotationCreator />
             </RequirePermission>
           }
         />
@@ -91,7 +109,7 @@ function App() {
         <Route
           path="/settings/role-permissions"
           element={
-            <RequirePermission permission="EDIT_ROLE_PERMISSIONS">
+            <RequirePermission permission="MANAGE_SETTINGS.EDIT_ROLE_PERMISSIONS">
               <RoleDefaultPermissions />
             </RequirePermission>
           }
@@ -99,7 +117,7 @@ function App() {
         <Route
           path="/settings/create-role"
           element={
-            <RequirePermission permission="CREATE_ROLE">
+            <RequirePermission permission="MANAGE_SETTINGS.CREATE_ROLE">
               <CreateRole />
             </RequirePermission>
           }
@@ -107,7 +125,7 @@ function App() {
         <Route
           path="/settings/edit-clauses"
           element={
-            <RequirePermission permission="EDIT_CLAUSES">
+            <RequirePermission permission="MANAGE_SETTINGS.EDIT_CLAUSES">
               <EditClauses />
             </RequirePermission>
           }
@@ -115,7 +133,7 @@ function App() {
         <Route
           path="/settings/payment-methods"
           element={
-            <RequirePermission permission="MANAGE_PAYMENT_METHODS">
+            <RequirePermission permission="MANAGE_SETTINGS.MANAGE_PAYMENT_METHODS">
               <AuthorizedPaymentMethods />
             </RequirePermission>
           }
@@ -123,7 +141,7 @@ function App() {
         <Route
           path="/settings/coverage-pricing"
           element={
-            <RequirePermission permission="MANAGE_COVERAGE_PRICING">
+            <RequirePermission permission="MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING">
               <ManageCoveragePricing />
             </RequirePermission>
           }

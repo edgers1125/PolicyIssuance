@@ -17,17 +17,10 @@ router.get(
         where: { id: req.user.userId },
         select: { agent_id: true },
       });
-
-      const overridesByCoverageId = new Map();
-      if (user?.agent_id) {
-        const overrides = await prisma.agentNetrate.findMany({
-          where: { agent_id: user.agent_id },
-          select: { product_coverage_id: true, netrate: true, maximum_coverage: true },
-        });
-        for (const o of overrides) {
-          overridesByCoverageId.set(o.product_coverage_id, o);
-        }
-      }
+      // Never matches a real agent id — lets the nested `where: { agent_id }`
+      // filters below run unconditionally instead of branching the whole
+      // query shape on whether this user even has an agent profile.
+      const agentId = user?.agent_id ?? "no-agent-profile";
 
       const classes = await prisma.insuranceClass.findMany({
         where: { status: "ACTIVE" },
@@ -52,9 +45,31 @@ router.get(
                   maximum_coverage: true,
                   clause: true,
                   pricing_mode: true,
-                  percentage_pricing: { select: { standard_rate: true } },
-                  value_percentage_tiers: { orderBy: { min_value: "asc" } },
-                  tier_based_prices: { orderBy: { coverage_amount: "asc" } },
+                  // Pricing (standard rate, both tier tables, and this
+                  // agent's overrides of each) lives per allowable period,
+                  // not flat on the coverage — a coverage can charge
+                  // differently for its 180-day period than its 365-day one.
+                  allowable_periods: {
+                    orderBy: { coverage_in_days: "asc" },
+                    select: {
+                      coverage_in_days: true,
+                      percentage_pricing: { select: { standard_rate: true } },
+                      value_percentage_tiers: { orderBy: { min_value: "asc" } },
+                      tier_based_prices: { orderBy: { coverage_amount: "asc" } },
+                      agent_netrates: {
+                        where: { agent_id: agentId },
+                        select: { netrate: true, maximum_coverage: true },
+                      },
+                      agent_value_percentage_tiers: {
+                        where: { agent_id: agentId },
+                        orderBy: { min_value: "asc" },
+                      },
+                      agent_flat_tier_prices: {
+                        where: { agent_id: agentId },
+                        orderBy: { coverage_amount: "asc" },
+                      },
+                    },
+                  },
                 },
               },
             },
@@ -63,22 +78,38 @@ router.get(
       });
 
       // Every agent gets every coverage — an agent-specific override (if one
-      // exists) replaces the product's own standard rate/cap, it doesn't gate access.
+      // exists) replaces the product's own standard rate/cap for that same
+      // period, it doesn't gate access.
       const withRates = classes.map((cls) => ({
         ...cls,
         product_variants: cls.product_variants.map((variant) => ({
           ...variant,
           product_coverages: variant.product_coverages.map((cov) => {
-            const override = overridesByCoverageId.get(cov.id);
+            const { allowable_periods, ...coverageFields } = cov;
             return {
-              ...cov,
-              // Only meaningful for PERCENTAGE-mode coverages — a
-              // VALUE_PERCENTAGE/FLAT_TIER one has no percentage_pricing row
-              // at all, so this just falls back to 0 (unused either way).
-              rate: override ? override.netrate : (cov.percentage_pricing?.standard_rate ?? 0),
-              effective_maximum_coverage:
-                override && override.maximum_coverage !== null ? override.maximum_coverage : cov.maximum_coverage,
-              is_custom_rate: Boolean(override),
+              ...coverageFields,
+              allowable_periods: allowable_periods.map((p) => {
+                const override = p.agent_netrates[0];
+                const valueTierOverride = p.agent_value_percentage_tiers;
+                const flatTierOverride = p.agent_flat_tier_prices;
+                return {
+                  coverage_in_days: p.coverage_in_days,
+                  // Only meaningful for PERCENTAGE-mode coverages — a
+                  // VALUE_PERCENTAGE/FLAT_TIER one has no percentage_pricing
+                  // row at all, so this just falls back to 0 (unused either way).
+                  rate: override ? override.netrate : (p.percentage_pricing?.standard_rate ?? 0),
+                  effective_maximum_coverage:
+                    override && override.maximum_coverage !== null ? override.maximum_coverage : cov.maximum_coverage,
+                  is_custom_rate: Boolean(override),
+                  // An agent's own tier table (if set) replaces the coverage's
+                  // default tiers for this period entirely — the client never
+                  // needs to know whether a tier came from the coverage or an
+                  // agent override, it just prices off whatever's here.
+                  value_percentage_tiers: valueTierOverride.length > 0 ? valueTierOverride : p.value_percentage_tiers,
+                  tier_based_prices: flatTierOverride.length > 0 ? flatTierOverride : p.tier_based_prices,
+                  has_custom_tiers: valueTierOverride.length > 0 || flatTierOverride.length > 0,
+                };
+              }),
             };
           }),
         })),
@@ -97,12 +128,12 @@ router.get("/coverages", requireAuth, async (req, res, next) => {
   try {
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
     if (
-      !actingPermissions.has("EDIT_CLAUSES") &&
-      !actingPermissions.has("EDIT_COVERAGE_DEFAULTS") &&
-      !actingPermissions.has("MANAGE_COVERAGE_PRICING")
+      !actingPermissions.has("MANAGE_SETTINGS.EDIT_CLAUSES") &&
+      !actingPermissions.has("MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING")
     ) {
       return res.status(403).json({
-        error: "Missing required permission: EDIT_CLAUSES, EDIT_COVERAGE_DEFAULTS, or MANAGE_COVERAGE_PRICING",
+        error:
+          "Missing required permission: MANAGE_SETTINGS.EDIT_CLAUSES or MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING",
       });
     }
 
@@ -116,9 +147,15 @@ router.get("/coverages", requireAuth, async (req, res, next) => {
         maximum_coverage: true,
         clause: true,
         pricing_mode: true,
-        percentage_pricing: { select: { standard_rate: true } },
         product_variant: {
           select: { variant_name: true, insurance_class: { select: { class_name: true } } },
+        },
+        // The set of periods this coverage is offered at — the Manage
+        // Coverage Pricing page picks one before showing/editing its
+        // rate/tiers, since those are scoped per period now.
+        allowable_periods: {
+          select: { id: true, coverage_in_days: true },
+          orderBy: { coverage_in_days: "asc" },
         },
       },
     });
@@ -131,9 +168,9 @@ router.get("/coverages", requireAuth, async (req, res, next) => {
         class_name: c.product_variant.insurance_class.class_name,
         variant_name: c.product_variant.variant_name,
         maximum_coverage: c.maximum_coverage,
-        standard_rate: c.percentage_pricing?.standard_rate ?? null,
         clause: c.clause,
         pricing_mode: c.pricing_mode,
+        allowable_periods: c.allowable_periods,
       }))
     );
   } catch (err) {
@@ -147,18 +184,12 @@ router.patch("/coverages/:id", requireAuth, validateBody(updateCoverageSchema), 
     const { clause, maximum_coverage } = req.body;
 
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
-    if (clause !== undefined && !ensurePermission(res, actingPermissions, "EDIT_CLAUSES")) return;
-    // Editing lives on the Manage Coverage Pricing page now, but
-    // EDIT_COVERAGE_DEFAULTS is left valid too so no existing role loses this
-    // ability just because the field moved pages.
+    if (clause !== undefined && !ensurePermission(res, actingPermissions, "MANAGE_SETTINGS.EDIT_CLAUSES")) return;
     if (
       maximum_coverage !== undefined &&
-      !actingPermissions.has("EDIT_COVERAGE_DEFAULTS") &&
-      !actingPermissions.has("MANAGE_COVERAGE_PRICING")
+      !ensurePermission(res, actingPermissions, "MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING")
     ) {
-      return res.status(403).json({
-        error: "Missing required permission: EDIT_COVERAGE_DEFAULTS or MANAGE_COVERAGE_PRICING",
-      });
+      return;
     }
 
     const coverage = await prisma.productCoverage.findUnique({ where: { id } });

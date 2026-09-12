@@ -13,21 +13,16 @@ router.use(requireAuth, requirePermission("CREATE_APPLICATION"));
 // An address isn't owned directly by an agent — it's reached through whichever
 // customer/company it's on file for, and that party has to be one of this agent's.
 async function agentCanEditAddress(agentId, addressId) {
-  const viaCustomer = await prisma.customerAddress.findFirst({
+  const owned = await prisma.partyAddress.findFirst({
     where: {
       address_id: addressId,
-      customer: { customer_agents: { some: { agent_id: agentId } } },
+      OR: [
+        { customer: { customer_agents: { some: { agent_id: agentId } } } },
+        { company: { company_agents: { some: { agent_id: agentId } } } },
+      ],
     },
   });
-  if (viaCustomer) return true;
-
-  const viaCompany = await prisma.companyAddress.findFirst({
-    where: {
-      address_id: addressId,
-      company: { company_agents: { some: { agent_id: agentId } } },
-    },
-  });
-  return Boolean(viaCompany);
+  return Boolean(owned);
 }
 
 router.patch("/:id", validateBody(updateAddressSchema), async (req, res, next) => {

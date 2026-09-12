@@ -1,0 +1,96 @@
+// A quotation is priced exactly like a PolicyApplication (same coverage
+// selection, same period/pricing enforcement) but isn't an application at
+// all — it never goes through approval (no ApprovalHistory), never becomes a
+// Policy, and has no payment method yet since nothing is being paid for.
+// Mirrors PolicyApplication field-for-field minus the payment/approval-only
+// pieces, with its own parallel vehicle/address/coverage tables so it never
+// shares rows with an actual application.
+model PolicyQuotation {
+  id                    String      @id @default(uuid()) @db.Uuid
+  insured_type          InsuredType
+  quotation_number      String      @unique @db.VarChar(50)
+  customer_id           String?     @db.Uuid
+  company_id            String?     @db.Uuid
+  company_name_snapshot String?     @db.VarChar(255)
+  agent_id              String      @db.Uuid
+  agent_name_snapshot   String?     @db.VarChar(255)
+  product_variant_id    String      @db.Uuid
+  coverage_start_at     DateTime
+  coverage_end_at       DateTime
+  quotation_date        DateTime    @db.Date
+  // Same statutory-charge components as PolicyApplication — the grand total
+  // is likewise never stored, just computed from these wherever it's needed.
+  total_premium         Decimal     @db.Decimal(18, 2)
+  doc_stamps            Decimal     @db.Decimal(18, 2)
+  vat                   Decimal     @db.Decimal(18, 2)
+  lgt                   Decimal     @db.Decimal(18, 2)
+  misc                  Decimal     @db.Decimal(18, 2)
+  send_policy_to_email  Boolean     @default(false)
+  remarks               String?
+  created_at            DateTime    @default(now())
+  updated_at            DateTime    @updatedAt
+
+  customer        Customer?      @relation(fields: [customer_id], references: [id])
+  company         Company?       @relation(fields: [company_id], references: [id])
+  agent           Agent          @relation(fields: [agent_id], references: [id])
+  product_variant ProductVariant @relation(fields: [product_variant_id], references: [id])
+
+  vehicles  PolicyQuotationVehicle[]
+  addresses PolicyQuotationAddress[]
+  coverages QuotationCoverage[]
+
+  @@index([customer_id])
+  @@index([company_id])
+  @@index([agent_id])
+}
+
+model PolicyQuotationVehicle {
+  id                  String   @id @default(uuid()) @db.Uuid
+  policy_quotation_id String   @db.Uuid
+  vehicle_id          String   @db.Uuid
+  created_at          DateTime @default(now())
+
+  policy_quotation PolicyQuotation @relation(fields: [policy_quotation_id], references: [id])
+  vehicle          Vehicle         @relation(fields: [vehicle_id], references: [id])
+
+  quotation_coverages QuotationCoverage[]
+
+  @@index([policy_quotation_id])
+}
+
+model PolicyQuotationAddress {
+  id                  String      @id @default(uuid()) @db.Uuid
+  policy_quotation_id String      @db.Uuid
+  address_id          String      @db.Uuid
+  role                AddressRole
+  created_at          DateTime    @default(now())
+
+  policy_quotation PolicyQuotation @relation(fields: [policy_quotation_id], references: [id])
+  address          Address         @relation(fields: [address_id], references: [id])
+
+  @@unique([policy_quotation_id, role])
+  @@index([policy_quotation_id])
+}
+
+model QuotationCoverage {
+  id                          String   @id @default(uuid()) @db.Uuid
+  quotation_id                String   @db.Uuid
+  coverage_id                 String   @db.Uuid
+  // Which vehicle (on a Motor quotation) this coverage was priced for — null
+  // means it applies to the whole quotation (every vehicle), same convention
+  // as ApplicationCoverage.policy_application_vehicle_id.
+  policy_quotation_vehicle_id String?  @db.Uuid
+  coverage_amount             Decimal  @db.Decimal(18, 2)
+  premium_amount              Decimal  @db.Decimal(18, 2)
+  payable_to_bethel           Decimal  @db.Decimal(18, 2)
+  applied_rate                Decimal  @db.Decimal(10, 6)
+  created_at                  DateTime @default(now())
+  updated_at                  DateTime @updatedAt
+
+  quotation                PolicyQuotation         @relation(fields: [quotation_id], references: [id])
+  coverage                 ProductCoverage         @relation(fields: [coverage_id], references: [id])
+  policy_quotation_vehicle PolicyQuotationVehicle? @relation(fields: [policy_quotation_vehicle_id], references: [id])
+
+  @@index([quotation_id])
+  @@index([policy_quotation_vehicle_id])
+}

@@ -9,9 +9,10 @@ model Company {
   updated_at   DateTime     @updatedAt
 
   customers           Customer[]
-  company_addresses   CompanyAddress[]
-  company_vehicles    CompanyVehicle[]
+  party_addresses     PartyAddress[]
+  party_vehicles      PartyVehicle[]
   policy_applications PolicyApplication[]
+  policy_quotations   PolicyQuotation[]
   policies            Policy[]
   company_agents      CompanyAgent[]
 }
@@ -32,9 +33,10 @@ model Customer {
 
   company             Company?            @relation(fields: [company_id], references: [id])
   users               User[]
-  customer_addresses  CustomerAddress[]
-  customer_vehicles   CustomerVehicle[]
+  party_addresses     PartyAddress[]
+  party_vehicles      PartyVehicle[]
   policy_applications PolicyApplication[]
+  policy_quotations   PolicyQuotation[]
   policies            Policy[]
   customer_agents     CustomerAgent[]
 }
@@ -48,12 +50,15 @@ model Agent {
   created_at DateTime     @default(now())
   updated_at DateTime     @updatedAt
 
-  users               User[]
-  agent_netrates      AgentNetrate[]
-  policy_applications PolicyApplication[]
-  policies            Policy[]
-  customer_agents     CustomerAgent[]
-  company_agents      CompanyAgent[]
+  users                        User[]
+  agent_netrates               AgentNetrate[]
+  agent_value_percentage_tiers AgentValuePercentageTier[]
+  agent_flat_tier_prices       AgentFlatTierPricing[]
+  policy_applications          PolicyApplication[]
+  policy_quotations            PolicyQuotation[]
+  policies                     Policy[]
+  customer_agents              CustomerAgent[]
+  company_agents               CompanyAgent[]
 }
 
 model CustomerAgent {
@@ -82,18 +87,60 @@ model CompanyAgent {
   @@index([agent_id])
 }
 
+// PERCENTAGE-mode override: this agent's own net rate/cap for a coverage at
+// one allowable period, replacing the product's standard_rate/maximum_coverage
+// for that same period only — an agent can have a different net rate for a
+// coverage's 180-day period than its 365-day one. The coverage itself is
+// reached via allowable_period.coverage_id rather than a column here.
 model AgentNetrate {
-  id                  String   @id @default(uuid()) @db.Uuid
-  agent_id            String   @db.Uuid
-  product_coverage_id String   @db.Uuid
-  netrate             Decimal  @db.Decimal(10, 6)
-  maximum_coverage    Decimal? @db.Decimal(18, 2)
-  created_at          DateTime @default(now())
-  updated_at          DateTime @updatedAt
+  id                           String   @id @default(uuid()) @db.Uuid
+  agent_id                     String   @db.Uuid
+  coverage_allowable_period_id String   @db.Uuid
+  netrate                      Decimal  @db.Decimal(10, 6)
+  maximum_coverage             Decimal? @db.Decimal(18, 2)
+  created_at                   DateTime @default(now())
+  updated_at                   DateTime @updatedAt
 
-  agent            Agent           @relation(fields: [agent_id], references: [id])
-  product_coverage ProductCoverage @relation(fields: [product_coverage_id], references: [id])
+  agent            Agent                   @relation(fields: [agent_id], references: [id])
+  allowable_period CoverageAllowablePeriod @relation(fields: [coverage_allowable_period_id], references: [id])
 
-  @@unique([agent_id, product_coverage_id])
+  @@unique([agent_id, coverage_allowable_period_id])
+  @@index([agent_id])
+}
+
+// VALUE_PERCENTAGE-mode override: this agent's own value/rate tier table for
+// a coverage at one allowable period, replacing the coverage's own
+// CoverageValuePercentageTier set for that period entirely (all-or-nothing
+// per coverage+period, same tax-bracket lookup shape).
+model AgentValuePercentageTier {
+  id                           String   @id @default(uuid()) @db.Uuid
+  agent_id                     String   @db.Uuid
+  coverage_allowable_period_id String   @db.Uuid
+  min_value                    Decimal  @db.Decimal(18, 2)
+  rate_percentage              Decimal  @db.Decimal(7, 4)
+  created_at                   DateTime @default(now())
+
+  agent            Agent                   @relation(fields: [agent_id], references: [id])
+  allowable_period CoverageAllowablePeriod @relation(fields: [coverage_allowable_period_id], references: [id])
+
+  @@unique([agent_id, coverage_allowable_period_id, min_value])
+  @@index([agent_id])
+}
+
+// FLAT_TIER-mode override: this agent's own fixed insured-value/price tier
+// menu for a coverage at one allowable period, replacing the coverage's own
+// CoverageTierBasedPricing set for that period entirely.
+model AgentFlatTierPricing {
+  id                           String   @id @default(uuid()) @db.Uuid
+  agent_id                     String   @db.Uuid
+  coverage_allowable_period_id String   @db.Uuid
+  coverage_amount              Decimal  @db.Decimal(18, 2)
+  coverage_price               Decimal  @db.Decimal(18, 2)
+  created_at                   DateTime @default(now())
+
+  agent            Agent                   @relation(fields: [agent_id], references: [id])
+  allowable_period CoverageAllowablePeriod @relation(fields: [coverage_allowable_period_id], references: [id])
+
+  @@unique([agent_id, coverage_allowable_period_id, coverage_amount])
   @@index([agent_id])
 }

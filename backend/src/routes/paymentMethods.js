@@ -25,7 +25,7 @@ router.get("/", async (req, res, next) => {
 router.post("/", validateBody(createPaymentMethodSchema), async (req, res, next) => {
   try {
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
-    if (!ensurePermission(res, actingPermissions, "MANAGE_PAYMENT_METHODS")) return;
+    if (!ensurePermission(res, actingPermissions, "MANAGE_SETTINGS.MANAGE_PAYMENT_METHODS")) return;
 
     const { name } = req.body;
 
@@ -44,7 +44,7 @@ router.post("/", validateBody(createPaymentMethodSchema), async (req, res, next)
 router.delete("/:id", async (req, res, next) => {
   try {
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
-    if (!ensurePermission(res, actingPermissions, "MANAGE_PAYMENT_METHODS")) return;
+    if (!ensurePermission(res, actingPermissions, "MANAGE_SETTINGS.MANAGE_PAYMENT_METHODS")) return;
 
     const { id } = req.params;
     const method = await prisma.authorizedPaymentMethod.findUnique({ where: { id } });

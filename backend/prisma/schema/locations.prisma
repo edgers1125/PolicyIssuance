@@ -15,88 +15,73 @@ model Address {
   created_at        DateTime    @default(now())
   updated_at        DateTime    @updatedAt
 
-  customer_addresses           CustomerAddress[]
-  company_addresses            CompanyAddress[]
+  party_addresses              PartyAddress[]
   policy_application_addresses PolicyApplicationAddress[]
+  policy_quotation_addresses   PolicyQuotationAddress[]
   policy_addresses             PolicyAddress[]
 }
 
-model CustomerAddress {
+// One party (a customer OR a company, never both) linked to one address.
+// Merges the old CustomerAddress/CompanyAddress join tables — everything
+// that used to branch on party type can now do a single query with an OR.
+model PartyAddress {
   id          String   @id @default(uuid()) @db.Uuid
-  customer_id String   @db.Uuid
+  customer_id String?  @db.Uuid
+  company_id  String?  @db.Uuid
   address_id  String   @db.Uuid
   is_primary  Boolean  @default(false)
   created_at  DateTime @default(now())
 
-  customer Customer @relation(fields: [customer_id], references: [id])
-  address  Address  @relation(fields: [address_id], references: [id])
+  customer Customer? @relation(fields: [customer_id], references: [id])
+  company  Company?  @relation(fields: [company_id], references: [id])
+  address  Address   @relation(fields: [address_id], references: [id])
 
   @@index([customer_id])
-}
-
-model CompanyAddress {
-  id         String   @id @default(uuid()) @db.Uuid
-  company_id String   @db.Uuid
-  address_id String   @db.Uuid
-  is_primary Boolean  @default(false)
-  created_at DateTime @default(now())
-
-  company Company @relation(fields: [company_id], references: [id])
-  address Address @relation(fields: [address_id], references: [id])
-
   @@index([company_id])
 }
 
 model Vehicle {
-  id             String   @id @default(uuid()) @db.Uuid
-  plate_number   String?  @db.VarChar(50)
-  mv_file_no     String   @unique @db.VarChar(100)
-  engine_number  String   @unique @db.VarChar(100)
-  chassis_number String   @unique @db.VarChar(100)
-  make           String?  @db.VarChar(100)
-  model          String?  @db.VarChar(100)
-  year_model     Int?
-  vehicle_type   String?  @db.VarChar(50)
-  color          String?  @db.VarChar(50)
-  estimated_value Decimal? @db.Decimal(18, 2)
+  id                      String    @id @default(uuid()) @db.Uuid
+  plate_number            String?   @db.VarChar(50)
+  mv_file_no              String    @unique @db.VarChar(100)
+  engine_number           String    @unique @db.VarChar(100)
+  chassis_number          String    @unique @db.VarChar(100)
+  make                    String?   @db.VarChar(100)
+  model                   String?   @db.VarChar(100)
+  year_model              Int?
+  vehicle_type            String?   @db.VarChar(50)
+  color                   String?   @db.VarChar(50)
+  estimated_value         Decimal?  @db.Decimal(18, 2)
   // Stamped automatically the first time an estimated_value is ever set on
   // this vehicle — never edited directly, and never moved once set, even if
   // the value itself is later revised.
   initial_assessment_date DateTime? @db.Date
-  created_at     DateTime @default(now())
-  updated_at     DateTime @updatedAt
+  created_at              DateTime  @default(now())
+  updated_at              DateTime  @updatedAt
 
-  customer_vehicles           CustomerVehicle[]
-  company_vehicles            CompanyVehicle[]
+  party_vehicles              PartyVehicle[]
   policy_application_vehicles PolicyApplicationVehicle[]
+  policy_quotation_vehicles   PolicyQuotationVehicle[]
   policy_vehicles             PolicyVehicle[]
-  application_coverages       ApplicationCoverage[]
 }
 
-model CustomerVehicle {
+// One party (a customer OR a company, never both) linked to one vehicle, for
+// one ownership period. Merges the old CustomerVehicle/CompanyVehicle join
+// tables — everything that used to branch on party type can now do a single
+// query with an OR.
+model PartyVehicle {
   id                   String    @id @default(uuid()) @db.Uuid
-  customer_id          String    @db.Uuid
+  customer_id          String?   @db.Uuid
+  company_id           String?   @db.Uuid
   vehicle_id           String    @db.Uuid
   ownership_start_date DateTime? @db.Date
   ownership_end_date   DateTime? @db.Date
   created_at           DateTime  @default(now())
 
-  customer Customer @relation(fields: [customer_id], references: [id])
-  vehicle  Vehicle  @relation(fields: [vehicle_id], references: [id])
+  customer Customer? @relation(fields: [customer_id], references: [id])
+  company  Company?  @relation(fields: [company_id], references: [id])
+  vehicle  Vehicle   @relation(fields: [vehicle_id], references: [id])
 
   @@index([customer_id])
-}
-
-model CompanyVehicle {
-  id                   String    @id @default(uuid()) @db.Uuid
-  company_id           String    @db.Uuid
-  vehicle_id           String    @db.Uuid
-  ownership_start_date DateTime? @db.Date
-  ownership_end_date   DateTime? @db.Date
-  created_at           DateTime  @default(now())
-
-  company Company @relation(fields: [company_id], references: [id])
-  vehicle Vehicle @relation(fields: [vehicle_id], references: [id])
-
   @@index([company_id])
 }

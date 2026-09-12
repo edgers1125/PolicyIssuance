@@ -6,149 +6,106 @@ const { PrismaPg } = require("@prisma/adapter-pg");
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
 
+// A code with no dot (e.g. "MANAGE_USERS") is a top-level, page-access
+// permission; "PARENT.CHILD" (e.g. "MANAGE_USERS.ADD_USER") is a
+// sub-permission scoped under that page — the hierarchy lives in the code
+// string itself, not in separate grouping columns.
 const PERMISSIONS = [
+  { code: "MANAGE_USERS", name: "Manage Users", description: "View the Manage Users page and user list" },
+  { code: "MANAGE_USERS.ADD_USER", name: "Add User", description: "Invite new user accounts" },
+  { code: "MANAGE_USERS.EDIT_ROLE", name: "Edit Role", description: "Change a user's assigned role" },
   {
-    code: "MANAGE_USERS",
-    name: "Manage Users",
-    group: "Manage Users",
-    pageAccess: true,
-    description: "View the Manage Users page and user list",
-  },
-  { code: "ADD_USER", name: "Add User", group: "Manage Users", description: "Invite new user accounts" },
-  {
-    code: "EDIT_ROLE",
-    name: "Edit Role",
-    group: "Manage Users",
-    description: "Change a user's assigned role",
-  },
-  {
-    code: "EDIT_SPECIAL_PERMISSIONS",
+    code: "MANAGE_USERS.EDIT_SPECIAL_PERMISSIONS",
     name: "Edit Special Permissions",
-    group: "Manage Users",
     description: "Change a user's direct/special permission grants",
   },
   {
-    code: "EDIT_USER_DETAILS",
+    code: "MANAGE_USERS.EDIT_USER_DETAILS",
     name: "Edit User Details",
-    group: "Manage Users",
     description: "Change a user's name, email, status, or reset their password",
   },
+  { code: "MANAGE_AGENTS", name: "My Agents", description: "Access the My Agents page" },
   {
-    code: "MANAGE_AGENTS",
-    name: "My Agents",
-    group: "My Agents",
-    pageAccess: true,
-    description: "Access the My Agents page",
-  },
-  {
-    code: "VIEW_AGENT_PREMIUMS",
+    code: "MANAGE_AGENTS.VIEW_AGENT_PREMIUMS",
     name: "View Premiums Generated",
-    group: "My Agents",
     description: "See how much in premiums each agent has generated, all-time and in the last 30 days",
   },
   {
-    code: "MANAGE_AGENT_RATES",
+    code: "MANAGE_AGENTS.MANAGE_AGENT_RATES",
     name: "Manage Agent Rates",
-    group: "My Agents",
     description: "See each agent's special rates and edit them",
   },
   {
     code: "CREATE_APPLICATION",
     name: "Policy Application",
-    group: "Policy Application",
-    pageAccess: true,
     description: "Create and manage policy applications",
   },
   {
-    code: "AGENT_ISSUANCE",
+    code: "CREATE_APPLICATION.AGENT_ISSUANCE",
     name: "Agent Issuance",
-    group: "Policy Application",
     description: "Submit and issue policy applications",
   },
-  {
-    code: "VIEW_POLICIES",
-    name: "My Policies",
-    group: "My Policies",
-    pageAccess: true,
-    description: "View issued policies",
-  },
-  {
-    code: "MANAGE_INLEASE",
-    name: "In-Lease Backlogs",
-    group: "In-Lease Backlogs",
-    pageAccess: true,
-    description: "Manage the In-Lease backlog queue",
-  },
+  { code: "VIEW_POLICIES", name: "My Policies", description: "View issued policies" },
+  { code: "MANAGE_INLEASE", name: "In-Lease Backlogs", description: "Manage the In-Lease backlog queue" },
   {
     code: "APPROVE_APPLICATION",
     name: "Policy Approval",
-    group: "Policy Approval",
-    pageAccess: true,
     description: "Approve or reject policy applications",
   },
+  { code: "MANAGE_SETTINGS", name: "Settings", description: "Access system settings" },
   {
-    code: "MANAGE_SETTINGS",
-    name: "Settings",
-    group: "Settings",
-    pageAccess: true,
-    description: "Access system settings",
-  },
-  {
-    code: "EDIT_ROLE_PERMISSIONS",
+    code: "MANAGE_SETTINGS.EDIT_ROLE_PERMISSIONS",
     name: "Edit Default Role Permissions",
-    group: "Settings",
     description: "Change which permissions a role grants by default",
   },
   {
-    code: "CREATE_ROLE",
+    code: "MANAGE_SETTINGS.CREATE_ROLE",
     name: "Create Role",
-    group: "Settings",
     description: "Create a new role with a chosen set of default permissions",
   },
   {
-    code: "EDIT_CLAUSES",
+    code: "MANAGE_SETTINGS.EDIT_CLAUSES",
     name: "Edit Clauses",
-    group: "Settings",
     description: "Edit the legal clause text attached to each coverage",
   },
   {
-    code: "EDIT_COVERAGE_DEFAULTS",
-    name: "Edit Coverage Defaults",
-    group: "Settings",
-    description: "Edit each coverage's standard rate and maximum coverage",
-  },
-  {
-    code: "MANAGE_PAYMENT_METHODS",
+    code: "MANAGE_SETTINGS.MANAGE_PAYMENT_METHODS",
     name: "Manage Authorized Payment Methods",
-    group: "Settings",
     description: "Add or remove which payment methods Bethel accepts directly",
   },
   {
-    code: "MANAGE_COVERAGE_PRICING",
+    code: "MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING",
     name: "Manage Coverage Pricing",
-    group: "Settings",
     description: "Choose how a coverage is priced and manage its value/tier pricing tables",
   },
 ];
+
+// Every seeded coverage is offered at these two standard periods — 6 months
+// and 1 year — so the Policy Application page's period picker has more than
+// one option to choose between out of the box.
+const ALLOWABLE_PERIOD_DAYS = [180, 365];
+
+// Returns the period rows keyed by their day count, so callers can look up
+// (e.g.) the 365-day period's id to seed pricing against it.
+async function seedAllowablePeriods(coverageId) {
+  const periodsByDays = {};
+  for (const days of ALLOWABLE_PERIOD_DAYS) {
+    periodsByDays[days] = await prisma.coverageAllowablePeriod.upsert({
+      where: { coverage_id_coverage_in_days: { coverage_id: coverageId, coverage_in_days: days } },
+      update: {},
+      create: { coverage_id: coverageId, coverage_in_days: days },
+    });
+  }
+  return periodsByDays;
+}
 
 async function main() {
   const permissions = [];
   for (const p of PERMISSIONS) {
     const permission = await prisma.permission.upsert({
       where: { permission_code: p.code },
-      update: {
-        permission_name: p.name,
-        page_group: p.group,
-        is_page_access: Boolean(p.pageAccess),
-        description: p.description,
-      },
-      create: {
-        permission_code: p.code,
-        permission_name: p.name,
-        page_group: p.group,
-        is_page_access: Boolean(p.pageAccess),
-        description: p.description,
-      },
+      update: { permission_name: p.name, description: p.description },
+      create: { permission_code: p.code, permission_name: p.name, description: p.description },
     });
     permissions.push(permission);
   }
@@ -265,10 +222,14 @@ async function main() {
           status: "ACTIVE",
         },
       });
+      const periods = await seedAllowablePeriods(coverage.id);
+      // All pre-period pricing is treated as the 1-year price — seeded
+      // against the 365-day period specifically, same as the migration that
+      // backfilled every existing pricing row this way.
       await prisma.coveragePercentageBasedPricing.upsert({
-        where: { coverage_id: coverage.id },
+        where: { coverage_allowable_period_id: periods[365].id },
         update: { standard_rate: c.rate },
-        create: { coverage_id: coverage.id, standard_rate: c.rate },
+        create: { coverage_allowable_period_id: periods[365].id, standard_rate: c.rate },
       });
     }
   }
@@ -338,10 +299,11 @@ async function main() {
           status: "ACTIVE",
         },
       });
+      const periods = await seedAllowablePeriods(coverage.id);
       await prisma.coveragePercentageBasedPricing.upsert({
-        where: { coverage_id: coverage.id },
+        where: { coverage_allowable_period_id: periods[365].id },
         update: { standard_rate: c.rate },
-        create: { coverage_id: coverage.id, standard_rate: c.rate },
+        create: { coverage_allowable_period_id: periods[365].id, standard_rate: c.rate },
       });
     }
   }

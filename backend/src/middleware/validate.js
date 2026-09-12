@@ -26,7 +26,11 @@ function validateQuery(schema) {
     if (!result.success) {
       return res.status(400).json({ error: formatZodError(result.error) });
     }
-    req.query = result.data;
+    // Express 5's `req.query` is a getter with no setter, so a plain
+    // `req.query = result.data` silently no-ops and the route would still
+    // see the raw (uncoerced — e.g. numbers as strings) query object.
+    // Object.defineProperty creates a real own property that shadows it.
+    Object.defineProperty(req, "query", { value: result.data, writable: true, configurable: true, enumerable: true });
     next();
   };
 }

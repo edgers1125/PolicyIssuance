@@ -1,6 +1,7 @@
 import DashboardIcon from "@mui/icons-material/Dashboard";
 import AssignmentIcon from "@mui/icons-material/Assignment";
 import ListAltIcon from "@mui/icons-material/ListAlt";
+import RequestQuoteIcon from "@mui/icons-material/RequestQuote";
 import PendingActionsIcon from "@mui/icons-material/PendingActions";
 import FactCheckIcon from "@mui/icons-material/FactCheck";
 import ManageAccountsIcon from "@mui/icons-material/ManageAccounts";
@@ -18,6 +19,12 @@ export const navItems = [
     permission: "CREATE_APPLICATION",
   },
   { label: "My Policies", path: "/my-policies", icon: ListAltIcon, permission: "VIEW_POLICIES" },
+  {
+    label: "Quotation Tracker",
+    path: "/quotation-tracker",
+    icon: RequestQuoteIcon,
+    permission: "CREATE_APPLICATION",
+  },
   {
     label: "In-Lease Backlogs",
     path: "/inlease-backlogs",

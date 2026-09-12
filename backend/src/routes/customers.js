@@ -34,8 +34,8 @@ router.get("/", async (req, res, next) => {
             status: true,
             // Excludes vehicles reassigned away from this customer (sold to
             // someone else) — those no longer count as "on file" here.
-            customer_vehicles: { where: { ownership_end_date: null }, select: { vehicle: true } },
-            customer_addresses: { select: { address: true } },
+            party_vehicles: { where: { ownership_end_date: null }, select: { vehicle: true } },
+            party_addresses: { select: { address: true } },
           },
         },
       },
@@ -45,10 +45,10 @@ router.get("/", async (req, res, next) => {
     res.json(
       links.map((l) => ({
         ...l.customer,
-        vehicles: l.customer.customer_vehicles.map((cv) => cv.vehicle),
-        addresses: l.customer.customer_addresses.map((ca) => ca.address),
-        customer_vehicles: undefined,
-        customer_addresses: undefined,
+        vehicles: l.customer.party_vehicles.map((pv) => pv.vehicle),
+        addresses: l.customer.party_addresses.map((pa) => pa.address),
+        party_vehicles: undefined,
+        party_addresses: undefined,
       }))
     );
   } catch (err) {

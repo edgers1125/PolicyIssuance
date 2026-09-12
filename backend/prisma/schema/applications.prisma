@@ -1,44 +1,44 @@
 model PolicyApplication {
-  id                    String            @id @default(uuid()) @db.Uuid
-  insured_type          InsuredType
-  application_number    String            @unique @db.VarChar(50)
-  customer_id           String?           @db.Uuid
-  company_id            String?           @db.Uuid
-  company_name_snapshot String?           @db.VarChar(255)
-  agent_id              String            @db.Uuid
-  agent_name_snapshot   String?           @db.VarChar(255)
-  product_variant_id    String            @db.Uuid
-  coverage_start_at     DateTime
-  coverage_end_at       DateTime
-  application_date      DateTime          @db.Date
-  submission_date       DateTime?         @db.Date
-  status                ApplicationStatus
+  id                       String            @id @default(uuid()) @db.Uuid
+  insured_type             InsuredType
+  application_number       String            @unique @db.VarChar(50)
+  customer_id              String?           @db.Uuid
+  company_id               String?           @db.Uuid
+  company_name_snapshot    String?           @db.VarChar(255)
+  agent_id                 String            @db.Uuid
+  agent_name_snapshot      String?           @db.VarChar(255)
+  product_variant_id       String            @db.Uuid
+  coverage_start_at        DateTime
+  coverage_end_at          DateTime
+  application_date         DateTime          @db.Date
+  submission_date          DateTime          @db.Date
+  status                   ApplicationStatus
   // Total premium is just the sum of every selected coverage's premium_amount.
   // Doc stamps/VAT/LGT are computed from it at the statutory rates in effect at
-  // submission time; misc is a flat amount the agent can enter. total_amount is
-  // the grand total (total_premium + doc_stamps + vat + lgt + misc).
-  total_premium         Decimal           @db.Decimal(18, 2)
-  doc_stamps            Decimal           @db.Decimal(18, 2)
-  vat                   Decimal           @db.Decimal(18, 2)
-  lgt                   Decimal           @db.Decimal(18, 2)
-  misc                  Decimal           @db.Decimal(18, 2)
-  total_amount          Decimal           @db.Decimal(18, 2)
-  send_policy_to_email  Boolean           @default(false)
-  payment_method        PaymentMethod
-  payment_remittance    PaymentRemittance
+  // submission time; misc is a flat amount the agent can enter. The grand total
+  // (total_premium + doc_stamps + vat + lgt + misc) is never stored — it's
+  // computable from these components, so it's derived wherever it's needed.
+  total_premium            Decimal           @db.Decimal(18, 2)
+  doc_stamps               Decimal           @db.Decimal(18, 2)
+  vat                      Decimal           @db.Decimal(18, 2)
+  lgt                      Decimal           @db.Decimal(18, 2)
+  misc                     Decimal           @db.Decimal(18, 2)
+  send_policy_to_email     Boolean           @default(false)
+  payment_method           PaymentMethod
+  payment_remittance       PaymentRemittance
   // Only set when payment_remittance is DIRECT_TO_BETHEL — which of Bethel's
   // own authorized payment methods the customer will use.
-  bethel_payment_method_id String?       @db.Uuid
-  remarks               String?
-  document_folder_name  String?           @db.VarChar(255)
-  created_at            DateTime          @default(now())
-  updated_at            DateTime          @updatedAt
+  bethel_payment_method_id String?           @db.Uuid
+  remarks                  String?
+  document_folder_name     String?           @db.VarChar(255)
+  created_at               DateTime          @default(now())
+  updated_at               DateTime          @updatedAt
 
   customer              Customer?                @relation(fields: [customer_id], references: [id])
   company               Company?                 @relation(fields: [company_id], references: [id])
   agent                 Agent                    @relation(fields: [agent_id], references: [id])
   product_variant       ProductVariant           @relation(fields: [product_variant_id], references: [id])
-  bethel_payment_method  AuthorizedPaymentMethod? @relation(fields: [bethel_payment_method_id], references: [id])
+  bethel_payment_method AuthorizedPaymentMethod? @relation(fields: [bethel_payment_method_id], references: [id])
 
   vehicles         PolicyApplicationVehicle[]
   addresses        PolicyApplicationAddress[]
@@ -61,6 +61,8 @@ model PolicyApplicationVehicle {
   policy_application PolicyApplication @relation(fields: [policy_application_id], references: [id])
   vehicle            Vehicle           @relation(fields: [vehicle_id], references: [id])
 
+  application_coverages ApplicationCoverage[]
+
   @@index([policy_application_id])
 }
 
@@ -79,25 +81,34 @@ model PolicyApplicationAddress {
 }
 
 model ApplicationCoverage {
-  id              String   @id @default(uuid()) @db.Uuid
-  application_id  String   @db.Uuid
-  coverage_id     String   @db.Uuid
+  id                            String   @id @default(uuid()) @db.Uuid
+  application_id                String   @db.Uuid
+  coverage_id                   String   @db.Uuid
   // Which vehicle (on a Motor application) this coverage was priced/applied
   // for — null means it applies to the whole policy (every vehicle on the
-  // application), with amounts already scaled by vehicle count.
-  vehicle_id      String?  @db.Uuid
-  coverage_amount Decimal  @db.Decimal(18, 2)
-  premium_amount  Decimal  @db.Decimal(18, 2)
+  // application), with amounts already scaled by vehicle count. Points at the
+  // application's own PolicyApplicationVehicle join row rather than Vehicle
+  // directly, so this can never reference a vehicle that isn't actually part
+  // of this application.
+  policy_application_vehicle_id String?  @db.Uuid
+  coverage_amount               Decimal  @db.Decimal(18, 2)
+  premium_amount                Decimal  @db.Decimal(18, 2)
+  // What's actually owed to Bethel for this row — coverage_amount × the
+  // agent's net rate (PERCENTAGE/VALUE_PERCENTAGE) or the tier's fixed price
+  // (FLAT_TIER). The agent's premium_amount is their own asking price, always
+  // >= this; premium_amount - payable_to_bethel is their profit on the row.
+  payable_to_bethel             Decimal  @db.Decimal(18, 2)
   // The net rate actually in effect for the agent at submission time — frozen
   // here so historical branch revenue stays accurate even if rates change later.
-  applied_rate    Decimal  @db.Decimal(10, 6)
-  created_at      DateTime @default(now())
-  updated_at      DateTime @updatedAt
+  // 0 for FLAT_TIER, which has no rate — just a fixed payable_to_bethel price.
+  applied_rate                  Decimal  @db.Decimal(10, 6)
+  created_at                    DateTime @default(now())
+  updated_at                    DateTime @updatedAt
 
-  application PolicyApplication @relation(fields: [application_id], references: [id])
-  coverage    ProductCoverage   @relation(fields: [coverage_id], references: [id])
-  vehicle     Vehicle?          @relation(fields: [vehicle_id], references: [id])
+  application                PolicyApplication         @relation(fields: [application_id], references: [id])
+  coverage                   ProductCoverage           @relation(fields: [coverage_id], references: [id])
+  policy_application_vehicle PolicyApplicationVehicle? @relation(fields: [policy_application_vehicle_id], references: [id])
 
   @@index([application_id])
-  @@index([vehicle_id])
+  @@index([policy_application_vehicle_id])
 }

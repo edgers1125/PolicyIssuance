@@ -2,35 +2,94 @@ const express = require("express");
 const crypto = require("crypto");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { requirePermission, ensurePermission, getUserPermissionCodes } = require("../middleware/permissions");
-const { validateBody } = require("../middleware/validate");
-const { createApplicationSchema } = require("../schemas/policyApplications");
+const { requirePermission } = require("../middleware/permissions");
+const { validateBody, validateQuery } = require("../middleware/validate");
+const { createQuotationSchema, listQuotationsQuerySchema } = require("../schemas/policyQuotations");
 const { currentVehicleValue } = require("../lib/vehicleValue");
 const { round2, resolveCoverageRows } = require("../lib/coveragePricing");
 const { sendIfHttpError } = require("../lib/httpError");
 
 const router = express.Router();
 
+// A quotation only needs the base CREATE_APPLICATION grant (the same one
+// that covers browsing the catalog and your customers/companies) — unlike an
+// application, drafting a quotation isn't "issuing" anything, so it doesn't
+// need CREATE_APPLICATION.AGENT_ISSUANCE.
 router.use(requireAuth, requirePermission("CREATE_APPLICATION"));
 
-// Standard Philippine non-life insurance statutory rates, applied to total premium.
 const DOC_STAMPS_RATE = 0.125;
 const VAT_RATE = 0.12;
 const LGT_RATE = 0.002;
 
-function generateApplicationNumber() {
+function generateQuotationNumber() {
   const datePart = new Date().toISOString().slice(0, 10).replaceAll("-", "");
   const randomPart = crypto.randomBytes(3).toString("hex").toUpperCase();
-  return `APP-${datePart}-${randomPart}`;
+  return `QUO-${datePart}-${randomPart}`;
 }
 
-router.post("/", validateBody(createApplicationSchema), async (req, res, next) => {
+// Every quotation this agent has drafted, latest first — the Quotation
+// Tracker's list view.
+router.get("/", validateQuery(listQuotationsQuerySchema), async (req, res, next) => {
   try {
-    // CREATE_APPLICATION covers the page itself (browsing the catalog, your
-    // customers/companies); actually issuing an application needs its own grant.
-    const actingPermissions = await getUserPermissionCodes(req.user.userId);
-    if (!ensurePermission(res, actingPermissions, "CREATE_APPLICATION.AGENT_ISSUANCE")) return;
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { agent_id: true } });
+    if (!user?.agent_id) {
+      return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+    }
 
+    const { page, page_size: pageSize } = req.query;
+    const where = { agent_id: user.agent_id };
+
+    const [total, quotations] = await Promise.all([
+      prisma.policyQuotation.count({ where }),
+      prisma.policyQuotation.findMany({
+        where,
+        orderBy: { created_at: "desc" },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        select: {
+          id: true,
+          quotation_number: true,
+          insured_type: true,
+          quotation_date: true,
+          coverage_start_at: true,
+          coverage_end_at: true,
+          total_premium: true,
+          created_at: true,
+          customer: { select: { first_name: true, last_name: true } },
+          company_name_snapshot: true,
+          product_variant: {
+            select: { variant_name: true, insurance_class: { select: { class_name: true } } },
+          },
+        },
+      }),
+    ]);
+
+    res.json({
+      data: quotations.map((q) => ({
+        id: q.id,
+        quotation_number: q.quotation_number,
+        insured_name:
+          q.insured_type === "INDIVIDUAL"
+            ? [q.customer?.last_name, q.customer?.first_name].filter(Boolean).join(", ")
+            : q.company_name_snapshot,
+        class_name: q.product_variant.insurance_class.class_name,
+        variant_name: q.product_variant.variant_name,
+        coverage_start_at: q.coverage_start_at,
+        coverage_end_at: q.coverage_end_at,
+        total_premium: q.total_premium,
+        created_at: q.created_at,
+      })),
+      total,
+      page,
+      page_size: pageSize,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/", validateBody(createQuotationSchema), async (req, res, next) => {
+  try {
     const {
       customer_id,
       company_id,
@@ -44,30 +103,11 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       remarks,
       misc,
       send_policy_to_email,
-      payment_method,
-      payment_remittance,
-      bethel_payment_method_id,
     } = req.body;
 
-    // Which one applies is derived from whichever id was actually sent — the
-    // schema already enforced that exactly one of the two is present.
     const insured_type = customer_id ? "INDIVIDUAL" : "CORPORATE";
-
-    // The single pair of conditionally-null party fields every
-    // PartyVehicle/PartyAddress create call below needs — computed once
-    // since which one is set never changes within a single application.
     const partyIdFields =
       insured_type === "INDIVIDUAL" ? { customer_id, company_id: null } : { customer_id: null, company_id };
-
-    // bethel_payment_method_id's presence-when-required was already checked by
-    // the schema — this just confirms the id it gave actually exists.
-    let bethelPaymentMethod = null;
-    if (bethel_payment_method_id) {
-      bethelPaymentMethod = await prisma.authorizedPaymentMethod.findUnique({ where: { id: bethel_payment_method_id } });
-      if (!bethelPaymentMethod) {
-        return res.status(400).json({ error: "bethel_payment_method_id does not match an existing payment method" });
-      }
-    }
 
     const productVariant = await prisma.productVariant.findUnique({
       where: { id: product_variant_id },
@@ -77,30 +117,19 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       return res.status(400).json({ error: "product_variant_id does not match an existing product" });
     }
     const className = productVariant.insurance_class.class_name;
-    // Property carries its own risk location, separate from the address the
-    // policy is actually named on; Motor only ever needs the latter.
     const requiresRiskAddress = className === "Property";
     const requiresInsuredAddress = className === "Motor" || className === "Property";
 
-    // What's required depends entirely on the insurance class, not the client's
-    // say-so — the schema already validated the shape of vehicles/addresses
-    // wherever they were given, this just enforces whether they had to be.
     if (className === "Motor" && (!Array.isArray(vehicles) || vehicles.length === 0)) {
-      return res.status(400).json({ error: "At least one vehicle is required for Motor applications" });
+      return res.status(400).json({ error: "At least one vehicle is required for Motor quotations" });
     }
     if (requiresRiskAddress && !risk_address) {
-      return res.status(400).json({ error: "A risk address is required for Property applications" });
+      return res.status(400).json({ error: "A risk address is required for Property quotations" });
     }
     if (requiresInsuredAddress && !insured_address) {
-      return res.status(400).json({ error: "An insured address is required for this application" });
+      return res.status(400).json({ error: "An insured address is required for this quotation" });
     }
 
-    // VALUE_PERCENTAGE coverages price off whichever vehicle they're scoped
-    // to (or the primary/first vehicle, for one that applies to the whole
-    // policy) — for an existing vehicle this is looked up fresh from the
-    // database (its value/date are frozen once assessed, so this is the
-    // authoritative figure); a brand-new vehicle is being assessed for the
-    // first time right now, so "now" is its assessment date.
     async function resolveVehicleValue(v) {
       if (!v) return null;
       if (v.existing_vehicle_id) {
@@ -117,16 +146,14 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
     }
     const vehicleValues = className === "Motor" ? await Promise.all(vehicles.map(resolveVehicleValue)) : [];
 
-    const user = await prisma.user.findUnique({
-      where: { id: req.user.userId },
-      select: { agent_id: true },
-    });
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { agent_id: true } });
     if (!user?.agent_id) {
       return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
     }
     const agent = await prisma.agent.findUnique({ where: { id: user.agent_id } });
 
-    // The agent can only file applications for their own connected customers/companies.
+    // Same connected-party restriction as an application — an agent can only
+    // quote for their own connected customers/companies.
     if (insured_type === "INDIVIDUAL") {
       const link = await prisma.customerAgent.findUnique({
         where: { customer_id_agent_id: { customer_id, agent_id: agent.id } },
@@ -143,10 +170,6 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       }
     }
 
-    // Every coverage resolves against whichever pricing this agent actually
-    // has for it, and against the application's own coverage period — see
-    // lib/coveragePricing.js (shared with quotation creation, which prices
-    // identically).
     const resolvedRows = await resolveCoverageRows({
       coverages,
       className,
@@ -157,11 +180,6 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       endAt,
     });
 
-    // Total premium is just the sum of every coverage's (server-resolved)
-    // premium — statutory charges are computed from that, and misc is
-    // whatever flat amount was entered. The grand total is computable from
-    // these components (total_premium + doc_stamps + vat + lgt + misc)
-    // wherever it's needed, so it's never stored.
     const totalPremium = round2(resolvedRows.reduce((sum, r) => sum + r.premium_amount, 0));
     const docStamps = round2(totalPremium * DOC_STAMPS_RATE);
     const vat = round2(totalPremium * VAT_RATE);
@@ -177,15 +195,11 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       companyNameSnapshot = company.company_name;
     }
 
-    // Verify any "reuse this existing vehicle/address" ids are actually on file for
-    // this customer/company before the transaction, so a bad id fails cleanly with 400.
     if (className === "Motor") {
       for (const v of vehicles) {
         if (!v.existing_vehicle_id) continue;
 
         if (v.reassign_owner) {
-          // Confirmed by the agent as belonging to (or about to belong to) this
-          // party — who currently owns it doesn't matter, that's what's changing.
           const vehicleExists = await prisma.vehicle.findUnique({ where: { id: v.existing_vehicle_id } });
           if (!vehicleExists) {
             return res.status(400).json({ error: "One of the selected vehicles no longer exists" });
@@ -220,10 +234,10 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
     }
 
     const result = await prisma.$transaction(async (tx) => {
-      const application = await tx.policyApplication.create({
+      const quotation = await tx.policyQuotation.create({
         data: {
           insured_type,
-          application_number: generateApplicationNumber(),
+          quotation_number: generateQuotationNumber(),
           customer_id: insured_type === "INDIVIDUAL" ? customer_id : null,
           company_id: insured_type === "CORPORATE" ? company_id : null,
           company_name_snapshot: companyNameSnapshot,
@@ -232,28 +246,22 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
           product_variant_id,
           coverage_start_at: startAt,
           coverage_end_at: endAt,
-          application_date: new Date(),
-          submission_date: new Date(),
-          status: "SUBMITTED",
+          quotation_date: new Date(),
           total_premium: totalPremium,
           doc_stamps: docStamps,
           vat,
           lgt,
           misc: miscAmount,
           send_policy_to_email: Boolean(send_policy_to_email),
-          payment_method,
-          payment_remittance,
-          bethel_payment_method_id: bethelPaymentMethod ? bethelPaymentMethod.id : null,
           remarks: remarks || null,
         },
       });
 
-      // Vehicles have to be resolved to real PolicyApplicationVehicle join
-      // rows before the coverage rows below can reference one — a brand-new
-      // vehicle doesn't have one until it's actually created here, in the
-      // same order as `vehicles`, so a coverage's vehicle_index can be mapped
-      // straight onto this array.
-      const policyApplicationVehicleIds = [];
+      // Same vehicle-resolution dance as an application — a brand-new
+      // vehicle is created fresh, an existing one is reused (and optionally
+      // reassigned to this party), then joined onto the quotation in the
+      // same order as `vehicles` so a coverage's vehicle_index maps onto it.
+      const policyQuotationVehicleIds = [];
 
       if (className === "Motor") {
         for (const v of vehicles) {
@@ -263,12 +271,6 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
             vehicleId = v.existing_vehicle_id;
 
             if (v.reassign_owner) {
-              // The agent may have corrected/updated details while confirming
-              // the match — persist those before moving ownership over.
-              // initial_assessment_date is stamped only the first time a value
-              // is recorded, and never moved again afterward — and once
-              // assessed, the value itself is frozen too (it only ever
-              // changes through automatic depreciation from here on).
               const currentVehicle = await tx.vehicle.findUnique({
                 where: { id: vehicleId },
                 select: { estimated_value: true, initial_assessment_date: true },
@@ -295,9 +297,6 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
                 },
               });
 
-              // Treated as sold: close out whichever active ownership link it
-              // had (kept for history, not deleted), then open a new one for
-              // this application's party.
               await tx.partyVehicle.updateMany({
                 where: { vehicle_id: vehicleId, ownership_end_date: null },
                 data: { ownership_end_date: new Date() },
@@ -307,7 +306,6 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
                 data: { ...partyIdFields, vehicle_id: vehicleId, ownership_start_date: new Date() },
               });
             }
-            // else: already verified as on-file for this customer/company above — just reuse it as-is.
           } else {
             const createdVehicle = await tx.vehicle.create({
               data: {
@@ -331,18 +329,18 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
             });
           }
 
-          const policyApplicationVehicle = await tx.policyApplicationVehicle.create({
-            data: { policy_application_id: application.id, vehicle_id: vehicleId },
+          const policyQuotationVehicle = await tx.policyQuotationVehicle.create({
+            data: { policy_quotation_id: quotation.id, vehicle_id: vehicleId },
           });
-          policyApplicationVehicleIds.push(policyApplicationVehicle.id);
+          policyQuotationVehicleIds.push(policyQuotationVehicle.id);
         }
       }
 
-      await tx.applicationCoverage.createMany({
+      await tx.quotationCoverage.createMany({
         data: resolvedRows.map((r) => ({
-          application_id: application.id,
+          quotation_id: quotation.id,
           coverage_id: r.coverage_id,
-          policy_application_vehicle_id: r.vehicle_index !== null ? policyApplicationVehicleIds[r.vehicle_index] : null,
+          policy_quotation_vehicle_id: r.vehicle_index !== null ? policyQuotationVehicleIds[r.vehicle_index] : null,
           coverage_amount: r.coverage_amount,
           premium_amount: r.premium_amount,
           payable_to_bethel: r.payable_to_bethel,
@@ -352,7 +350,6 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
 
       async function resolveAddressId(addr, addressType) {
         if (addr.existing_address_id) {
-          // Already verified as on-file for this customer/company above — just reuse it.
           return addr.existing_address_id;
         }
         const createdAddress = await tx.address.create({
@@ -368,26 +365,24 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
           },
         });
 
-        // New addresses created inline get linked to the party too, same as a
-        // new vehicle does, so they're available to pick from next time.
         await tx.partyAddress.create({ data: { ...partyIdFields, address_id: createdAddress.id } });
         return createdAddress.id;
       }
 
       if (requiresRiskAddress) {
         const addressId = await resolveAddressId(risk_address, "RISK_LOCATION");
-        await tx.policyApplicationAddress.create({
-          data: { policy_application_id: application.id, address_id: addressId, role: "RISK" },
+        await tx.policyQuotationAddress.create({
+          data: { policy_quotation_id: quotation.id, address_id: addressId, role: "RISK" },
         });
       }
       if (requiresInsuredAddress) {
         const addressId = await resolveAddressId(insured_address, "RESIDENTIAL");
-        await tx.policyApplicationAddress.create({
-          data: { policy_application_id: application.id, address_id: addressId, role: "INSURED" },
+        await tx.policyQuotationAddress.create({
+          data: { policy_quotation_id: quotation.id, address_id: addressId, role: "INSURED" },
         });
       }
 
-      return application;
+      return quotation;
     });
 
     res.status(201).json(result);

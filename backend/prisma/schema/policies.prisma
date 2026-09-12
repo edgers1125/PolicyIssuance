@@ -1,20 +1,22 @@
 model Policy {
-  id                  String       @id @default(uuid()) @db.Uuid
-  policy_number       String       @unique @db.VarChar(50)
-  application_id      String       @unique @db.Uuid
-  customer_id         String?      @db.Uuid
-  company_id          String?      @db.Uuid
-  agent_id            String       @db.Uuid
-  agent_name_snapshot String?      @db.VarChar(255)
-  product_variant_id  String       @db.Uuid
-  issue_date          DateTime     @db.Date
-  effective_date      DateTime     @db.Date
-  expiry_date         DateTime     @db.Date
-  policy_status       PolicyStatus
-  added_to_inlease    Boolean      @default(false)
-  inlease_added_at    DateTime?
-  created_at          DateTime     @default(now())
-  updated_at          DateTime     @updatedAt
+  id                     String       @id @default(uuid()) @db.Uuid
+  policy_number          String       @unique @db.VarChar(50)
+  application_id         String       @unique @db.Uuid
+  customer_id            String?      @db.Uuid
+  customer_name_snapshot String?      @db.VarChar(255)
+  company_id             String?      @db.Uuid
+  company_name_snapshot  String?      @db.VarChar(255)
+  agent_id               String       @db.Uuid
+  agent_name_snapshot    String?      @db.VarChar(255)
+  product_variant_id     String       @db.Uuid
+  issue_date             DateTime     @db.Date
+  effective_date         DateTime     @db.Date
+  expiry_date            DateTime     @db.Date
+  policy_status          PolicyStatus
+  added_to_inlease       Boolean      @default(false)
+  inlease_added_at       DateTime?
+  created_at             DateTime     @default(now())
+  updated_at             DateTime     @updatedAt
 
   application     PolicyApplication @relation(fields: [application_id], references: [id])
   customer        Customer?         @relation(fields: [customer_id], references: [id])
@@ -61,13 +63,19 @@ model PolicyAddress {
 }
 
 model PolicyCoverage {
-  id              String   @id @default(uuid()) @db.Uuid
-  policy_id       String   @db.Uuid
-  coverage_id     String   @db.Uuid
-  coverage_amount Decimal  @db.Decimal(18, 2)
-  premium_amount  Decimal  @db.Decimal(18, 2)
-  created_at      DateTime @default(now())
-  updated_at      DateTime @updatedAt
+  id                     String   @id @default(uuid()) @db.Uuid
+  policy_id              String   @db.Uuid
+  coverage_id            String   @db.Uuid
+  // Frozen off ProductCoverage at policy issuance, since the coverage's own
+  // code/name/clause can be edited later and this row must keep reading the
+  // way the policy actually looked when it was issued.
+  coverage_code_snapshot String   @db.VarChar(50)
+  coverage_name_snapshot String   @db.VarChar(255)
+  clause_snapshot        String   @db.Text
+  coverage_amount        Decimal  @db.Decimal(18, 2)
+  premium_amount         Decimal  @db.Decimal(18, 2)
+  created_at             DateTime @default(now())
+  updated_at             DateTime @updatedAt
 
   policy   Policy          @relation(fields: [policy_id], references: [id])
   coverage ProductCoverage @relation(fields: [coverage_id], references: [id])

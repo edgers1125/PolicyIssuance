@@ -1,15 +1,30 @@
 const ANNUAL_DEPRECIATION_RATE = 0.1;
-const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000;
 
-// A vehicle's insurable value depreciates 10% per year (continuously, not in
-// yearly steps) from the date it was first assessed — this is what
-// VALUE_PERCENTAGE coverage pricing is based on, never the frozen original
-// estimate itself.
+// Counts whole calendar years between two dates, anchored to the exact
+// anniversary of `from` — e.g. assessed Oct 12, 2026, 2:00 PM: still 0 whole
+// years elapsed at 1:59:59 PM on Oct 12, 2027, becomes 1 the instant it turns
+// 2:00 PM that same day. Using real calendar-year anniversaries (rather than
+// dividing by an averaged ms-per-year) also means this lands correctly across
+// leap years, instead of drifting by a few hours per year.
+function wholeYearsElapsed(from, to) {
+  let years = to.getFullYear() - from.getFullYear();
+  const anniversary = new Date(from);
+  anniversary.setFullYear(from.getFullYear() + years);
+  if (anniversary > to) {
+    years -= 1;
+  }
+  return Math.max(0, years);
+}
+
+// A vehicle's insurable value drops a full 10% at each whole-year anniversary
+// of its assessment date — never gradually, and never partway through a year
+// — from the date it was first assessed. This is what VALUE_PERCENTAGE
+// coverage pricing is based on, never the frozen original estimate itself.
 function currentVehicleValue(estimatedValue, initialAssessmentDate, asOf = new Date()) {
   if (estimatedValue === null || estimatedValue === undefined || !initialAssessmentDate) {
     return null;
   }
-  const yearsElapsed = Math.max(0, (asOf - new Date(initialAssessmentDate)) / MS_PER_YEAR);
+  const yearsElapsed = wholeYearsElapsed(new Date(initialAssessmentDate), asOf);
   return Number(estimatedValue) * Math.pow(1 - ANNUAL_DEPRECIATION_RATE, yearsElapsed);
 }
 

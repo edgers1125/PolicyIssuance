@@ -24,7 +24,7 @@ function fmtDateTime(value) {
 // preview reads as an actual sheet rather than an arbitrary web block. Real
 // pagination when printing is left entirely to the browser — this only marks
 // where a new page should start; it never clips content itself.
-function Page({ children, breakBefore }) {
+function Page({ children, breakBefore, watermarkText }) {
   return (
     <div
       className="policy-schedule-page"
@@ -37,6 +37,7 @@ function Page({ children, breakBefore }) {
         boxSizing: "border-box",
         background: "#fff",
         breakBefore: breakBefore ? "page" : "auto",
+        overflow: "hidden",
       }}
     >
       <div
@@ -52,6 +53,36 @@ function Page({ children, breakBefore }) {
           pointerEvents: "none",
         }}
       />
+      {watermarkText && (
+        <div
+          aria-hidden
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            pointerEvents: "none",
+          }}
+        >
+          <div
+            style={{
+              transform: "rotate(-38deg)",
+              fontFamily: "Arial, sans-serif",
+              fontWeight: 700,
+              fontSize: 46,
+              lineHeight: 1.15,
+              letterSpacing: 2,
+              color: "rgba(185, 28, 28, 0.28)",
+              textAlign: "center",
+              whiteSpace: "pre-line",
+              width: "120%",
+            }}
+          >
+            {watermarkText}
+          </div>
+        </div>
+      )}
       <div style={{ position: "relative" }}>{children}</div>
     </div>
   );
@@ -113,6 +144,7 @@ function VehicleBlock({ vehicle }) {
 export function PolicySchedulePreview({
   applicationNumber,
   isPreview,
+  isQuotation,
   classNameLabel,
   variantName,
   insuredName,
@@ -134,6 +166,9 @@ export function PolicySchedulePreview({
   const to = fmtDateTime(coverageEndAt);
   const hasVehicles = Array.isArray(vehicles) && vehicles.length > 0;
   const clausedCoverages = coverages.filter((c) => c.clause);
+  // A quotation is never a policy — every page (on screen and printed)
+  // carries this watermark so it can never be mistaken for one.
+  const watermarkText = isQuotation ? "POLICY NOT IN EFFECT\nQUOTATION ONLY" : null;
 
   return (
     <div style={{ fontFamily: "'Times New Roman', Times, serif", fontSize: 12, color: "#111" }}>
@@ -143,8 +178,8 @@ export function PolicySchedulePreview({
           .policy-schedule-page { box-shadow: none; margin: 0 !important; width: auto; min-height: 0; }
         }
       `}</style>
-      <Page>
-        {isPreview && (
+      <Page watermarkText={watermarkText}>
+        {isPreview && !isQuotation && (
           <div
             style={{
               textAlign: "center",
@@ -159,7 +194,9 @@ export function PolicySchedulePreview({
           </div>
         )}
 
-        <div style={{ textAlign: "center", fontWeight: 700, fontSize: 15, letterSpacing: 1 }}>POLICY SCHEDULE</div>
+        <div style={{ textAlign: "center", fontWeight: 700, fontSize: 15, letterSpacing: 1 }}>
+          {isQuotation ? "QUOTATION" : "POLICY SCHEDULE"}
+        </div>
         <div style={{ textAlign: "center", fontWeight: 700, marginTop: 4, marginBottom: 16 }}>
           {classNameLabel?.toUpperCase()}
           {variantName ? ` — ${variantName.toUpperCase()}` : ""}
@@ -170,7 +207,7 @@ export function PolicySchedulePreview({
             <tr>
               <td style={{ verticalAlign: "top", width: "55%", paddingRight: 16 }}>
                 <div>
-                  <strong>Policy No :</strong> {applicationNumber}
+                  <strong>{isQuotation ? "Quotation No :" : "Policy No :"}</strong> {applicationNumber}
                 </div>
                 <div style={{ marginTop: 10 }}>
                   <strong>Insured :</strong> {insuredName}
@@ -184,7 +221,7 @@ export function PolicySchedulePreview({
               </td>
               <td style={{ verticalAlign: "top", width: "45%" }}>
                 <div style={{ marginBottom: 10 }}>
-                  <strong>Date Issued:</strong> {fmtDate(new Date())}
+                  <strong>{isQuotation ? "Date Prepared:" : "Date Issued:"}</strong> {fmtDate(new Date())}
                 </div>
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <tbody>
@@ -279,13 +316,13 @@ export function PolicySchedulePreview({
       </Page>
 
       {clausedCoverages.length > 0 && (
-        <Page breakBefore>
+        <Page breakBefore watermarkText={watermarkText}>
           <div style={{ textAlign: "center", fontWeight: 700, fontSize: 14, marginBottom: 16 }}>
             Warranties and Clauses
           </div>
           <div style={{ fontSize: 11, marginBottom: 20 }}>
-            ATTACH TO AND FORMING PART OF BETHEL GENERAL INSURANCE AND SURETY CORP. POLICY NO.:{" "}
-            {applicationNumber}
+            ATTACH TO AND FORMING PART OF BETHEL GENERAL INSURANCE AND SURETY CORP.{" "}
+            {isQuotation ? "QUOTATION NO.:" : "POLICY NO.:"} {applicationNumber}
           </div>
           {clausedCoverages.map((c) => (
             <div key={c.name} style={{ marginBottom: 18 }}>

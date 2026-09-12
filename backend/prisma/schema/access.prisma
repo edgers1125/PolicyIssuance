@@ -33,12 +33,16 @@ model Role {
   user_roles       UserRole[]
 }
 
+// permission_code encodes its own hierarchy instead of separate grouping
+// columns: a code with no dot (e.g. "MANAGE_USERS") is a top-level,
+// page-access permission; "PARENT.CHILD" (e.g. "MANAGE_USERS.ADD_USER") is a
+// sub-permission scoped under that page. Both grouping-for-display and
+// "which page does this unlock" are derived by splitting on "." wherever
+// needed, rather than stored.
 model Permission {
   id              String   @id @default(uuid()) @db.Uuid
   permission_code String   @unique @db.VarChar(100)
   permission_name String   @db.VarChar(255)
-  page_group      String   @db.VarChar(100)
-  is_page_access  Boolean  @default(false)
   description     String?
   created_at      DateTime @default(now())
   updated_at      DateTime @updatedAt

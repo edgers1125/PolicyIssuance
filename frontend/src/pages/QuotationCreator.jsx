@@ -41,8 +41,7 @@ import {
   updateVehicle,
   lookupVehicleByPlate,
   updateAddress,
-  createPolicyApplication,
-  listPaymentMethods,
+  createPolicyQuotation,
 } from "../api/client";
 import { formatPHP, formatRate } from "../utils/currency";
 import { formatPeriodLabel } from "../utils/coveragePeriods";
@@ -731,9 +730,8 @@ function PlateConflictDialog({ conflict, onCancel, onConfirm }) {
   );
 }
 
-export function PolicyApplication() {
-  const { token, permissions, agent } = useAuth();
-  const canIssue = permissions?.includes("CREATE_APPLICATION.AGENT_ISSUANCE");
+export function QuotationCreator() {
+  const { token, agent } = useAuth();
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -772,10 +770,6 @@ export function PolicyApplication() {
   const [remarks, setRemarks] = useState("");
   const [misc, setMisc] = useState("");
   const [sendPolicyToEmail, setSendPolicyToEmail] = useState(false);
-  const [paymentMethod, setPaymentMethod] = useState("");
-  const [paymentRemittance, setPaymentRemittance] = useState("");
-  const [bethelPaymentMethodId, setBethelPaymentMethodId] = useState("");
-  const [bethelPaymentMethods, setBethelPaymentMethods] = useState([]);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [confirmChecked, setConfirmChecked] = useState(false);
 
@@ -785,7 +779,7 @@ export function PolicyApplication() {
 
   useEffect(() => {
     setLoading(true);
-    Promise.all([getProductCatalog(token).then(setCatalog), loadParties(), listPaymentMethods(token).then(setBethelPaymentMethods)])
+    Promise.all([getProductCatalog(token).then(setCatalog), loadParties()])
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1103,18 +1097,6 @@ export function PolicyApplication() {
       setError("Fill out the insured address.");
       return;
     }
-    if (!paymentMethod) {
-      setError("Select a payment method.");
-      return;
-    }
-    if (!paymentRemittance) {
-      setError("Select whether payment goes directly to Bethel or through the agent.");
-      return;
-    }
-    if (paymentRemittance === "DIRECT_TO_BETHEL" && !bethelPaymentMethodId) {
-      setError("Select which Bethel payment method the customer will use.");
-      return;
-    }
     for (const [coverageId, selection] of coverageEntries) {
       const cov = coverages.find((c) => c.id === coverageId);
       if (Array.isArray(selection.vehicle_indices) && selection.vehicle_indices.length === 0) {
@@ -1205,13 +1187,10 @@ export function PolicyApplication() {
         remarks: remarks || undefined,
         misc: miscAmount,
         send_policy_to_email: sendPolicyToEmail,
-        payment_method: paymentMethod,
-        payment_remittance: paymentRemittance,
-        bethel_payment_method_id: paymentRemittance === "DIRECT_TO_BETHEL" ? bethelPaymentMethodId : undefined,
       };
 
-      const application = await createPolicyApplication(token, payload);
-      setSuccess(application);
+      const quotation = await createPolicyQuotation(token, payload);
+      setSuccess(quotation);
 
       // Reset for the next application, but keep the just-used party available
       // (locked, as if it were an existing match) in case another one follows.
@@ -1233,9 +1212,6 @@ export function PolicyApplication() {
       setRemarks("");
       setMisc("");
       setSendPolicyToEmail(false);
-      setPaymentMethod("");
-      setPaymentRemittance("");
-      setBethelPaymentMethodId("");
       setPreviewOpen(false);
       setConfirmChecked(false);
       await loadParties();
@@ -1259,6 +1235,7 @@ export function PolicyApplication() {
   const previewProps = {
     applicationNumber: "TO BE ASSIGNED ON SUBMISSION",
     isPreview: true,
+    isQuotation: true,
     classNameLabel: selectedClass?.class_name,
     variantName: selectedVariant?.variant_name,
     insuredName:
@@ -1305,12 +1282,12 @@ export function PolicyApplication() {
   return (
     <Container maxWidth="sm" sx={{ py: { xs: 3, sm: 6 } }}>
       <Typography variant="h5" sx={{ mb: 3, fontWeight: 700 }}>
-        Policy Application
+        Quotation Creator
       </Typography>
 
       {success && (
         <Alert severity="success" sx={{ mb: 2 }}>
-          Application {success.application_number} submitted.
+          Quotation {success.quotation_number} created.
         </Alert>
       )}
       {error && (
@@ -2466,63 +2443,17 @@ export function PolicyApplication() {
 
           <Paper sx={{ p: { xs: 2, sm: 3 }, borderRadius: 3 }}>
             <Typography variant="subtitle1" sx={{ fontWeight: 600, mb: 2 }}>
-              Payment &amp; Delivery
+              Delivery
             </Typography>
-            <Stack spacing={2}>
-              <FormControlLabel
-                control={
-                  <Checkbox
-                    checked={sendPolicyToEmail}
-                    onChange={(e) => setSendPolicyToEmail(e.target.checked)}
-                  />
-                }
-                label="Send the policy directly to the customer's email once issued"
-              />
-
-              <TextField
-                select
-                label="Payment method"
-                value={paymentMethod}
-                onChange={(e) => setPaymentMethod(e.target.value)}
-                required
-                fullWidth
-              >
-                <MenuItem value="CASH">Cash</MenuItem>
-                <MenuItem value="CHECK">Check</MenuItem>
-                <MenuItem value="CREDIT_CARD">Credit card</MenuItem>
-                <MenuItem value="BANK_TRANSFER">Bank transfer</MenuItem>
-                <MenuItem value="ONLINE_PAYMENT">Online payment</MenuItem>
-              </TextField>
-
-              <TextField
-                select
-                label="Payment goes to"
-                value={paymentRemittance}
-                onChange={(e) => setPaymentRemittance(e.target.value)}
-                required
-                fullWidth
-              >
-                <MenuItem value="DIRECT_TO_BETHEL">Directly to Bethel</MenuItem>
-                <MenuItem value="THROUGH_AGENT">Through the agent first</MenuItem>
-              </TextField>
-
-              {paymentRemittance === "DIRECT_TO_BETHEL" && (
-                <TextField
-                  select
-                  label="Bethel payment method"
-                  value={bethelPaymentMethodId}
-                  onChange={(e) => setBethelPaymentMethodId(e.target.value)}
-                  required
-                  fullWidth
-                >
-                  {bethelPaymentMethods.map((m) => (
-                    <MenuItem key={m.id} value={m.id}>
-                      {m.name}
-                    </MenuItem>
-                  ))}
-                </TextField>
-              )}
-            </Stack>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={sendPolicyToEmail}
+                  onChange={(e) => setSendPolicyToEmail(e.target.checked)}
+                />
+              }
+              label="Send this quotation to the customer's email"
+            />
           </Paper>
 
           {totalPremium > 0 && (
@@ -2581,15 +2512,8 @@ export function PolicyApplication() {
             </Paper>
           )}
 
-          {!canIssue && (
-            <Alert severity="warning">
-              You don't have permission to issue policy applications. You can still fill this out, but
-              submitting it isn't available for your account.
-            </Alert>
-          )}
-
-          <Button type="submit" variant="contained" size="large" disabled={!canIssue}>
-            Submit Application
+          <Button type="submit" variant="contained" size="large">
+            Save Quotation
           </Button>
           </>
           )}
@@ -2712,7 +2636,7 @@ export function PolicyApplication() {
       />
 
       <Dialog open={previewOpen} onClose={() => setPreviewOpen(false)} fullWidth maxWidth="md">
-        <DialogTitle>Policy Schedule Preview</DialogTitle>
+        <DialogTitle>Quotation Preview</DialogTitle>
         <DialogContent sx={{ bgcolor: "#e9e9e9" }}>
           <Box sx={{ my: 2, display: "flex", justifyContent: "center" }}>
             <PolicySchedulePreview {...previewProps} />
@@ -2742,9 +2666,9 @@ export function PolicyApplication() {
           <Button
             variant="contained"
             onClick={handleConfirmSubmit}
-            disabled={!confirmChecked || submitting || !canIssue}
+            disabled={!confirmChecked || submitting}
           >
-            {submitting ? "Submitting..." : "Submit"}
+            {submitting ? "Saving..." : "Save"}
           </Button>
         </DialogActions>
       </Dialog>

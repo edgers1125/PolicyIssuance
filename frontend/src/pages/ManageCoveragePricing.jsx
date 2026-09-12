@@ -17,6 +17,12 @@ import {
   FormLabel,
   InputAdornment,
   Divider,
+  Autocomplete,
+  TextField,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
 } from "@mui/material";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import AddIcon from "@mui/icons-material/Add";
@@ -29,9 +35,11 @@ import {
   updateCoveragePricingMode,
   updateValuePercentageTiers,
   updateFlatTiers,
+  createAllowablePeriod,
 } from "../api/client";
 import { CoverageSelector } from "../components/CoverageSelector";
 import { NumberField } from "../components/NumberField";
+import { formatPeriodLabel } from "../utils/coveragePeriods";
 
 const PRICING_MODES = [
   { value: "PERCENTAGE", label: "Percentage of coverage amount", description: "Agent enters a coverage amount and premium, floored by the net rate." },
@@ -51,16 +59,29 @@ function sameTiers(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+// Sentinel option the period Autocomplete injects when the typed number of
+// days doesn't match any of the coverage's existing periods — picking it
+// opens the "Add Coverage Period" dialog instead of selecting a period.
+function isAddNewOption(option) {
+  return Boolean(option) && typeof option === "object" && option.addNew;
+}
+
 export function ManageCoveragePricing() {
   const { token } = useAuth();
   const navigate = useNavigate();
   const [coverages, setCoverages] = useState([]);
   const [coverageId, setCoverageId] = useState("");
+  const [coveragePeriodDays, setCoveragePeriodDays] = useState("");
   const [loading, setLoading] = useState(true);
   const [pricingLoading, setPricingLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
+
+  const [addPeriodOpen, setAddPeriodOpen] = useState(false);
+  const [addPeriodDraft, setAddPeriodDraft] = useState("");
+  const [addPeriodSubmitting, setAddPeriodSubmitting] = useState(false);
+  const [addPeriodError, setAddPeriodError] = useState("");
 
   const [maximumCoverage, setMaximumCoverage] = useState("");
   const [originalMaximumCoverage, setOriginalMaximumCoverage] = useState("");
@@ -86,6 +107,9 @@ export function ManageCoveragePricing() {
       .finally(() => setLoading(false));
   }, [token]);
 
+  const selectedCoverage = coverages.find((c) => c.id === coverageId);
+  const availablePeriods = selectedCoverage?.allowable_periods || [];
+
   // maximum_coverage lives on the plain coverage record itself (not the
   // pricing-mode-specific data below), so it's sourced straight from the
   // already-loaded `coverages` list rather than another round trip.
@@ -97,12 +121,22 @@ export function ManageCoveragePricing() {
     setOriginalMaximumCoverage(mc);
   }, [coverageId, coverages]);
 
+  // A different coverage has its own (possibly entirely different) set of
+  // periods — default to its first one whenever the currently-selected
+  // period doesn't actually belong to it (a fresh coverage, or one whose
+  // periods changed under it).
   useEffect(() => {
-    if (!coverageId) return;
+    if (availablePeriods.some((p) => p.coverage_in_days === coveragePeriodDays)) return;
+    setCoveragePeriodDays(availablePeriods[0]?.coverage_in_days ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [coverageId, availablePeriods.map((p) => p.coverage_in_days).join(",")]);
+
+  useEffect(() => {
+    if (!coverageId || !coveragePeriodDays) return;
     setPricingLoading(true);
     setError("");
     setSaved(false);
-    getCoveragePricing(token, coverageId)
+    getCoveragePricing(token, coverageId, coveragePeriodDays)
       .then((data) => {
         setPricingMode(data.pricing_mode);
         setOriginalPricingMode(data.pricing_mode);
@@ -118,10 +152,51 @@ export function ManageCoveragePricing() {
       })
       .catch((err) => setError(err.message))
       .finally(() => setPricingLoading(false));
-  }, [coverageId, token]);
+  }, [coverageId, coveragePeriodDays, token]);
 
   function handleCoverageChange(newCoverageId) {
     setCoverageId(newCoverageId);
+  }
+
+  function openAddPeriodDialog(days) {
+    setAddPeriodDraft(days ? String(days) : "");
+    setAddPeriodError("");
+    setAddPeriodOpen(true);
+  }
+
+  async function handleCreatePeriod() {
+    const days = Number(addPeriodDraft);
+    if (!Number.isInteger(days) || days <= 0) {
+      setAddPeriodError("Enter a whole number of days greater than 0");
+      return;
+    }
+    if (availablePeriods.some((p) => p.coverage_in_days === days)) {
+      setAddPeriodError(`This coverage already has a ${days}-day period`);
+      return;
+    }
+    setAddPeriodSubmitting(true);
+    setAddPeriodError("");
+    try {
+      const period = await createAllowablePeriod(token, coverageId, days);
+      setCoverages((prev) =>
+        prev.map((c) =>
+          c.id === coverageId
+            ? {
+                ...c,
+                allowable_periods: [...c.allowable_periods, period].sort(
+                  (a, b) => a.coverage_in_days - b.coverage_in_days
+                ),
+              }
+            : c
+        )
+      );
+      setCoveragePeriodDays(period.coverage_in_days);
+      setAddPeriodOpen(false);
+    } catch (err) {
+      setAddPeriodError(err.message);
+    } finally {
+      setAddPeriodSubmitting(false);
+    }
   }
 
   const isDirty = useMemo(
@@ -194,7 +269,7 @@ export function ManageCoveragePricing() {
         if (new Set(minValues).size !== minValues.length) {
           throw new Error("Each tier needs a distinct minimum value");
         }
-        await updateValuePercentageTiers(token, coverageId, tiers);
+        await updateValuePercentageTiers(token, coverageId, coveragePeriodDays, tiers);
       }
       if (pricingMode === "FLAT_TIER") {
         const tiers = flatTiers.map((t) => ({ coverage_amount: Number(t.coverage_amount), coverage_price: Number(t.coverage_price) }));
@@ -202,7 +277,7 @@ export function ManageCoveragePricing() {
         if (new Set(amounts).size !== amounts.length) {
           throw new Error("Each tier needs a distinct insured value");
         }
-        await updateFlatTiers(token, coverageId, tiers);
+        await updateFlatTiers(token, coverageId, coveragePeriodDays, tiers);
       }
       const modeChanged = pricingMode !== originalPricingMode;
       const rateChanged = pricingMode === "PERCENTAGE" && standardRatePercent !== originalStandardRatePercent;
@@ -212,11 +287,12 @@ export function ManageCoveragePricing() {
         }
         await updateCoveragePricingMode(token, coverageId, {
           pricing_mode: pricingMode,
+          coverage_in_days: coveragePeriodDays,
           ...(pricingMode === "PERCENTAGE" ? { standard_rate: Number(standardRatePercent) / 100 } : {}),
         });
       }
 
-      const refreshed = await getCoveragePricing(token, coverageId);
+      const refreshed = await getCoveragePricing(token, coverageId, coveragePeriodDays);
       setPricingMode(refreshed.pricing_mode);
       setOriginalPricingMode(refreshed.pricing_mode);
       const ratePercent = refreshed.standard_rate !== null ? (Number(refreshed.standard_rate) * 100).toString() : "";
@@ -258,6 +334,46 @@ export function ManageCoveragePricing() {
       <Stack spacing={2}>
         <CoverageSelector coverages={coverages} value={coverageId} onChange={handleCoverageChange} />
 
+        <Autocomplete
+          disabled={!coverageId}
+          options={availablePeriods.map((p) => p.coverage_in_days)}
+          getOptionLabel={(option) => (typeof option === "number" ? formatPeriodLabel(option) : option.label)}
+          value={coveragePeriodDays || null}
+          onChange={(e, newValue) => {
+            if (newValue == null) return;
+            if (isAddNewOption(newValue)) {
+              openAddPeriodDialog(newValue.days);
+              return;
+            }
+            setCoveragePeriodDays(newValue);
+          }}
+          filterOptions={(options, params) => {
+            const input = params.inputValue.trim();
+            const filtered = options.filter((days) => formatPeriodLabel(days).toLowerCase().includes(input.toLowerCase()));
+            const typedDays = Number(input);
+            if (input && Number.isInteger(typedDays) && typedDays > 0 && !options.includes(typedDays)) {
+              filtered.push({ addNew: true, days: typedDays, label: `Add "${typedDays}"-day period…` });
+            }
+            return filtered;
+          }}
+          renderInput={(params) => (
+            <TextField
+              {...params}
+              label="Coverage period"
+              required
+              helperText="Pricing below applies only to this period — type a number of days not already listed to add a new one."
+            />
+          )}
+          fullWidth
+        />
+
+        {coverageId && availablePeriods.length === 0 && (
+          <Alert severity="info">
+            This coverage has no allowable period yet — type a number of days into the field above and choose
+            "Add" to create one before setting its pricing.
+          </Alert>
+        )}
+
         <NumberField
           label="Maximum coverage"
           value={maximumCoverage}
@@ -267,7 +383,7 @@ export function ManageCoveragePricing() {
           slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
         />
 
-        {pricingLoading ? (
+        {coveragePeriodDays && (pricingLoading ? (
           <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}>
             <CircularProgress size={28} />
           </Box>
@@ -301,11 +417,11 @@ export function ManageCoveragePricing() {
             {pricingMode === "PERCENTAGE" && (
               <Paper variant="outlined" sx={{ p: 2 }}>
                 <Typography variant="subtitle2" sx={{ mb: 1.5 }}>
-                  Standard rate
+                  Standard rate — {formatPeriodLabel(coveragePeriodDays)}
                 </Typography>
                 <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 2 }}>
-                  Used whenever an agent doesn't have a custom net rate for this coverage — the premium an agent
-                  charges can never come in under coverage amount × this rate.
+                  Used whenever an agent doesn't have a custom net rate for this coverage at this period — the
+                  premium an agent charges can never come in under coverage amount × this rate.
                 </Typography>
                 <NumberField
                   label="Standard rate"
@@ -320,7 +436,7 @@ export function ManageCoveragePricing() {
             {pricingMode === "VALUE_PERCENTAGE" && (
               <Paper variant="outlined" sx={{ p: 2 }}>
                 <Typography variant="subtitle2" sx={{ mb: 1.5 }}>
-                  Value tiers
+                  Value tiers — {formatPeriodLabel(coveragePeriodDays)}
                 </Typography>
                 <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 2 }}>
                   The tier with the highest minimum value that's still at or below the vehicle's current value is
@@ -358,7 +474,7 @@ export function ManageCoveragePricing() {
             {pricingMode === "FLAT_TIER" && (
               <Paper variant="outlined" sx={{ p: 2 }}>
                 <Typography variant="subtitle2" sx={{ mb: 1.5 }}>
-                  Insured value tiers
+                  Insured value tiers — {formatPeriodLabel(coveragePeriodDays)}
                 </Typography>
                 <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 2 }}>
                   The agent picks one of these insured values when applying this coverage, and the matching price is
@@ -409,8 +525,44 @@ export function ManageCoveragePricing() {
             {saved && !isDirty && <Alert severity="success">Saved.</Alert>}
             {error && <Alert severity="error">{error}</Alert>}
           </>
-        )}
+        ))}
       </Stack>
+
+      <Dialog open={addPeriodOpen} onClose={() => setAddPeriodOpen(false)} fullWidth maxWidth="xs">
+        <DialogTitle>Add Coverage Period</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <Stack spacing={0.5}>
+              <Typography variant="body2" color="text.secondary">
+                Insurance class: <strong>{selectedCoverage?.class_name}</strong>
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                Product variant: <strong>{selectedCoverage?.variant_name}</strong>
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                Coverage: <strong>{selectedCoverage?.coverage_name}</strong>
+              </Typography>
+            </Stack>
+            <NumberField
+              label="Number of days"
+              value={addPeriodDraft}
+              onChange={setAddPeriodDraft}
+              fullWidth
+              autoFocus
+              helperText="A brand-new period starts with no pricing configured — set its rate/tiers next."
+            />
+            {addPeriodError && <Alert severity="error">{addPeriodError}</Alert>}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setAddPeriodOpen(false)} disabled={addPeriodSubmitting}>
+            Cancel
+          </Button>
+          <Button variant="contained" onClick={handleCreatePeriod} disabled={addPeriodSubmitting}>
+            {addPeriodSubmitting ? "Adding..." : "Add period"}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Container>
   );
 }

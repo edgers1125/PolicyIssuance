@@ -15,29 +15,36 @@ const router = express.Router();
 
 const INVITE_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-// Each page has one hidden "page access" permission (is_page_access: true) that
-// isn't shown in the UI — granting any other permission belonging to that page
-// automatically grants page access too, so the grantee can actually reach the page.
+// Each top-level, dot-free permission code (e.g. "MANAGE_USERS") is a hidden
+// "page access" permission that isn't shown in the UI — granting any of its
+// sub-permissions ("MANAGE_USERS.ADD_USER") automatically grants the parent
+// too, so the grantee can actually reach the page it lives on.
 async function expandWithPageAccess(permissionIds) {
   if (!Array.isArray(permissionIds) || permissionIds.length === 0) {
     return permissionIds || [];
   }
 
-  const allPermissions = await prisma.permission.findMany({
-    select: { id: true, page_group: true, is_page_access: true },
+  const selected = await prisma.permission.findMany({
+    where: { id: { in: permissionIds } },
+    select: { permission_code: true },
   });
-  const byId = new Map(allPermissions.map((p) => [p.id, p]));
-  const pageAccessIdByGroup = new Map(
-    allPermissions.filter((p) => p.is_page_access).map((p) => [p.page_group, p.id])
-  );
+
+  const parentCodes = new Set();
+  for (const { permission_code } of selected) {
+    const dotIndex = permission_code.indexOf(".");
+    if (dotIndex !== -1) {
+      parentCodes.add(permission_code.slice(0, dotIndex));
+    }
+  }
 
   const result = new Set(permissionIds);
-  for (const id of permissionIds) {
-    const perm = byId.get(id);
-    if (!perm) continue;
-    const pageAccessId = pageAccessIdByGroup.get(perm.page_group);
-    if (pageAccessId) {
-      result.add(pageAccessId);
+  if (parentCodes.size > 0) {
+    const parents = await prisma.permission.findMany({
+      where: { permission_code: { in: Array.from(parentCodes) } },
+      select: { id: true },
+    });
+    for (const p of parents) {
+      result.add(p.id);
     }
   }
   return Array.from(result);
@@ -75,7 +82,7 @@ router.get("/", requirePermission("MANAGE_USERS"), async (req, res, next) => {
         user_permissions: {
           select: {
             permission: {
-              select: { id: true, permission_code: true, permission_name: true, is_page_access: true },
+              select: { id: true, permission_code: true, permission_name: true },
             },
           },
         },
@@ -100,10 +107,11 @@ router.get("/", requirePermission("MANAGE_USERS"), async (req, res, next) => {
         agent: u.agent,
         roles: u.user_roles.map((ur) => ({ id: ur.role.id, role_name: ur.role.role_name })),
         permissions: Array.from(rolePermissionsById.values()),
-        // Page access is implicit/hidden — only surface the real sub-permissions here.
+        // Page access is implicit/hidden — only surface the real sub-permissions
+        // here, i.e. codes with a dot ("PARENT.CHILD"), never a bare top-level code.
         specialPermissions: u.user_permissions
           .map((up) => up.permission)
-          .filter((p) => !p.is_page_access)
+          .filter((p) => p.permission_code.includes("."))
           .map(({ id, permission_code, permission_name }) => ({ id, permission_code, permission_name })),
       };
     });
@@ -140,57 +148,74 @@ router.get("/roles", async (req, res, next) => {
 
 router.get("/permissions", async (req, res, next) => {
   try {
-    const permissions = await prisma.permission.findMany({
-      // Page-access permissions are implicit (auto-granted whenever another
-      // permission on that page is granted) — never shown for manual selection.
-      where: { is_page_access: false },
-      orderBy: [{ page_group: "asc" }, { permission_name: "asc" }],
-      select: {
-        id: true,
-        permission_code: true,
-        permission_name: true,
-        page_group: true,
-        description: true,
-      },
+    const allPermissions = await prisma.permission.findMany({
+      select: { id: true, permission_code: true, permission_name: true, description: true },
     });
+    const nameByCode = new Map(allPermissions.map((p) => [p.permission_code, p.permission_name]));
+
+    const permissions = allPermissions
+      // Page-access permissions (no dot in the code) are implicit — auto-granted
+      // whenever a sub-permission under them is granted — never shown for manual
+      // selection.
+      .filter((p) => p.permission_code.includes("."))
+      .map((p) => {
+        const parentCode = p.permission_code.split(".")[0];
+        return {
+          id: p.id,
+          permission_code: p.permission_code,
+          permission_name: p.permission_name,
+          description: p.description,
+          // Human-friendly grouping for display, derived from the parent
+          // page's own name rather than a separately maintained value.
+          group_name: nameByCode.get(parentCode) || parentCode,
+        };
+      })
+      .sort((a, b) => a.group_name.localeCompare(b.group_name) || a.permission_name.localeCompare(b.permission_name));
+
     res.json(permissions);
   } catch (err) {
     next(err);
   }
 });
 
-router.post("/roles", requirePermission("CREATE_ROLE"), validateBody(createRoleSchema), async (req, res, next) => {
-  try {
-    const { role_name, description, permission_ids } = req.body;
+router.post(
+  "/roles",
+  requirePermission("MANAGE_SETTINGS.CREATE_ROLE"),
+  validateBody(createRoleSchema),
+  async (req, res, next) => {
+    try {
+      const { role_name, description, permission_ids } = req.body;
 
-    const existing = await prisma.role.findUnique({ where: { role_name } });
-    if (existing) {
-      return res.status(409).json({ error: "A role with this name already exists" });
+      const existing = await prisma.role.findUnique({ where: { role_name } });
+      if (existing) {
+        return res.status(409).json({ error: "A role with this name already exists" });
+      }
+
+      const expandedPermissionIds = await expandWithPageAccess(permission_ids);
+
+      const role = await prisma.role.create({
+        data: {
+          role_name,
+          description: description || null,
+          role_permissions:
+            expandedPermissionIds.length > 0
+              ? { create: expandedPermissionIds.map((permission_id) => ({ permission_id })) }
+              : undefined,
+        },
+        select: { id: true, role_name: true, description: true },
+      });
+
+      res.status(201).json(role);
+    } catch (err) {
+      next(err);
     }
-
-    const expandedPermissionIds = await expandWithPageAccess(permission_ids);
-
-    const role = await prisma.role.create({
-      data: {
-        role_name,
-        description: description || null,
-        role_permissions: expandedPermissionIds.length > 0
-          ? { create: expandedPermissionIds.map((permission_id) => ({ permission_id })) }
-          : undefined,
-      },
-      select: { id: true, role_name: true, description: true },
-    });
-
-    res.status(201).json(role);
-  } catch (err) {
-    next(err);
   }
-});
+);
 
 router.post("/", requirePermission("MANAGE_USERS"), validateBody(createUserSchema), async (req, res, next) => {
   try {
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
-    if (!ensurePermission(res, actingPermissions, "ADD_USER")) return;
+    if (!ensurePermission(res, actingPermissions, "MANAGE_USERS.ADD_USER")) return;
 
     const { email, first_name, last_name, role_id, permission_ids, make_agent, agent_code } = req.body;
 
@@ -288,9 +313,13 @@ router.patch("/:id", requirePermission("MANAGE_USERS"), validateBody(updateUserS
 
     const wantsDetailsChange =
       full_name !== undefined || email !== undefined || status !== undefined || reset_password || make_agent;
-    if (wantsDetailsChange && !ensurePermission(res, actingPermissions, "EDIT_USER_DETAILS")) return;
-    if (role_id !== undefined && !ensurePermission(res, actingPermissions, "EDIT_ROLE")) return;
-    if (permission_ids !== undefined && !ensurePermission(res, actingPermissions, "EDIT_SPECIAL_PERMISSIONS")) return;
+    if (wantsDetailsChange && !ensurePermission(res, actingPermissions, "MANAGE_USERS.EDIT_USER_DETAILS")) return;
+    if (role_id !== undefined && !ensurePermission(res, actingPermissions, "MANAGE_USERS.EDIT_ROLE")) return;
+    if (
+      permission_ids !== undefined &&
+      !ensurePermission(res, actingPermissions, "MANAGE_USERS.EDIT_SPECIAL_PERMISSIONS")
+    )
+      return;
 
     if (make_agent && targetUser.agent_id) {
       return res.status(409).json({ error: "This user is already an agent" });
@@ -378,7 +407,7 @@ router.patch("/:id", requirePermission("MANAGE_USERS"), validateBody(updateUserS
 
 router.put(
   "/roles/:id/permissions",
-  requirePermission("EDIT_ROLE_PERMISSIONS"),
+  requirePermission("MANAGE_SETTINGS.EDIT_ROLE_PERMISSIONS"),
   validateBody(updateRolePermissionsSchema),
   async (req, res, next) => {
     try {

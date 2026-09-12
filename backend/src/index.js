@@ -13,6 +13,7 @@ const addressesRouter = require("./routes/addresses");
 const catalogRouter = require("./routes/catalog");
 const coveragePricingRouter = require("./routes/coveragePricing");
 const policyApplicationsRouter = require("./routes/policyApplications");
+const policyQuotationsRouter = require("./routes/policyQuotations");
 const paymentMethodsRouter = require("./routes/paymentMethods");
 const { requireAuth } = require("./middleware/auth");
 const { getUserPermissionCodes } = require("./middleware/permissions");
@@ -32,6 +33,7 @@ app.use("/addresses", addressesRouter);
 app.use("/", catalogRouter);
 app.use("/", coveragePricingRouter);
 app.use("/policy-applications", policyApplicationsRouter);
+app.use("/policy-quotations", policyQuotationsRouter);
 app.use("/payment-methods", paymentMethodsRouter);
 
 app.get("/me", requireAuth, async (req, res, next) => {
