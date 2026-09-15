@@ -1,17 +1,24 @@
 const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { requirePermission } = require("../middleware/permissions");
-const { validateBody } = require("../middleware/validate");
+const { requirePermission, requireAnyPermission, INTAKE_PERMISSIONS } = require("../middleware/permissions");
+const { validateBody, validateParams } = require("../middleware/validate");
 const { getCurrentAgentId } = require("../lib/agent");
-const { companyInputSchema } = require("../schemas/companies");
+const { companyInputSchema, agentIdParamSchema } = require("../schemas/companies");
 
 const router = express.Router();
 
-router.use(requireAuth, requirePermission("CREATE_APPLICATION"));
+// requireAuth only at router level — the specific grant is required
+// per-route below, same as catalog.js/coveragePricing.js, rather than via
+// router.use(), because GET /agent/:agentId needs a different one entirely
+// (QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION) and a caller who only has that
+// one may well hold none of INTAKE_PERMISSIONS.
+router.use(requireAuth);
 
-// Companies connected to the logged-in agent only — not the whole company base.
-router.get("/", async (req, res, next) => {
+// Companies connected to the logged-in agent only — not the whole company
+// base. Feeds both PolicyApplication.jsx and QuotationCreator.jsx — see
+// INTAKE_PERMISSIONS (middleware/permissions.js).
+router.get("/", requireAnyPermission(INTAKE_PERMISSIONS), async (req, res, next) => {
   try {
     const agentId = await getCurrentAgentId(req.user.userId);
     if (!agentId) {
@@ -53,7 +60,7 @@ router.get("/", async (req, res, next) => {
   }
 });
 
-router.post("/", validateBody(companyInputSchema), async (req, res, next) => {
+router.post("/", requireAnyPermission(INTAKE_PERMISSIONS), validateBody(companyInputSchema), async (req, res, next) => {
   try {
     const agentId = await getCurrentAgentId(req.user.userId);
     if (!agentId) {
@@ -88,7 +95,7 @@ router.post("/", validateBody(companyInputSchema), async (req, res, next) => {
   }
 });
 
-router.patch("/:id", validateBody(companyInputSchema), async (req, res, next) => {
+router.patch("/:id", requireAnyPermission(INTAKE_PERMISSIONS), validateBody(companyInputSchema), async (req, res, next) => {
   try {
     const { id } = req.params;
     const agentId = await getCurrentAgentId(req.user.userId);
@@ -124,5 +131,50 @@ router.patch("/:id", validateBody(companyInputSchema), async (req, res, next) =>
     next(err);
   }
 });
+
+// Companies connected to a *chosen* agent, not the caller's own — the New
+// Quotation form's cross-agent company picker, shown only once
+// QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION is held (see routes/policyQuotations.js's
+// GET /agents, the matching agent picker). Same response shape as GET /
+// above, just scoped to :agentId instead of getCurrentAgentId(req.user.userId).
+router.get(
+  "/agent/:agentId",
+  requirePermission("QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION"),
+  validateParams(agentIdParamSchema),
+  async (req, res, next) => {
+    try {
+      const links = await prisma.companyAgent.findMany({
+        where: { agent_id: req.params.agentId },
+        select: {
+          company: {
+            select: {
+              id: true,
+              company_code: true,
+              company_name: true,
+              tin_no: true,
+              email: true,
+              status: true,
+              party_vehicles: { where: { ownership_end_date: null }, select: { vehicle: true } },
+              party_addresses: { select: { address: true } },
+            },
+          },
+        },
+        orderBy: { company: { company_name: "asc" } },
+      });
+
+      res.json(
+        links.map((l) => ({
+          ...l.company,
+          vehicles: l.company.party_vehicles.map((pv) => pv.vehicle),
+          addresses: l.company.party_addresses.map((pa) => pa.address),
+          party_vehicles: undefined,
+          party_addresses: undefined,
+        }))
+      );
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 module.exports = router;

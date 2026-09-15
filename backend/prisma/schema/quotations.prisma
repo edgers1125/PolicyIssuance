@@ -38,6 +38,10 @@ model PolicyQuotation {
   vehicles  PolicyQuotationVehicle[]
   addresses PolicyQuotationAddress[]
   coverages QuotationCoverage[]
+  // Set once an agent submits this quotation as a policy application (see
+  // PolicyApplication.source_quotation_id) — its presence is what blocks
+  // both re-submitting and further editing an already-converted quotation.
+  converted_application PolicyApplication?
 
   @@index([customer_id])
   @@index([company_id])

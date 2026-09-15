@@ -30,7 +30,7 @@ function belowBethelError(coverageName, payableToBethel) {
 //  - PERCENTAGE's agent-entered premium never comes in under payable_to_bethel
 // Throws HttpError for any of the above; never touches `res` itself so it
 // can be shared between routes with different response shapes.
-async function resolveCoverageRows({ coverages, className, vehicles, vehicleValues, agentId, startAt, endAt }) {
+async function resolveCoverageRows({ coverages, className, vehicles, vehicleValues, addressValue, agentId, startAt, endAt }) {
   const coverageIds = coverages.map((c) => c.coverage_id);
   const coverageDetails = await prisma.productCoverage.findMany({
     where: { id: { in: coverageIds } },
@@ -110,9 +110,17 @@ async function resolveCoverageRows({ coverages, className, vehicles, vehicleValu
         ? period.agent_value_percentage_tiers
         : period.value_percentage_tiers;
       for (const vehicleIndex of targetIndices) {
-        const targetValue = vehicleIndex !== null ? vehicleValues[vehicleIndex] : null;
+        // Motor prices off the targeted vehicle's own (depreciated) value;
+        // any other class (Property) has no vehicles at all, so it prices
+        // off the application/quotation's risk address value instead.
+        const targetValue = vehicleIndex !== null ? vehicleValues[vehicleIndex] : addressValue;
         if (targetValue === null || targetValue === undefined) {
-          throw new HttpError(400, `${coverage.coverage_name} is priced from the vehicle's estimated value, which hasn't been assessed yet`);
+          throw new HttpError(
+            400,
+            vehicleIndex !== null
+              ? `${coverage.coverage_name} is priced from the vehicle's estimated value, which hasn't been assessed yet`
+              : `${coverage.coverage_name} is priced from the risk address's estimated value, which hasn't been assessed yet`
+          );
         }
         const tier = findApplicableValueTier(valueTiers, targetValue);
         if (!tier) {

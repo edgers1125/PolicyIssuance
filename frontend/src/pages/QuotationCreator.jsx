@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import {
   Container,
   Typography,
@@ -29,6 +28,7 @@ import {
 import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
 import EditIcon from "@mui/icons-material/Edit";
+import CloseIcon from "@mui/icons-material/Close";
 import { useAuth } from "../context/AuthContext";
 import {
   getProductCatalog,
@@ -38,16 +38,20 @@ import {
   listMyCompanies,
   createCompany,
   updateCompany,
+  listCustomersByAgent,
+  listCompaniesByAgent,
+  listAgentsForQuotation,
   updateVehicle,
   lookupVehicleByPlate,
   updateAddress,
   createPolicyQuotation,
+  previewQuotationPdf,
 } from "../api/client";
 import { formatPHP, formatRate } from "../utils/currency";
 import { formatPeriodLabel } from "../utils/coveragePeriods";
 import { currentVehicleValue, findApplicableValueTier } from "../utils/vehicleValue";
 import { NumberField } from "../components/NumberField";
-import { PolicySchedulePreview } from "../components/PolicySchedulePreview";
+import { PdfViewer } from "../components/PdfViewer";
 
 const emptyCustomer = {
   first_name: "",
@@ -78,6 +82,7 @@ const emptyVehicle = {
   year_model: "",
   vehicle_type: "",
   color: "",
+  no_of_seats: "",
   estimated_value: "",
   // Set automatically the first time an estimated value is ever recorded —
   // never entered directly, and never sent back to the server.
@@ -98,6 +103,10 @@ const emptyAddress = {
   postal_code: "",
   country: "Philippines",
   existing_address_id: null,
+  // Only meaningful for a Property risk address — VALUE_PERCENTAGE coverage
+  // pricing prices off this the same way it prices off a vehicle's
+  // estimated_value for Motor. Unlike a vehicle, this never locks/depreciates.
+  estimated_value: "",
 };
 
 // Standard Philippine non-life insurance statutory rates, applied to total premium —
@@ -146,7 +155,7 @@ function addDaysToLocalDateTime(value, days) {
 // selection with no vehicle_indices applies to the whole policy — every
 // vehicle on the application; one with a specific (possibly multi-vehicle)
 // list applies to just those.
-function resolveCoverageSelection(cov, selection, vehicles) {
+function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
   if (!selection) return null;
 
   // Property has no vehicle concept at all — treat it as a single virtual
@@ -177,7 +186,10 @@ function resolveCoverageSelection(cov, selection, vehicles) {
     let payablePerVehicle;
 
     if (cov.pricing_mode === "VALUE_PERCENTAGE") {
-      const targetValue = vehicleCurrentValue(vehicles[idx]);
+      // Motor prices off the targeted vehicle's own (depreciated) value;
+      // Property has no vehicles at all, so it prices off the risk
+      // address's own estimated value instead.
+      const targetValue = idx !== null ? vehicleCurrentValue(vehicles[idx]) : Number(addressValue) || null;
       if (targetValue === null || targetValue === undefined) {
         return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
       }
@@ -236,7 +248,7 @@ function isCompanyComplete(c) {
 }
 
 function isVehicleComplete(v) {
-  return Boolean(v.plate_number && v.mv_file_no && v.engine_number && v.chassis_number);
+  return Boolean(v.plate_number && v.mv_file_no && v.engine_number && v.chassis_number && v.no_of_seats);
 }
 
 function isAddressComplete(a) {
@@ -576,6 +588,17 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly }
               />
             </Grid>
             <Grid size={{ xs: 12, sm: 6 }}>
+              <TextField
+                label="No. of seats"
+                type="number"
+                value={form.no_of_seats}
+                onChange={(e) => setForm({ ...form, no_of_seats: e.target.value })}
+                required
+                fullWidth
+                helperText="Drives the policy schedule's driver/occupants endorsement line"
+              />
+            </Grid>
+            <Grid size={{ xs: 12, sm: 6 }}>
               <NumberField
                 label="Estimated value"
                 value={form.estimated_value}
@@ -611,7 +634,7 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly }
   );
 }
 
-function AddressEditDialog({ open, onClose, address, token, onSaved }) {
+function AddressEditDialog({ open, onClose, address, token, onSaved, showEstimatedValue }) {
   const [form, setForm] = useState(emptyAddress);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
@@ -693,6 +716,18 @@ function AddressEditDialog({ open, onClose, address, token, onSaved }) {
                 fullWidth
               />
             </Grid>
+            {showEstimatedValue && (
+              <Grid size={{ xs: 12, sm: 6 }}>
+                <NumberField
+                  label="Estimated value"
+                  value={form.estimated_value}
+                  onChange={(v) => setForm({ ...form, estimated_value: v })}
+                  fullWidth
+                  helperText="Used to price VALUE_PERCENTAGE coverages for this property"
+                  slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                />
+              </Grid>
+            )}
           </Grid>
           {error && <Alert severity="error">{error}</Alert>}
         </Stack>
@@ -730,8 +765,20 @@ function PlateConflictDialog({ conflict, onCancel, onConfirm }) {
   );
 }
 
-export function QuotationCreator() {
-  const { token, agent } = useAuth();
+// onClose/onCreated are only passed when this is rendered inside the
+// Quotation Tracker's "New Quotation" dialog — omitted, it behaves exactly
+// as it does at the standalone /quotation-tracker/create route.
+export function QuotationCreator({ onClose, onCreated } = {}) {
+  const { token, agent, permissions } = useAuth();
+  // Lets this quotation be filed under an agent other than the caller's own
+  // — the party/vehicle/address lists below then come from that agent's own
+  // connections (listCustomersByAgent/listCompaniesByAgent) instead of the
+  // caller's (listMyCustomers/listMyCompanies), and the submit payload
+  // carries agent_id so the backend files it there instead of defaulting to
+  // the caller's own. 403s server-side without this permission regardless of
+  // what the client sends, so hiding the picker without it is purely a UX
+  // nicety, not the actual enforcement.
+  const canFileForOtherAgent = permissions?.includes("QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION");
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -741,6 +788,10 @@ export function QuotationCreator() {
   const [catalog, setCatalog] = useState([]);
   const [myCustomers, setMyCustomers] = useState([]);
   const [myCompanies, setMyCompanies] = useState([]);
+  const [agentsForPicker, setAgentsForPicker] = useState([]);
+  // null until resolved to the caller's own agent (agent context loads
+  // async) or explicitly changed via the picker below.
+  const [filingAgentId, setFilingAgentId] = useState(null);
 
   const [insuredType, setInsuredType] = useState("INDIVIDUAL");
   const [newCustomer, setNewCustomer] = useState(emptyCustomer);
@@ -769,12 +820,24 @@ export function QuotationCreator() {
   const [insuredAddress, setInsuredAddress] = useState(emptyAddress);
   const [remarks, setRemarks] = useState("");
   const [misc, setMisc] = useState("");
-  const [sendPolicyToEmail, setSendPolicyToEmail] = useState(false);
+  const [sendPolicyToEmail, setSendPolicyToEmail] = useState(true);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [confirmChecked, setConfirmChecked] = useState(false);
+  const [previewPdfUrl, setPreviewPdfUrl] = useState(null);
+  const [previewPdfLoading, setPreviewPdfLoading] = useState(false);
+  const [previewPdfError, setPreviewPdfError] = useState("");
 
-  function loadParties() {
-    return Promise.all([listMyCustomers(token).then(setMyCustomers), listMyCompanies(token).then(setMyCompanies)]);
+  // agentIdOverride defaults to filingAgentId (state may not have committed
+  // yet when called right after setFilingAgentId, e.g. from the picker's
+  // onChange) — "own agent" (null/undefined, or equal to agent.id) uses the
+  // caller-scoped routes, anything else uses the chosen agent's.
+  function loadParties(agentIdOverride) {
+    const targetAgentId = agentIdOverride !== undefined ? agentIdOverride : filingAgentId;
+    const isOwnAgent = !targetAgentId || targetAgentId === agent?.id;
+    return Promise.all([
+      (isOwnAgent ? listMyCustomers(token) : listCustomersByAgent(token, targetAgentId)).then(setMyCustomers),
+      (isOwnAgent ? listMyCompanies(token) : listCompaniesByAgent(token, targetAgentId)).then(setMyCompanies),
+    ]);
   }
 
   useEffect(() => {
@@ -784,6 +847,37 @@ export function QuotationCreator() {
       .finally(() => setLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
+
+  // filingAgentId defaults to the caller's own agent once it's loaded (the
+  // auth context resolves it asynchronously, so it isn't necessarily ready
+  // on this component's own first render) — never overwrites a value the
+  // picker below already set.
+  useEffect(() => {
+    if (agent?.id && filingAgentId === null) {
+      setFilingAgentId(agent.id);
+    }
+  }, [agent, filingAgentId]);
+
+  useEffect(() => {
+    if (!canFileForOtherAgent) return;
+    listAgentsForQuotation(token)
+      .then(setAgentsForPicker)
+      .catch(() => {});
+  }, [canFileForOtherAgent, token]);
+
+  // Switching the filing agent starts the party selection over — a
+  // reused customer/company/vehicle/address only makes sense for the agent
+  // it came from (the selectedPartyId effect below already resets
+  // vehicles/addresses once the party changes, which clearing it here
+  // triggers).
+  function handleFilingAgentChange(newAgentId) {
+    const resolved = newAgentId || agent?.id || null;
+    setFilingAgentId(resolved);
+    setInsuredType("INDIVIDUAL");
+    setNewCustomer(emptyCustomer);
+    setNewCompany(emptyCompany);
+    loadParties(resolved).catch((err) => setError(err.message));
+  }
 
   const selectedClass = catalog.find((c) => c.id === classId);
   const variants = selectedClass ? selectedClass.product_variants : [];
@@ -807,6 +901,10 @@ export function QuotationCreator() {
           value_percentage_tiers: period.value_percentage_tiers,
           tier_based_prices: period.tier_based_prices,
           has_custom_tiers: period.has_custom_tiers,
+          // Whether this coverage actually has a rate/tier configured for
+          // this specific period yet — an allowable period can exist before
+          // anyone's set a price for it under Settings → Coverage Pricing.
+          has_pricing: period.has_pricing,
         }
       : cov;
   });
@@ -823,6 +921,14 @@ export function QuotationCreator() {
     return Boolean(days) && (cov.allowable_periods || []).some((p) => p.coverage_in_days === days);
   }
 
+  // False only once the coverage is actually flattened onto the chosen
+  // period (has_pricing undefined beforehand, e.g. no period chosen yet) —
+  // callers already gate on coverageAllowsPeriod first, so this only needs
+  // to catch the "period exists but nobody's priced it yet" case.
+  function coverageIsPriced(cov) {
+    return cov.has_pricing !== false;
+  }
+
   // coverage_end_at is never entered directly — it's always coverage_start_at
   // plus the chosen period, computed the same way the server re-derives it.
   const coverageEndAt = coverageStartAt && coveragePeriodDays
@@ -837,6 +943,9 @@ export function QuotationCreator() {
   // applies to the whole policy — Property has no vehicles at all, so it
   // always resolves as a single virtual target instead.
   const coverageVehicles = isMotor ? vehicles : [];
+  // Property's VALUE_PERCENTAGE stand-in for a vehicle's own value — see
+  // resolveCoverageSelection.
+  const riskAddressValue = isProperty ? Number(riskAddress.estimated_value) || null : null;
 
   // Total premium is the sum of every selected coverage's resolved premium —
   // the statutory charges below are derived from it, mirroring what the
@@ -844,7 +953,7 @@ export function QuotationCreator() {
   const totalPremium = Object.entries(coverageSelections).reduce((sum, [coverageId, selection]) => {
     const cov = coverages.find((c) => c.id === coverageId);
     if (!cov) return sum;
-    const resolved = resolveCoverageSelection(cov, selection, coverageVehicles);
+    const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue);
     return sum + (resolved?.premium_amount || 0);
   }, 0);
   const docStamps = totalPremium * DOC_STAMPS_RATE;
@@ -942,6 +1051,12 @@ export function QuotationCreator() {
       const next = { ...prev };
       if (next[coverageId]) {
         delete next[coverageId];
+      } else if (!coverageIsPriced(cov)) {
+        // Nothing to price it with yet (no rate/tiers configured under
+        // Settings → Coverage Pricing for this period) — never let it be
+        // selected in the first place rather than letting the agent fill
+        // out the whole form and find out only when the server rejects it.
+        return prev;
       } else {
         // vehicle_indices null = applies to the whole policy (every vehicle),
         // the default — an agent narrows it to specific vehicles only for a
@@ -1022,6 +1137,7 @@ export function QuotationCreator() {
                 year_model: found.year_model || "",
                 vehicle_type: found.vehicle_type || "",
                 color: found.color || "",
+                no_of_seats: found.no_of_seats ?? "",
                 estimated_value: found.estimated_value ?? "",
                 initial_assessment_date: found.initial_assessment_date || null,
                 existing_vehicle_id: found.id,
@@ -1051,6 +1167,7 @@ export function QuotationCreator() {
               year_model: vehicle.year_model || "",
               vehicle_type: vehicle.vehicle_type || "",
               color: vehicle.color || "",
+              no_of_seats: vehicle.no_of_seats ?? "",
               estimated_value: vehicle.estimated_value ?? "",
               initial_assessment_date: vehicle.initial_assessment_date || null,
               existing_vehicle_id: vehicle.id,
@@ -1103,13 +1220,15 @@ export function QuotationCreator() {
         setError(`Select which vehicle(s) ${cov.coverage_name} applies to, or apply it to the whole policy.`);
         return;
       }
-      const resolved = resolveCoverageSelection(cov, selection, coverageVehicles);
+      const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue);
       if (resolved.pending) {
         setError(
           cov.pricing_mode === "VALUE_PERCENTAGE"
             ? resolved.noTier
-              ? `No pricing tier is configured for ${cov.coverage_name} at this vehicle's current value.`
-              : `${cov.coverage_name} needs its vehicle's estimated value assessed before it can be priced.`
+              ? `No pricing tier is configured for ${cov.coverage_name} at this ${isProperty ? "address's" : "vehicle's"} current value.`
+              : isProperty
+                ? `${cov.coverage_name} needs the risk address's estimated value entered before it can be priced.`
+                : `${cov.coverage_name} needs its vehicle's estimated value assessed before it can be priced.`
             : cov.pricing_mode === "FLAT_TIER"
               ? `Select an insured value for ${cov.coverage_name}.`
               : `Fill out the coverage amount for ${cov.coverage_name}.`
@@ -1175,22 +1294,35 @@ export function QuotationCreator() {
         // vehicle's value). coverage_amount for FLAT_TIER is the tier key the
         // agent picked, also unmultiplied, so the server can look it up
         // among the coverage's actual tiers.
-        coverages: coverageEntries.map(([coverage_id, v]) => ({
-          coverage_id,
-          coverage_amount: Number(v.coverage_amount) || 0,
-          premium_amount: Number(v.premium_amount) || 0,
-          vehicle_indices: v.vehicle_indices ?? null,
-        })),
+        coverages: coverageEntries.map(([coverage_id, v]) => {
+          const cov = coverages.find((c) => c.id === coverage_id);
+          return {
+            coverage_id,
+            // VALUE_PERCENTAGE never collects a coverage_amount from the agent
+            // (the server computes its own from the vehicle/address value) —
+            // coverage_amount is only required by the schema to reject an
+            // unfilled-in PERCENTAGE/FLAT_TIER selection, so send a harmless
+            // positive placeholder here instead of the unset 0.
+            coverage_amount: cov?.pricing_mode === "VALUE_PERCENTAGE" ? 1 : Number(v.coverage_amount) || 0,
+            premium_amount: Number(v.premium_amount) || 0,
+            vehicle_indices: v.vehicle_indices ?? null,
+          };
+        }),
         vehicles: isMotor ? vehicles : undefined,
         risk_address: isProperty ? riskAddress : undefined,
         insured_address: insuredAddress,
         remarks: remarks || undefined,
         misc: miscAmount,
         send_policy_to_email: sendPolicyToEmail,
+        // Omitted (undefined) files under the caller's own agent, same as
+        // before this field existed — only sent when the picker above
+        // actually chose someone else's.
+        agent_id: canFileForOtherAgent && filingAgentId && filingAgentId !== agent?.id ? filingAgentId : undefined,
       };
 
       const quotation = await createPolicyQuotation(token, payload);
       setSuccess(quotation);
+      onCreated?.(quotation);
 
       // Reset for the next application, but keep the just-used party available
       // (locked, as if it were an existing match) in case another one follows.
@@ -1211,7 +1343,7 @@ export function QuotationCreator() {
       setInsuredAddress(emptyAddress);
       setRemarks("");
       setMisc("");
-      setSendPolicyToEmail(false);
+      setSendPolicyToEmail(true);
       setPreviewOpen(false);
       setConfirmChecked(false);
       await loadParties();
@@ -1222,13 +1354,18 @@ export function QuotationCreator() {
     }
   }
 
-  if (loading) {
-    return (
-      <Container maxWidth="sm" sx={{ py: 6, display: "flex", justifyContent: "center" }}>
-        <CircularProgress />
-      </Container>
-    );
-  }
+  const header = (
+    <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", mb: 3 }}>
+      <Typography variant="h5" sx={{ fontWeight: 700 }}>
+        Quotation Creator
+      </Typography>
+      {onClose && (
+        <IconButton onClick={onClose} aria-label="Close">
+          <CloseIcon />
+        </IconButton>
+      )}
+    </Box>
+  );
 
   // Shared between the on-screen preview (inside the dialog) and the hidden
   // print-only copy — kept as plain data so the two never drift apart.
@@ -1251,7 +1388,7 @@ export function QuotationCreator() {
     vehicles: isMotor ? vehicles : [],
     coverages: Object.entries(coverageSelections).map(([id, sel]) => {
       const cov = coverages.find((c) => c.id === id);
-      const resolved = cov ? resolveCoverageSelection(cov, sel, coverageVehicles) : null;
+      const resolved = cov ? resolveCoverageSelection(cov, sel, coverageVehicles, riskAddressValue) : null;
       // Only worth spelling out which vehicle(s) a coverage applies to when
       // there's more than one on the application — otherwise it's implicit.
       const scopedToAll = sel.vehicle_indices === null || sel.vehicle_indices === undefined;
@@ -1268,8 +1405,11 @@ export function QuotationCreator() {
         clause: cov?.clause || "",
         amount: resolved?.coverage_amount || 0,
         premium: resolved?.premium_amount || 0,
+        pricing_mode: cov?.pricing_mode,
       };
     }),
+    deductibleRate: selectedVariant?.deductible_rate,
+    authorizedRepairLimitRate: selectedVariant?.authorized_repair_limit_rate,
     totalPremium,
     docStamps,
     vat,
@@ -1279,11 +1419,54 @@ export function QuotationCreator() {
     remarks,
   };
 
+  // Fetches the actual PDFKit-rendered document the moment the preview
+  // dialog opens, so the dialog shows the real exported file (not a
+  // separate HTML mockup) and "Print / Save as PDF" just reuses it — no
+  // second request. previewProps is deliberately not a dependency here:
+  // while the dialog is open the form behind it is inert, so it can't
+  // change anyway, and re-running this on every keystroke before it opens
+  // would just be wasted requests.
+  useEffect(() => {
+    if (!previewOpen) return;
+    let cancelled = false;
+    let objectUrl = null;
+    setPreviewPdfLoading(true);
+    setPreviewPdfError("");
+    previewQuotationPdf(token, previewProps)
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setPreviewPdfUrl(objectUrl);
+      })
+      .catch((err) => {
+        if (!cancelled) setPreviewPdfError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setPreviewPdfLoading(false);
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      setPreviewPdfUrl(null);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewOpen]);
+
+  // Every hook above must run on every render regardless of loading state —
+  // this early return has to come after all of them, or the hook count
+  // changes between the loading and loaded renders and React throws
+  // ("Rendered more hooks than during the previous render").
+  if (loading) {
+    return (
+      <Container maxWidth="sm" sx={{ py: 6, display: "flex", justifyContent: "center" }}>
+        <CircularProgress />
+      </Container>
+    );
+  }
+
   return (
-    <Container maxWidth="sm" sx={{ py: { xs: 3, sm: 6 } }}>
-      <Typography variant="h5" sx={{ mb: 3, fontWeight: 700 }}>
-        Quotation Creator
-      </Typography>
+    <Container maxWidth="sm" sx={{ py: onClose ? 0 : { xs: 3, sm: 6 } }}>
+      {header}
 
       {success && (
         <Alert severity="success" sx={{ mb: 2 }}>
@@ -1298,6 +1481,26 @@ export function QuotationCreator() {
 
       <Box component="form" onSubmit={handlePreview}>
         <Stack spacing={3}>
+          {/* Filing agent — ADMIN_CREATE_QUOTATION only */}
+          {canFileForOtherAgent && (
+            <Paper sx={{ p: { xs: 2, sm: 3 }, borderRadius: 3 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight: 600, mb: 2 }}>
+                Filing Agent
+              </Typography>
+              <Autocomplete
+                options={agentsForPicker}
+                getOptionLabel={(o) => (o.agent_name ? `${o.agent_name} (${o.agent_code})` : "")}
+                isOptionEqualToValue={(o, v) => o.id === v.id}
+                value={agentsForPicker.find((a) => a.id === filingAgentId) || null}
+                onChange={(e, value) => handleFilingAgentChange(value?.id || null)}
+                renderInput={(params) => <TextField {...params} label="File this quotation under" fullWidth />}
+              />
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: "block" }}>
+                Defaults to your own agent profile — pick a different one to file this quotation for another agent.
+              </Typography>
+            </Paper>
+          )}
+
           {/* Insured party */}
           <Paper sx={{ p: { xs: 2, sm: 3 }, borderRadius: 3 }}>
             <Typography variant="subtitle1" sx={{ fontWeight: 600, mb: 2 }}>
@@ -1876,6 +2079,7 @@ export function QuotationCreator() {
                                         year_model: value.year_model || "",
                                         vehicle_type: value.vehicle_type || "",
                                         color: value.color || "",
+                                        no_of_seats: value.no_of_seats ?? "",
                                         estimated_value: value.estimated_value ?? "",
                                         initial_assessment_date: value.initial_assessment_date || null,
                                         existing_vehicle_id: value.id,
@@ -1985,6 +2189,17 @@ export function QuotationCreator() {
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
+                        <TextField
+                          label="No. of seats"
+                          type="number"
+                          value={v.no_of_seats}
+                          onChange={(e) => updateVehicleField(index, "no_of_seats", e.target.value)}
+                          required
+                          fullWidth
+                          disabled={Boolean(v.existing_vehicle_id)}
+                        />
+                      </Grid>
+                      <Grid size={{ xs: 12, sm: 6 }}>
                         <NumberField
                           label="Estimated value"
                           value={v.estimated_value}
@@ -2084,6 +2299,7 @@ export function QuotationCreator() {
                           province: value.province || "",
                           postal_code: value.postal_code || "",
                           country: value.country || "Philippines",
+                          estimated_value: value.estimated_value ?? "",
                           existing_address_id: value.id,
                         });
                       }
@@ -2153,6 +2369,23 @@ export function QuotationCreator() {
                     onChange={(e) => setRiskAddress({ ...riskAddress, postal_code: e.target.value })}
                     fullWidth
                     disabled={Boolean(riskAddress.existing_address_id)}
+                  />
+                </Grid>
+                <Grid size={{ xs: 12, sm: 6 }}>
+                  <NumberField
+                    label="Estimated value"
+                    value={riskAddress.estimated_value}
+                    onChange={(value) => setRiskAddress({ ...riskAddress, estimated_value: value })}
+                    fullWidth
+                    // Already on file? The value has to be entered/updated via
+                    // "Edit Details" like the rest of a reused address's fields.
+                    disabled={Boolean(riskAddress.existing_address_id)}
+                    helperText={
+                      riskAddress.existing_address_id
+                        ? "Already on file — use Edit Details to change it"
+                        : "Used to price VALUE_PERCENTAGE coverages for this property"
+                    }
+                    slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
                   />
                 </Grid>
               </Grid>
@@ -2247,8 +2480,9 @@ export function QuotationCreator() {
                   <Stack spacing={1.5} divider={<Divider />}>
                     {coverages.map((cov) => {
                       const selection = coverageSelections[cov.id];
-                      const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles) : null;
+                      const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue) : null;
                       const periodAllowed = coverageAllowsPeriod(cov, coveragePeriodDays);
+                      const isPriced = !periodAllowed || coverageIsPriced(cov);
                       return (
                         <Box key={cov.id}>
                           <FormControlLabel
@@ -2256,7 +2490,7 @@ export function QuotationCreator() {
                               <Checkbox
                                 checked={Boolean(selection)}
                                 onChange={() => toggleCoverage(cov.id)}
-                                disabled={!periodAllowed}
+                                disabled={!periodAllowed || !isPriced}
                               />
                             }
                             label={
@@ -2265,7 +2499,9 @@ export function QuotationCreator() {
                                 : cov.coverage_name) +
                               (!periodAllowed && coveragePeriodDays
                                 ? ` — not offered for the ${formatPeriodLabel(coveragePeriodDays).toLowerCase()} period`
-                                : "")
+                                : periodAllowed && !isPriced
+                                  ? " — pricing not yet configured for this period"
+                                  : "")
                             }
                           />
                           {selection && isMotor && vehicles.length > 1 && (
@@ -2580,6 +2816,7 @@ export function QuotationCreator() {
                     year_model: updated.year_model || "",
                     vehicle_type: updated.vehicle_type || "",
                     color: updated.color || "",
+                    no_of_seats: updated.no_of_seats ?? "",
                     estimated_value: updated.estimated_value ?? "",
                     initial_assessment_date: updated.initial_assessment_date || null,
                     existing_vehicle_id: updated.id,
@@ -2614,6 +2851,7 @@ export function QuotationCreator() {
         onClose={() => setEditingAddressField(null)}
         address={editingAddressField === "risk" ? riskAddress : editingAddressField === "insured" ? insuredAddress : null}
         token={token}
+        showEstimatedValue={editingAddressField === "risk"}
         onSaved={(updated) => {
           const updatedFields = {
             address_line_1: updated.address_line_1,
@@ -2623,6 +2861,7 @@ export function QuotationCreator() {
             province: updated.province,
             postal_code: updated.postal_code || "",
             country: updated.country || "Philippines",
+            estimated_value: updated.estimated_value ?? "",
             existing_address_id: updated.id,
           };
           if (editingAddressField === "risk") {
@@ -2637,9 +2876,9 @@ export function QuotationCreator() {
 
       <Dialog open={previewOpen} onClose={() => setPreviewOpen(false)} fullWidth maxWidth="md">
         <DialogTitle>Quotation Preview</DialogTitle>
-        <DialogContent sx={{ bgcolor: "#e9e9e9" }}>
-          <Box sx={{ my: 2, display: "flex", justifyContent: "center" }}>
-            <PolicySchedulePreview {...previewProps} />
+        <DialogContent>
+          <Box sx={{ my: 1 }}>
+            <PdfViewer url={previewPdfUrl} loading={previewPdfLoading} error={previewPdfError} />
           </Box>
 
           <FormControlLabel
@@ -2660,7 +2899,7 @@ export function QuotationCreator() {
           <Button onClick={() => setPreviewOpen(false)} disabled={submitting}>
             Back to edit
           </Button>
-          <Button variant="outlined" onClick={() => window.print()}>
+          <Button variant="outlined" onClick={() => window.open(previewPdfUrl, "_blank")} disabled={!previewPdfUrl}>
             Print / Save as PDF
           </Button>
           <Button
@@ -2672,11 +2911,6 @@ export function QuotationCreator() {
           </Button>
         </DialogActions>
       </Dialog>
-
-      {/* Printed independently of the dialog — printing the dialog directly
-          drags in its own chrome/scroll container and produces blank pages. */}
-      {previewOpen &&
-        createPortal(<PolicySchedulePreview {...previewProps} />, document.getElementById("print-root"))}
     </Container>
   );
 }

@@ -9,10 +9,12 @@ import { RoleDefaultPermissions } from "./pages/RoleDefaultPermissions";
 import { CreateRole } from "./pages/CreateRole";
 import { EditClauses } from "./pages/EditClauses";
 import { ManageCoveragePricing } from "./pages/ManageCoveragePricing";
+import { ManageVehicleRates } from "./pages/ManageVehicleRates";
 import { AuthorizedPaymentMethods } from "./pages/AuthorizedPaymentMethods";
-import { PolicyApplication } from "./pages/PolicyApplication";
+import { PolicyApplications } from "./pages/PolicyApplications";
 import { Quotations } from "./pages/Quotations";
-import { QuotationCreator } from "./pages/QuotationCreator";
+import { PolicyApproval } from "./pages/PolicyApproval";
+import { ClientPolicies } from "./pages/ClientPolicies";
 import { MyAgents } from "./pages/MyAgents";
 import { AppLayout } from "./layouts/AppLayout";
 import { ProtectedRoute } from "./components/ProtectedRoute";
@@ -38,23 +40,15 @@ function App() {
           path="/policy-application"
           element={
             <RequirePermission permission="CREATE_APPLICATION">
-              <PolicyApplication />
+              <PolicyApplications />
             </RequirePermission>
           }
         />
         <Route
           path="/quotation-tracker"
           element={
-            <RequirePermission permission="CREATE_APPLICATION">
+            <RequirePermission permission="QUOTATION_TRACKER">
               <Quotations />
-            </RequirePermission>
-          }
-        />
-        <Route
-          path="/quotation-tracker/create"
-          element={
-            <RequirePermission permission="CREATE_APPLICATION">
-              <QuotationCreator />
             </RequirePermission>
           }
         />
@@ -62,7 +56,7 @@ function App() {
           path="/my-policies"
           element={
             <RequirePermission permission="VIEW_POLICIES">
-              <PlaceholderPage title="My Policies" />
+              <ClientPolicies />
             </RequirePermission>
           }
         />
@@ -78,7 +72,7 @@ function App() {
           path="/policy-approval"
           element={
             <RequirePermission permission="APPROVE_APPLICATION">
-              <PlaceholderPage title="Policy Approval" />
+              <PolicyApproval />
             </RequirePermission>
           }
         />
@@ -143,6 +137,14 @@ function App() {
           element={
             <RequirePermission permission="MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING">
               <ManageCoveragePricing />
+            </RequirePermission>
+          }
+        />
+        <Route
+          path="/settings/vehicle-rates"
+          element={
+            <RequirePermission permission="MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING">
+              <ManageVehicleRates />
             </RequirePermission>
           }
         />

@@ -23,7 +23,17 @@ model PolicyApplication {
   vat                      Decimal           @db.Decimal(18, 2)
   lgt                      Decimal           @db.Decimal(18, 2)
   misc                     Decimal           @db.Decimal(18, 2)
+  // Emailed the moment this application is filed/submitted (create or
+  // quotation-submit) — "your application is now under approval, please
+  // settle payment" plus the application PDF. Separate from the flag below,
+  // which governs a second, different email sent later at approval time.
   send_policy_to_email     Boolean           @default(false)
+  // Emailed only once POST /policy-approval/:id/approve actually approves
+  // this application — the "your policy has been approved" notice plus the
+  // issued Policy's own PDF (isPreview: false). Independent of
+  // send_policy_to_email above: an agent can ask for either, both, or
+  // neither.
+  send_policy_to_email_on_approval Boolean   @default(false)
   payment_method           PaymentMethod
   payment_remittance       PaymentRemittance
   // Only set when payment_remittance is DIRECT_TO_BETHEL — which of Bethel's
@@ -31,6 +41,24 @@ model PolicyApplication {
   bethel_payment_method_id String?           @db.Uuid
   remarks                  String?
   document_folder_name     String?           @db.VarChar(255)
+  // Set only when this application was created by submitting a quotation
+  // (rather than filed fresh) — @unique so a given quotation can only ever
+  // convert into one application, letting the submit route and the
+  // quotation edit route both cheaply check "has this already been
+  // submitted?" via PolicyQuotation.converted_application.
+  source_quotation_id      String?           @unique @db.Uuid
+  // Server-derived at POST /, never client-set directly — see
+  // ApplicationPolicyType's own comment. Defaults NEW_POLICY at the DB level
+  // only so the migration adding it didn't fail on rows already on file;
+  // every create path always ends up with an explicit value one way or
+  // another (either by omission here, for NEW_POLICY, or set to RENEWAL
+  // alongside renewed_policy_id below).
+  policy_type              ApplicationPolicyType @default(NEW_POLICY)
+  // Only set when policy_type is RENEWAL — which already-issued Policy this
+  // application renews (the Client Policies page's "Renew This Policy"
+  // action). coverage_start_at is validated at POST / to never be earlier
+  // than this policy's own expiry_date.
+  renewed_policy_id        String?           @db.Uuid
   created_at               DateTime          @default(now())
   updated_at               DateTime          @updatedAt
 
@@ -39,11 +67,14 @@ model PolicyApplication {
   agent                 Agent                    @relation(fields: [agent_id], references: [id])
   product_variant       ProductVariant           @relation(fields: [product_variant_id], references: [id])
   bethel_payment_method AuthorizedPaymentMethod? @relation(fields: [bethel_payment_method_id], references: [id])
+  source_quotation      PolicyQuotation?         @relation(fields: [source_quotation_id], references: [id])
+  renewed_policy         Policy?                 @relation("PolicyRenewals", fields: [renewed_policy_id], references: [id])
 
   vehicles         PolicyApplicationVehicle[]
   addresses        PolicyApplicationAddress[]
   coverages        ApplicationCoverage[]
   approval_history ApprovalHistory[]
+  changes          PolicyApplicationChange[]
   policy           Policy?
 
   @@index([status])
@@ -62,6 +93,7 @@ model PolicyApplicationVehicle {
   vehicle            Vehicle           @relation(fields: [vehicle_id], references: [id])
 
   application_coverages ApplicationCoverage[]
+  changes                PolicyApplicationChange[]
 
   @@index([policy_application_id])
 }
@@ -109,6 +141,45 @@ model ApplicationCoverage {
   coverage                   ProductCoverage           @relation(fields: [coverage_id], references: [id])
   policy_application_vehicle PolicyApplicationVehicle? @relation(fields: [policy_application_vehicle_id], references: [id])
 
+  changes PolicyApplicationChange[]
+
   @@index([application_id])
   @@index([policy_application_vehicle_id])
+}
+
+// An approver's audit trail of corrections against one PolicyApplication,
+// recorded after submission without ever touching the application row itself
+// (see routes/policyApproval.js's POST /:id/changes) — the application stays
+// exactly as filed, and this table is what the corrected PDF re-export (and,
+// on approval, the issued Policy) reads from on top of it.
+//
+// change_from/change_to are always computed server-side, never trusted from
+// the client — for VEHICLE_* and INSURED_ADDRESS_DETAILS, change_to is also
+// written straight onto the underlying Vehicle/Address row (application_vehicle_id
+// says which of the application's vehicles, since a Motor application can carry
+// more than one) so the correction is already there the next time that same
+// vehicle/address is selected on a future application. AddClause/RemoveClause
+// instead amend a *copy* of the coverage's clause text scoped to this one
+// application (application_coverage_id) — the shared ProductCoverage.clause
+// catalog entry is never touched, since that would silently reword every other
+// application/quotation using that coverage too.
+model PolicyApplicationChange {
+  id                       String                @id @default(uuid()) @db.Uuid
+  policy_application_id    String                @db.Uuid
+  application_vehicle_id   String?               @db.Uuid
+  application_coverage_id  String?               @db.Uuid
+  change_type              ApplicationChangeType
+  change_from              String?               @db.Text
+  change_to                String?               @db.Text
+  effective_date           DateTime?             @db.Date
+  remarks                  String?               @db.Text
+  created_by_user_id       String                @db.Uuid
+  created_at               DateTime              @default(now())
+
+  policy_application   PolicyApplication         @relation(fields: [policy_application_id], references: [id])
+  application_vehicle  PolicyApplicationVehicle? @relation(fields: [application_vehicle_id], references: [id])
+  application_coverage ApplicationCoverage?      @relation(fields: [application_coverage_id], references: [id])
+  created_by           User                      @relation(fields: [created_by_user_id], references: [id])
+
+  @@index([policy_application_id])
 }

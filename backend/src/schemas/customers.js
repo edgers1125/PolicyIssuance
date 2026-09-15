@@ -18,4 +18,10 @@ const customerInputSchema = z.object({
   mobile_number: z.string().optional(),
 });
 
-module.exports = { customerInputSchema };
+// GET /customers/agent/:agentId — QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION's
+// cross-agent customer picker.
+const agentIdParamSchema = z.object({
+  agentId: z.string().uuid("agentId must be a valid UUID"),
+});
+
+module.exports = { customerInputSchema, agentIdParamSchema };

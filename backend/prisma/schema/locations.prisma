@@ -12,6 +12,13 @@ model Address {
   google_place_id   String?     @db.VarChar(255)
   formatted_address String?
   address_type      AddressType
+  // Only meaningful for a RISK_LOCATION address on a Property policy —
+  // VALUE_PERCENTAGE coverage pricing for Property prices off this the same
+  // way it prices off a Vehicle's estimated_value for Motor. Unlike Vehicle,
+  // there's no depreciation/freeze rule here — a property's assessed value
+  // doesn't automatically decay the way a vehicle's does, so this can be
+  // revised directly at any time via PATCH /addresses/:id.
+  estimated_value   Decimal?    @db.Decimal(18, 2)
   created_at        DateTime    @default(now())
   updated_at        DateTime    @updatedAt
 
@@ -51,6 +58,12 @@ model Vehicle {
   year_model              Int?
   vehicle_type            String?   @db.VarChar(50)
   color                   String?   @db.VarChar(50)
+  // Required going forward (see schemas/policyIntakeShared.js's
+  // vehicleInputSchema) — feeds the policy schedule's "1 DRIVER AND N
+  // OCCUPANTS OR PASSENGERS" endorsement line (N = no_of_seats - 1). Defaults
+  // existing rows to 5 so the migration adding this column doesn't fail on
+  // vehicles already on file; every new/edited vehicle must supply a real value.
+  no_of_seats             Int       @default(5)
   estimated_value         Decimal?  @db.Decimal(18, 2)
   // Stamped automatically the first time an estimated_value is ever set on
   // this vehicle — never edited directly, and never moved once set, even if

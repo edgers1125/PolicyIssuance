@@ -9,6 +9,9 @@ const updateAddressSchema = z.object({
   province: requiredString("province"),
   postal_code: z.string().optional(),
   country: z.string().optional(),
+  // Only meaningful for a risk address on a Property policy — see
+  // Address.estimated_value. The UI sends "" for a blank value field.
+  estimated_value: z.preprocess((v) => (v === "" ? undefined : v), z.coerce.number().nonnegative().optional()),
 });
 
 module.exports = { updateAddressSchema };

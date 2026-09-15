@@ -94,3 +94,38 @@ enum CoveragePricingMode {
   VALUE_PERCENTAGE
   FLAT_TIER
 }
+
+// Whether a filed PolicyApplication is a brand-new policy or a renewal of an
+// already-issued one — always server-derived (POST /policy-applications),
+// never trusted from the client: RENEWAL only when renewed_policy_id was
+// actually sent (the "Renew This Policy" flow from the Client Policies
+// page), NEW_POLICY for every other entry point — a fresh filing, or a
+// quotation submitted via POST /policy-quotations/:id/submit (which never
+// sets renewed_policy_id at all).
+enum ApplicationPolicyType {
+  NEW_POLICY
+  RENEWAL
+}
+
+// What an approver can record against a PolicyApplication after it's been
+// submitted, without ever mutating the application row itself — see
+// PolicyApplicationChange. VEHICLE_* and INSURED_ADDRESS_DETAILS each also
+// drive a permanent write to the underlying Vehicle/Address row (so the
+// correction sticks for future selections); the rest are logged only, folded
+// back in wherever this application's own PDF is re-rendered and, on
+// approval, into the issued Policy.
+enum ApplicationChangeType {
+  INSURED_FROM_DATE
+  INSURED_NAME_DETAILS
+  INSURED_ADDRESS_DETAILS
+  VEHICLE_MODEL
+  VEHICLE_MV_FILE
+  VEHICLE_PLATE_NO
+  VEHICLE_TYPE
+  VEHICLE_MAKE
+  VEHICLE_COLOR
+  VEHICLE_ENGINE_NO
+  VEHICLE_CHASSIS_NO
+  ADD_CLAUSE
+  REMOVE_CLAUSE
+}

@@ -1,6 +1,12 @@
 model Policy {
   id                     String       @id @default(uuid()) @db.Uuid
   policy_number          String       @unique @db.VarChar(50)
+  // Entered by an approver at the moment of approval (see
+  // routes/policyApproval.js's POST /:id/approve) — optional, since not every
+  // policy has one assigned yet at issuance. Printed on the Policy PDF below
+  // "Policy No."/"Date Issued:" respectively (see pdf/policyPdf.js).
+  coc_number             String?      @db.VarChar(50)
+  sa_number              String?      @db.VarChar(50)
   application_id         String       @unique @db.Uuid
   customer_id            String?      @db.Uuid
   customer_name_snapshot String?      @db.VarChar(255)
@@ -8,11 +14,38 @@ model Policy {
   company_name_snapshot  String?      @db.VarChar(255)
   agent_id               String       @db.Uuid
   agent_name_snapshot    String?      @db.VarChar(255)
+  // Frozen off Agent.agent_code at issuance — Policy already froze the
+  // agent's *name*; the code needs the same treatment so a re-exported PDF's
+  // "Agent Code:" line can't drift if the Agent row is ever edited later.
+  agent_code_snapshot    String?      @db.VarChar(50)
   product_variant_id     String       @db.Uuid
+  // Frozen off ProductVariant/InsuranceClass at issuance — product_variant_id
+  // is still a live FK (kept for reporting/joins), but the printed document
+  // must keep reading the way the policy actually looked when issued, same
+  // reasoning as PolicyCoverage's own *_snapshot fields below.
+  class_name_snapshot    String       @db.VarChar(100)
+  variant_name_snapshot  String       @db.VarChar(255)
+  // Frozen off ProductVariant.deductible_rate/authorized_repair_limit_rate —
+  // these feed the policy schedule's Section III Deductible/Authorized
+  // Repair Limit line (see pdf/theme.js's computeDeductibleFigures()); a
+  // later change via Settings → Vehicle Rates must never alter what an
+  // already-issued policy's re-exported PDF shows.
+  deductible_rate_snapshot              Decimal? @db.Decimal(7, 4)
+  authorized_repair_limit_rate_snapshot Decimal? @db.Decimal(7, 4)
   issue_date             DateTime     @db.Date
   effective_date         DateTime     @db.Date
   expiry_date            DateTime     @db.Date
   policy_status          PolicyStatus
+  // Carried over from PolicyApplication at issuance (never recomputed from
+  // the statutory-rate constants again afterward) — PolicyApplication itself
+  // has no equivalent freeze once *its* upstream data changes, but a Policy
+  // is the final, immutable stage, so its own charges must never move.
+  total_premium          Decimal      @db.Decimal(18, 2)
+  doc_stamps             Decimal      @db.Decimal(18, 2)
+  vat                    Decimal      @db.Decimal(18, 2)
+  lgt                    Decimal      @db.Decimal(18, 2)
+  misc                   Decimal      @db.Decimal(18, 2)
+  remarks                String?
   added_to_inlease       Boolean      @default(false)
   inlease_added_at       DateTime?
   created_at             DateTime     @default(now())
@@ -28,6 +61,10 @@ model Policy {
   addresses            PolicyAddress[]
   coverages            PolicyCoverage[]
   cancellation_history CancellationHistory[]
+  // Every PolicyApplication filed as a renewal of this policy (Client
+  // Policies page's "Renew This Policy" action) — see
+  // PolicyApplication.renewed_policy_id.
+  renewal_applications PolicyApplication[] @relation("PolicyRenewals")
 
   @@index([policy_status])
   @@index([customer_id])
@@ -40,6 +77,23 @@ model PolicyVehicle {
   id         String   @id @default(uuid()) @db.Uuid
   policy_id  String   @db.Uuid
   vehicle_id String   @db.Uuid
+  // Frozen off Vehicle at issuance — vehicle_id is kept as a live FK (so a
+  // future correction still lands on the right underlying Vehicle row for
+  // ownership/depreciation purposes), but a PolicyApplicationChange's
+  // VEHICLE_* corrections write straight onto that shared Vehicle row (by
+  // design — see ApplicationChangeType), which would otherwise silently
+  // change what an already-issued policy's PDF shows the next time it's
+  // re-exported. These columns are what the PDF actually reads instead.
+  plate_number_snapshot   String?  @db.VarChar(50)
+  mv_file_no_snapshot     String   @db.VarChar(100)
+  engine_number_snapshot  String   @db.VarChar(100)
+  chassis_number_snapshot String   @db.VarChar(100)
+  make_snapshot           String?  @db.VarChar(100)
+  model_snapshot          String?  @db.VarChar(100)
+  year_model_snapshot     Int?
+  vehicle_type_snapshot   String?  @db.VarChar(50)
+  color_snapshot          String?  @db.VarChar(50)
+  no_of_seats_snapshot    Int
   created_at DateTime @default(now())
 
   policy  Policy  @relation(fields: [policy_id], references: [id])
@@ -53,6 +107,12 @@ model PolicyAddress {
   policy_id  String      @db.Uuid
   address_id String      @db.Uuid
   role       AddressRole
+  // Frozen combined display string off Address at issuance (same
+  // comma-joined shape formatAddress() in routes/policyApplications.js
+  // already produces) — address_id stays a live FK for ownership purposes,
+  // but Address rows are always freely editable via PATCH /addresses/:id
+  // with no freeze rule, so the printed document needs its own copy.
+  formatted_address_snapshot String @db.Text
   created_at DateTime    @default(now())
 
   policy  Policy  @relation(fields: [policy_id], references: [id])
@@ -72,6 +132,12 @@ model PolicyCoverage {
   coverage_code_snapshot String   @db.VarChar(50)
   coverage_name_snapshot String   @db.VarChar(255)
   clause_snapshot        String   @db.Text
+  // Frozen off ProductCoverage.pricing_mode at issuance — drives the policy
+  // schedule's Section III vs. Section IVA/IVB/PA/AOG & Others split (see
+  // pdf/policyApplicationPdf.js); a later catalog change to the coverage's
+  // pricing mode must never reclassify which section an already-issued
+  // policy's coverage prints under.
+  pricing_mode_snapshot  CoveragePricingMode
   coverage_amount        Decimal  @db.Decimal(18, 2)
   premium_amount         Decimal  @db.Decimal(18, 2)
   created_at             DateTime @default(now())

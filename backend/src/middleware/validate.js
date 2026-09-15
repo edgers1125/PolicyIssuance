@@ -35,4 +35,16 @@ function validateQuery(schema) {
   };
 }
 
-module.exports = { validateBody, validateQuery };
+function validateParams(schema) {
+  return (req, res, next) => {
+    const result = schema.safeParse(req.params);
+    if (!result.success) {
+      return res.status(400).json({ error: formatZodError(result.error) });
+    }
+    // Same Express 5 read-only-getter issue as req.query above.
+    Object.defineProperty(req, "params", { value: result.data, writable: true, configurable: true, enumerable: true });
+    next();
+  };
+}
+
+module.exports = { validateBody, validateQuery, validateParams };

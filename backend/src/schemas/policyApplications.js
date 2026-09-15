@@ -8,10 +8,10 @@ const {
   wholeDayPeriodRefinement,
   refineExactlyOneParty,
   exactlyOnePartyRefinement,
+  paymentFieldsSchema,
+  refineBethelPaymentMethod,
+  bethelPaymentMethodRefinement,
 } = require("./policyIntakeShared");
-
-const PAYMENT_METHODS = ["CASH", "CHECK", "CREDIT_CARD", "BANK_TRANSFER", "ONLINE_PAYMENT"];
-const PAYMENT_REMITTANCES = ["DIRECT_TO_BETHEL", "THROUGH_AGENT"];
 
 // Whether each class needs a vehicle, a risk address, etc. depends on a DB
 // lookup (the product variant's insurance class) that a static schema can't
@@ -35,15 +35,31 @@ const createApplicationSchema = z
     remarks: z.string().optional(),
     misc: z.coerce.number().optional(),
     send_policy_to_email: z.boolean().optional(),
-    payment_method: z.enum(PAYMENT_METHODS),
-    payment_remittance: z.enum(PAYMENT_REMITTANCES),
-    bethel_payment_method_id: z.string().optional(),
+    send_policy_to_email_on_approval: z.boolean().optional(),
+    // Shape-only here — a valid UUID string. Whether it's actually honored
+    // (ownership of the referenced Policy, and coverage_start_at not
+    // preceding its expiry_date) is the route's own business-logic check,
+    // not something a static schema can express. Present only on the
+    // Client Policies page's "Renew This Policy" flow; omitted, this
+    // application is policy_type: NEW_POLICY (the default).
+    renewed_policy_id: z.string().uuid().optional(),
   })
+  .merge(paymentFieldsSchema)
   .refine(refineExactlyOneParty, exactlyOnePartyRefinement)
   .refine(refineWholeDayPeriod, wholeDayPeriodRefinement)
-  .refine((data) => data.payment_remittance !== "DIRECT_TO_BETHEL" || Boolean(data.bethel_payment_method_id), {
-    message: "bethel_payment_method_id is required when payment goes directly to Bethel",
-    path: ["bethel_payment_method_id"],
-  });
+  .refine(refineBethelPaymentMethod, bethelPaymentMethodRefinement);
 
-module.exports = { createApplicationSchema };
+// Pagination for GET /policy-applications — same shape/cap as
+// listQuotationsQuerySchema.
+const listApplicationsQuerySchema = z.object({
+  page: z.coerce.number().int().positive().optional().default(1),
+  page_size: z.coerce.number().int().positive().max(100).optional().default(20),
+});
+
+// :id path param shared by GET /:id, GET /:id/changes, GET /:id/pdf, and
+// POST /:id/resend-email.
+const applicationIdParamSchema = z.object({
+  id: z.string().uuid("id must be a valid UUID"),
+});
+
+module.exports = { createApplicationSchema, listApplicationsQuerySchema, applicationIdParamSchema };

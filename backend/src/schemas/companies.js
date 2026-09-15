@@ -10,4 +10,10 @@ const companyInputSchema = z.object({
   email: requiredEmail(),
 });
 
-module.exports = { companyInputSchema };
+// GET /companies/agent/:agentId — QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION's
+// cross-agent company picker.
+const agentIdParamSchema = z.object({
+  agentId: z.string().uuid("agentId must be a valid UUID"),
+});
+
+module.exports = { companyInputSchema, agentIdParamSchema };

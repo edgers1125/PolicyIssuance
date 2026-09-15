@@ -16,6 +16,16 @@ model ProductVariant {
   variant_name       String       @db.VarChar(255)
   description        String?
   status             RecordStatus
+  // Both null until an admin sets them via Settings → Vehicle Rates
+  // (routes/catalog.js's PATCH /product-variants/:id) — a Motor variant with
+  // neither configured simply omits the policy schedule's Deductible/
+  // Authorized Repair Limit line rather than computing off a 0 rate.
+  // deductible_rate multiplies a vehicle's current depreciated value to get
+  // its deductible; authorized_repair_limit_rate then multiplies *that*
+  // deductible to get the authorized repair limit — see pdf/theme.js's
+  // computeDeductibleFigures().
+  deductible_rate                Decimal?     @db.Decimal(7, 4)
+  authorized_repair_limit_rate   Decimal?     @db.Decimal(7, 4)
   created_at         DateTime     @default(now())
   updated_at         DateTime     @updatedAt
 

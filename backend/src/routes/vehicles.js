@@ -1,7 +1,7 @@
 const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { requirePermission } = require("../middleware/permissions");
+const { requireAnyPermission, INTAKE_PERMISSIONS } = require("../middleware/permissions");
 const { validateBody, validateQuery } = require("../middleware/validate");
 const { getCurrentAgentId } = require("../lib/agent");
 const { updateVehicleSchema, lookupVehicleQuerySchema } = require("../schemas/vehicles");
@@ -9,7 +9,9 @@ const { currentVehicleValue } = require("../lib/vehicleValue");
 
 const router = express.Router();
 
-router.use(requireAuth, requirePermission("CREATE_APPLICATION"));
+// Feeds both PolicyApplication.jsx and QuotationCreator.jsx's vehicle
+// reuse/reassignment flow — see INTAKE_PERMISSIONS (middleware/permissions.js).
+router.use(requireAuth, requireAnyPermission(INTAKE_PERMISSIONS));
 
 // Deliberately not scoped to the agent's own customers/companies — an agent
 // needs to be able to find a plate that's on file under someone else's party,
@@ -55,6 +57,7 @@ router.get("/lookup", validateQuery(lookupVehicleQuerySchema), async (req, res, 
       year_model: vehicle.year_model,
       vehicle_type: vehicle.vehicle_type,
       color: vehicle.color,
+      no_of_seats: vehicle.no_of_seats,
       estimated_value: vehicle.estimated_value,
       initial_assessment_date: vehicle.initial_assessment_date,
       current_value: currentVehicleValue(vehicle.estimated_value, vehicle.initial_assessment_date),
@@ -108,6 +111,7 @@ router.patch("/:id", validateBody(updateVehicleSchema), async (req, res, next) =
       year_model,
       vehicle_type,
       color,
+      no_of_seats,
       estimated_value,
     } = req.body;
 
@@ -132,6 +136,7 @@ router.patch("/:id", validateBody(updateVehicleSchema), async (req, res, next) =
         year_model: year_model ?? null,
         vehicle_type: vehicle_type || null,
         color: color || null,
+        no_of_seats,
         estimated_value: alreadyAssessed ? current.estimated_value : (estimated_value ?? null),
         initial_assessment_date: alreadyAssessed
           ? current.initial_assessment_date

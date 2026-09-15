@@ -18,6 +18,7 @@ model User {
   user_permissions UserPermission[]
   approvals        ApprovalHistory[]
   cancellations    CancellationHistory[]
+  application_changes PolicyApplicationChange[]
 
   @@index([status])
 }

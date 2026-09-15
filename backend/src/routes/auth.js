@@ -5,6 +5,7 @@ const prisma = require("../lib/prisma");
 const { signToken } = require("../utils/jwt");
 const { validateBody } = require("../middleware/validate");
 const { loginSchema, forgotPasswordSchema, setPasswordSchema } = require("../schemas/auth");
+const { sendMail } = require("../lib/mailer");
 
 const router = express.Router();
 
@@ -63,9 +64,36 @@ router.post("/forgot-password", validateBody(forgotPasswordSchema), async (req, 
 
       const resetLink = `${process.env.FRONTEND_URL}/set-password?token=${resetToken}`;
 
-      // No email provider configured yet — log the link so the reset flow
-      // can be tested end-to-end without real email delivery.
-      console.log(`[mock email] Password reset link for ${email}: ${resetLink}`);
+      // Always log the link too, regardless of send outcome — the same
+      // fallback the invite flow relies on when SMTP is down.
+      console.log(`[email] Password reset link for ${email}: ${resetLink}`);
+
+      // A send failure here (e.g. SMTP not configured) must NOT change the
+      // response — this route always replies with the same generic message
+      // whether or not the account exists, and letting a mail error surface
+      // only on the "user exists" path would itself be an enumeration leak.
+      try {
+        await sendMail({
+          to: email,
+          subject: "Reset your Bethel Policy Issuance password",
+          html: `
+            <div style="font-family:Arial,sans-serif;color:#111">
+              <p>We received a request to reset your Bethel Policy Issuance password.</p>
+              <p><a href="${resetLink}">Click here to choose a new password</a>. This link expires in 1 hour.</p>
+              <p>If you didn't request this, you can safely ignore this email.</p>
+            </div>
+          `,
+          text: [
+            "We received a request to reset your Bethel Policy Issuance password.",
+            "",
+            `Choose a new password: ${resetLink}`,
+            "",
+            "This link expires in 1 hour. If you didn't request this, you can safely ignore this email.",
+          ].join("\n"),
+        });
+      } catch (mailErr) {
+        console.error(`[email] Failed to send password reset email to ${email}:`, mailErr.message || mailErr);
+      }
     }
 
     res.json({ message: "If an account with that email exists, a password reset link has been sent." });

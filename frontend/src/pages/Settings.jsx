@@ -5,6 +5,7 @@ import AddModeratorIcon from "@mui/icons-material/AddModerator";
 import GavelIcon from "@mui/icons-material/Gavel";
 import PaymentsIcon from "@mui/icons-material/Payments";
 import PriceChangeIcon from "@mui/icons-material/PriceChange";
+import DirectionsCarIcon from "@mui/icons-material/DirectionsCar";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 
 const settingsLinks = [
@@ -37,6 +38,12 @@ const settingsLinks = [
     description: "Choose how a coverage is priced, its maximum coverage, and its value/tier pricing tables",
     path: "/settings/coverage-pricing",
     icon: PriceChangeIcon,
+  },
+  {
+    label: "Vehicle Rates",
+    description: "Set each product variant's deductible and authorized repair limit rates",
+    path: "/settings/vehicle-rates",
+    icon: DirectionsCarIcon,
   },
 ];
 

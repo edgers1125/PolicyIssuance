@@ -7,4 +7,20 @@ const updateCoverageSchema = z.object({
   maximum_coverage: z.coerce.number().positive("maximum_coverage must be a positive number").optional(),
 });
 
-module.exports = { updateCoverageSchema };
+const productVariantIdParamSchema = z.object({
+  id: z.string().uuid("id must be a valid UUID"),
+});
+
+// Both optional — Settings → Vehicle Rates only ever sets one or the other
+// (or both) on a variant; either can also be cleared back to unconfigured by
+// sending null explicitly.
+const updateProductVariantRatesSchema = z.object({
+  deductible_rate: z.coerce.number().nonnegative("deductible_rate must be zero or greater").nullable().optional(),
+  authorized_repair_limit_rate: z.coerce
+    .number()
+    .nonnegative("authorized_repair_limit_rate must be zero or greater")
+    .nullable()
+    .optional(),
+});
+
+module.exports = { updateCoverageSchema, productVariantIdParamSchema, updateProductVariantRatesSchema };

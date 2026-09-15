@@ -18,12 +18,12 @@ export const navItems = [
     icon: AssignmentIcon,
     permission: "CREATE_APPLICATION",
   },
-  { label: "My Policies", path: "/my-policies", icon: ListAltIcon, permission: "VIEW_POLICIES" },
+  { label: "Client Policies", path: "/my-policies", icon: ListAltIcon, permission: "VIEW_POLICIES" },
   {
     label: "Quotation Tracker",
     path: "/quotation-tracker",
     icon: RequestQuoteIcon,
-    permission: "CREATE_APPLICATION",
+    permission: "QUOTATION_TRACKER",
   },
   {
     label: "In-Lease Backlogs",

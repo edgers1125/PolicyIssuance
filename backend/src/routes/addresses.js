@@ -1,14 +1,16 @@
 const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { requirePermission } = require("../middleware/permissions");
+const { requireAnyPermission, INTAKE_PERMISSIONS } = require("../middleware/permissions");
 const { validateBody } = require("../middleware/validate");
 const { getCurrentAgentId } = require("../lib/agent");
 const { updateAddressSchema } = require("../schemas/addresses");
 
 const router = express.Router();
 
-router.use(requireAuth, requirePermission("CREATE_APPLICATION"));
+// Feeds both PolicyApplication.jsx and QuotationCreator.jsx's address reuse
+// flow — see INTAKE_PERMISSIONS (middleware/permissions.js).
+router.use(requireAuth, requireAnyPermission(INTAKE_PERMISSIONS));
 
 // An address isn't owned directly by an agent — it's reached through whichever
 // customer/company it's on file for, and that party has to be one of this agent's.
@@ -38,7 +40,8 @@ router.patch("/:id", validateBody(updateAddressSchema), async (req, res, next) =
       return res.status(403).json({ error: "This address isn't connected to your agent account" });
     }
 
-    const { address_line_1, address_line_2, barangay, city, province, postal_code, country } = req.body;
+    const { address_line_1, address_line_2, barangay, city, province, postal_code, country, estimated_value } =
+      req.body;
 
     const address = await prisma.address.update({
       where: { id },
@@ -50,6 +53,7 @@ router.patch("/:id", validateBody(updateAddressSchema), async (req, res, next) =
         province,
         postal_code: postal_code || null,
         country: country || "Philippines",
+        estimated_value: estimated_value ?? null,
       },
     });
 

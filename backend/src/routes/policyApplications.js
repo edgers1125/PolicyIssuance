@@ -3,11 +3,20 @@ const crypto = require("crypto");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
 const { requirePermission, ensurePermission, getUserPermissionCodes } = require("../middleware/permissions");
-const { validateBody } = require("../middleware/validate");
-const { createApplicationSchema } = require("../schemas/policyApplications");
+const { validateBody, validateQuery, validateParams } = require("../middleware/validate");
+const {
+  createApplicationSchema,
+  listApplicationsQuerySchema,
+  applicationIdParamSchema,
+} = require("../schemas/policyApplications");
+const { documentPreviewPropsSchema } = require("../schemas/policyIntakeShared");
+const { CLAUSE_CHANGE_TYPES } = require("../schemas/policyApplicationChanges");
 const { currentVehicleValue } = require("../lib/vehicleValue");
 const { round2, resolveCoverageRows } = require("../lib/coveragePricing");
 const { sendIfHttpError } = require("../lib/httpError");
+const { sendMail } = require("../lib/mailer");
+const { buildSubmissionEmailContent } = require("../lib/applicationEmails");
+const { buildPolicyApplicationPdf } = require("../pdf/policyApplicationPdf");
 
 const router = express.Router();
 
@@ -23,6 +32,71 @@ function generateApplicationNumber() {
   const randomPart = crypto.randomBytes(3).toString("hex").toUpperCase();
   return `APP-${datePart}-${randomPart}`;
 }
+
+// Every application this agent has filed, latest first — the Policy
+// Applications tracker's list view (same shape/pattern as
+// GET /policy-quotations).
+router.get("/", validateQuery(listApplicationsQuerySchema), async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { agent_id: true } });
+    if (!user?.agent_id) {
+      return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+    }
+
+    const { page, page_size: pageSize } = req.query;
+    const where = { agent_id: user.agent_id };
+
+    const [total, applications] = await Promise.all([
+      prisma.policyApplication.count({ where }),
+      prisma.policyApplication.findMany({
+        where,
+        orderBy: { created_at: "desc" },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        select: {
+          id: true,
+          application_number: true,
+          insured_type: true,
+          status: true,
+          policy_type: true,
+          coverage_start_at: true,
+          coverage_end_at: true,
+          total_premium: true,
+          created_at: true,
+          customer: { select: { first_name: true, last_name: true } },
+          company_name_snapshot: true,
+          product_variant: {
+            select: { variant_name: true, insurance_class: { select: { class_name: true } } },
+          },
+        },
+      }),
+    ]);
+
+    res.json({
+      data: applications.map((a) => ({
+        id: a.id,
+        application_number: a.application_number,
+        insured_name:
+          a.insured_type === "INDIVIDUAL"
+            ? [a.customer?.last_name, a.customer?.first_name].filter(Boolean).join(", ")
+            : a.company_name_snapshot,
+        class_name: a.product_variant.insurance_class.class_name,
+        variant_name: a.product_variant.variant_name,
+        status: a.status,
+        policy_type: a.policy_type,
+        coverage_start_at: a.coverage_start_at,
+        coverage_end_at: a.coverage_end_at,
+        total_premium: a.total_premium,
+        created_at: a.created_at,
+      })),
+      total,
+      page,
+      page_size: pageSize,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 router.post("/", validateBody(createApplicationSchema), async (req, res, next) => {
   try {
@@ -44,9 +118,11 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       remarks,
       misc,
       send_policy_to_email,
+      send_policy_to_email_on_approval,
       payment_method,
       payment_remittance,
       bethel_payment_method_id,
+      renewed_policy_id,
     } = req.body;
 
     // Which one applies is derived from whichever id was actually sent — the
@@ -117,6 +193,26 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
     }
     const vehicleValues = className === "Motor" ? await Promise.all(vehicles.map(resolveVehicleValue)) : [];
 
+    // VALUE_PERCENTAGE coverages on a Property application price off the
+    // risk address's own estimated value instead — same "existing record is
+    // authoritative, new one uses what was just entered" split as vehicles,
+    // just without a depreciation schedule (a property's value doesn't decay
+    // automatically the way a vehicle's does).
+    async function resolveRiskAddressValue(addr) {
+      if (!addr) return null;
+      if (addr.existing_address_id) {
+        const dbAddress = await prisma.address.findUnique({
+          where: { id: addr.existing_address_id },
+          select: { estimated_value: true },
+        });
+        return dbAddress?.estimated_value !== null && dbAddress?.estimated_value !== undefined
+          ? Number(dbAddress.estimated_value)
+          : null;
+      }
+      return addr.estimated_value !== undefined ? Number(addr.estimated_value) : null;
+    }
+    const addressValue = className === "Property" ? await resolveRiskAddressValue(risk_address) : null;
+
     const user = await prisma.user.findUnique({
       where: { id: req.user.userId },
       select: { agent_id: true },
@@ -125,6 +221,31 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
     }
     const agent = await prisma.agent.findUnique({ where: { id: user.agent_id } });
+
+    // The Client Policies page's "Renew This Policy" action carries the
+    // source Policy's id along in the create payload — this is the only
+    // place policy_type ever becomes RENEWAL (see ApplicationPolicyType's
+    // own comment). Ownership and the "can't start before the current
+    // policy expires" rule are both business logic, not something the
+    // static schema can express, so both are checked here rather than in
+    // createApplicationSchema.
+    let policyType = "NEW_POLICY";
+    if (renewed_policy_id) {
+      const renewedPolicy = await prisma.policy.findUnique({
+        where: { id: renewed_policy_id },
+        select: { id: true, agent_id: true, expiry_date: true },
+      });
+      if (!renewedPolicy) {
+        return res.status(400).json({ error: "renewed_policy_id does not match an existing policy" });
+      }
+      if (renewedPolicy.agent_id !== agent.id) {
+        return res.status(403).json({ error: "That policy isn't on file for your agent account" });
+      }
+      if (new Date(startAt) < renewedPolicy.expiry_date) {
+        return res.status(400).json({ error: "Coverage cannot start before the current policy's expiry date" });
+      }
+      policyType = "RENEWAL";
+    }
 
     // The agent can only file applications for their own connected customers/companies.
     if (insured_type === "INDIVIDUAL") {
@@ -152,6 +273,7 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       className,
       vehicles,
       vehicleValues,
+      addressValue,
       agentId: user.agent_id,
       startAt,
       endAt,
@@ -241,10 +363,13 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
           lgt,
           misc: miscAmount,
           send_policy_to_email: Boolean(send_policy_to_email),
+          send_policy_to_email_on_approval: Boolean(send_policy_to_email_on_approval),
           payment_method,
           payment_remittance,
           bethel_payment_method_id: bethelPaymentMethod ? bethelPaymentMethod.id : null,
           remarks: remarks || null,
+          policy_type: policyType,
+          renewed_policy_id: renewed_policy_id || null,
         },
       });
 
@@ -286,6 +411,7 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
                   year_model: v.year_model ?? null,
                   vehicle_type: v.vehicle_type || null,
                   color: v.color || null,
+                  no_of_seats: v.no_of_seats,
                   estimated_value: alreadyAssessed ? currentVehicle.estimated_value : (v.estimated_value ?? null),
                   initial_assessment_date: alreadyAssessed
                     ? currentVehicle.initial_assessment_date
@@ -320,6 +446,7 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
                 year_model: v.year_model ?? null,
                 vehicle_type: v.vehicle_type || null,
                 color: v.color || null,
+                no_of_seats: v.no_of_seats,
                 estimated_value: v.estimated_value ?? null,
                 initial_assessment_date: v.estimated_value !== undefined ? new Date() : null,
               },
@@ -365,6 +492,7 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
             postal_code: addr.postal_code || null,
             country: addr.country || "Philippines",
             address_type: addressType,
+            estimated_value: addr.estimated_value ?? null,
           },
         });
 
@@ -390,11 +518,533 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       return application;
     });
 
+    // Sent right away, not just on manual "Resend to client" — a mail
+    // failure here must never fail the application that was just created, so
+    // it's caught and logged rather than surfaced (same swallow-and-log
+    // pattern as auth.js's forgot-password and users.js's invite email).
+    if (result.send_policy_to_email) {
+      try {
+        const fullApplication = await prisma.policyApplication.findUnique({
+          where: { id: result.id },
+          select: applicationDetailSelect,
+        });
+        const detail = toApplicationDetail(fullApplication);
+        if (detail.insured_email) {
+          const pdfBuffer = await buildPolicyApplicationPdf(toPreviewProps(detail));
+          const { subject, html, text } = buildSubmissionEmailContent(detail);
+          await sendMail({
+            to: detail.insured_email,
+            subject,
+            html,
+            text,
+            attachments: [{ filename: `${detail.application_number}.pdf`, content: pdfBuffer, contentType: "application/pdf" }],
+          });
+        }
+      } catch (mailErr) {
+        console.error("[policyApplications] failed to send submission email", mailErr);
+      }
+    }
+
     res.status(201).json(result);
   } catch (err) {
     if (sendIfHttpError(err, res)) return;
     next(err);
   }
 });
+
+// Renders a PDF from live, not-yet-saved preview data —
+// PolicyApplication's "Print / Save as PDF" button before the application is
+// actually submitted. Read-only: nothing here touches the database.
+router.post("/preview-pdf", validateBody(documentPreviewPropsSchema), async (req, res, next) => {
+  try {
+    const pdfBuffer = await buildPolicyApplicationPdf(req.body);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'inline; filename="policy-application-preview.pdf"');
+    res.send(pdfBuffer);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Shared select for the routes below that need a single application's full
+// detail (the Policy Applications tracker's row detail popup, the resend
+// email route, and the saved-PDF download) — same shape/pattern as
+// policyQuotations.js's quotationDetailSelect.
+const applicationDetailSelect = {
+  id: true,
+  application_number: true,
+  insured_type: true,
+  status: true,
+  policy_type: true,
+  renewed_policy_id: true,
+  application_date: true,
+  submission_date: true,
+  coverage_start_at: true,
+  coverage_end_at: true,
+  total_premium: true,
+  doc_stamps: true,
+  vat: true,
+  lgt: true,
+  misc: true,
+  send_policy_to_email: true,
+  payment_method: true,
+  payment_remittance: true,
+  remarks: true,
+  created_at: true,
+  customer: { select: { first_name: true, last_name: true, middle_name: true, email: true } },
+  company_name_snapshot: true,
+  company: { select: { email: true } },
+  agent: { select: { agent_code: true, agent_name: true } },
+  product_variant_id: true,
+  product_variant: {
+    select: {
+      variant_name: true,
+      insurance_class: { select: { class_name: true } },
+      deductible_rate: true,
+      authorized_repair_limit_rate: true,
+    },
+  },
+  vehicles: {
+    orderBy: { created_at: "asc" },
+    select: {
+      // The join row's own id — not just the Vehicle it points at — so a
+      // caller (routes/policyApproval.js's change form) can address "this
+      // application's 2nd vehicle" without it possibly resolving to a
+      // different application's row for the same underlying Vehicle.
+      id: true,
+      vehicle: {
+        select: {
+          plate_number: true,
+          mv_file_no: true,
+          engine_number: true,
+          chassis_number: true,
+          make: true,
+          model: true,
+          year_model: true,
+          vehicle_type: true,
+          color: true,
+          no_of_seats: true,
+        },
+      },
+    },
+  },
+  addresses: {
+    select: {
+      role: true,
+      address: {
+        select: {
+          address_line_1: true,
+          address_line_2: true,
+          barangay: true,
+          city: true,
+          province: true,
+          postal_code: true,
+          country: true,
+        },
+      },
+    },
+  },
+  coverages: {
+    select: {
+      // Same reasoning as vehicles.id above — routes/policyApproval.js's
+      // AddClause/RemoveClause changes need to address one specific coverage
+      // line on this application.
+      id: true,
+      coverage_amount: true,
+      premium_amount: true,
+      coverage: { select: { coverage_name: true, clause: true, pricing_mode: true } },
+    },
+  },
+};
+
+// Combines a Customer's name columns into the one display/snapshot string
+// used everywhere an individual insured's name is shown (insured_name,
+// change_from/change_to on an INSURED_NAME_DETAILS change, and eventually
+// Policy.customer_name_snapshot) — "Last, First Middle", middle name omitted
+// when blank. Attached onto `router` (see bottom of file) so
+// routes/policyApproval.js's change-recording and approve handlers build the
+// exact same string rather than each re-deriving their own join and
+// silently dropping middle_name the way the pre-fix version of this file did.
+function formatInsuredName({ last_name, first_name, middle_name }) {
+  const given = [first_name, middle_name].filter(Boolean).join(" ");
+  return [last_name, given].filter(Boolean).join(", ") || null;
+}
+
+// Combines an Address's columns into the one display/snapshot string used
+// for insured_address and for an INSURED_ADDRESS_DETAILS change's
+// change_from/change_to — every field a caller can actually edit via that
+// change type (see updateAddressSchema/policyApplicationChanges.js), not
+// just address_line_1.
+function formatAddress(address) {
+  if (!address) return null;
+  return (
+    [
+      address.address_line_1,
+      address.address_line_2,
+      address.barangay,
+      address.city,
+      address.province,
+      address.postal_code,
+      address.country,
+    ]
+      .filter(Boolean)
+      .join(", ") || null
+  );
+}
+
+// Turns the raw Prisma record into the flat shape the Policy Applications
+// tracker's detail popup and the resend email both render from — mirrors
+// policyQuotations.js's toQuotationDetail().
+function toApplicationDetail(application) {
+  const insuredAddress = application.addresses.find((a) => a.role === "INSURED")?.address;
+  const totalAmount =
+    Number(application.total_premium) +
+    Number(application.doc_stamps) +
+    Number(application.vat) +
+    Number(application.lgt) +
+    Number(application.misc);
+
+  return {
+    id: application.id,
+    application_number: application.application_number,
+    insured_type: application.insured_type,
+    insured_name:
+      application.insured_type === "INDIVIDUAL" ? formatInsuredName(application.customer || {}) : application.company_name_snapshot,
+    // Split-out name columns — not rendered anywhere themselves, just so
+    // routes/policyApproval.js's "Create Change" form can prefill separate
+    // First/Middle/Last inputs instead of asking an approver to retype
+    // insured_name's whole "Last, First Middle" string from scratch. null
+    // for a CORPORATE application (insured_name/company_name_snapshot is
+    // already the single field there).
+    insured_first_name: application.insured_type === "INDIVIDUAL" ? application.customer?.first_name ?? null : null,
+    insured_middle_name: application.insured_type === "INDIVIDUAL" ? application.customer?.middle_name ?? null : null,
+    insured_last_name: application.insured_type === "INDIVIDUAL" ? application.customer?.last_name ?? null : null,
+    insured_email: application.insured_type === "INDIVIDUAL" ? application.customer?.email : application.company?.email,
+    insured_address: formatAddress(insuredAddress),
+    // Same reasoning as the split name columns above — lets the change form
+    // prefill every individually-editable address field, not just line 1.
+    insured_address_line_1: insuredAddress?.address_line_1 ?? null,
+    insured_address_line_2: insuredAddress?.address_line_2 ?? null,
+    insured_barangay: insuredAddress?.barangay ?? null,
+    insured_city: insuredAddress?.city ?? null,
+    insured_province: insuredAddress?.province ?? null,
+    insured_postal_code: insuredAddress?.postal_code ?? null,
+    insured_country: insuredAddress?.country ?? null,
+    class_name: application.product_variant.insurance_class.class_name,
+    product_variant_id: application.product_variant_id,
+    variant_name: application.product_variant.variant_name,
+    deductible_rate: application.product_variant.deductible_rate,
+    authorized_repair_limit_rate: application.product_variant.authorized_repair_limit_rate,
+    agent_code: application.agent.agent_code,
+    agent_name: application.agent.agent_name,
+    status: application.status,
+    policy_type: application.policy_type,
+    renewed_policy_id: application.renewed_policy_id,
+    application_date: application.application_date,
+    submission_date: application.submission_date,
+    coverage_start_at: application.coverage_start_at,
+    coverage_end_at: application.coverage_end_at,
+    send_policy_to_email: application.send_policy_to_email,
+    payment_method: application.payment_method,
+    payment_remittance: application.payment_remittance,
+    total_premium: application.total_premium,
+    doc_stamps: application.doc_stamps,
+    vat: application.vat,
+    lgt: application.lgt,
+    misc: application.misc,
+    total_amount: totalAmount,
+    remarks: application.remarks,
+    created_at: application.created_at,
+    vehicles: application.vehicles.map((v) => ({ ...v.vehicle, application_vehicle_id: v.id })),
+    coverages: application.coverages.map((c) => ({
+      id: c.id,
+      name: c.coverage.coverage_name,
+      clause: c.coverage.clause,
+      amount: c.coverage_amount,
+      premium: c.premium_amount,
+      pricing_mode: c.coverage.pricing_mode,
+    })),
+  };
+}
+
+// Maps an application's DB-flattened detail onto the same shared prop shape
+// every PDFKit builder takes — mirrors policyQuotations.js's toPreviewProps().
+// isPreview stays true even for an already-saved application: it isn't an
+// issued Policy yet (that only exists once approved — see
+// Policy.application_id), so the exported document keeps saying so.
+function toPreviewProps(detail) {
+  return {
+    applicationNumber: detail.application_number,
+    isPreview: true,
+    classNameLabel: detail.class_name,
+    variantName: detail.variant_name,
+    insuredName: detail.insured_name,
+    insuredAddress: detail.insured_address,
+    agentCode: detail.agent_code,
+    coverageStartAt: detail.coverage_start_at,
+    coverageEndAt: detail.coverage_end_at,
+    vehicles: detail.vehicles || [],
+    coverages: detail.coverages || [],
+    deductibleRate: detail.deductible_rate,
+    authorizedRepairLimitRate: detail.authorized_repair_limit_rate,
+    totalPremium: detail.total_premium,
+    docStamps: detail.doc_stamps,
+    vat: detail.vat,
+    lgt: detail.lgt,
+    misc: detail.misc,
+    totalAmount: detail.total_amount,
+    remarks: detail.remarks,
+  };
+}
+
+// Folds recorded PolicyApplicationChange rows onto an already-built
+// toApplicationDetail() result, for the change types that never mutate a
+// Vehicle/Address row and so wouldn't otherwise show up in a fresh read —
+// VEHICLE_*/INSURED_ADDRESS_DETAILS changes are already live on the
+// underlying rows this detail was built from, so they need no overlay here.
+// Attached onto `router` (see the bottom of this file) rather than
+// duplicated, same as applicationDetailSelect/toApplicationDetail/
+// toPreviewProps above — both this router (agent-facing) and
+// routes/policyApproval.js (approver-facing) need every recorded correction
+// reflected wherever an application's detail/PDF/emailed copy is rendered,
+// not just in the approval queue.
+function applyChangesToDetail(detail, changes) {
+  const next = { ...detail, coverages: detail.coverages.map((c) => ({ ...c })) };
+  // The period's length (coverage_end_at - coverage_start_at) is fixed at
+  // whatever it was originally quoted/applied for — an INSURED_FROM_DATE
+  // change moves the whole period, it doesn't just push the start date out
+  // while leaving the end date behind (which would silently shrink or
+  // stretch the period). Captured once, before the loop, so two
+  // INSURED_FROM_DATE changes in a row (the second superseding the first)
+  // both shift from the same original length rather than compounding.
+  const originalDurationMs = detail.coverage_end_at.getTime() - detail.coverage_start_at.getTime();
+  for (const change of changes) {
+    if (change.change_type === "INSURED_FROM_DATE") {
+      next.coverage_start_at = new Date(change.change_to);
+      next.coverage_end_at = new Date(next.coverage_start_at.getTime() + originalDurationMs);
+    } else if (change.change_type === "INSURED_NAME_DETAILS") {
+      next.insured_name = change.change_to;
+      // Keep the split first/middle/last fields in sync with the corrected
+      // combined string too (parsing formatInsuredName's own "Last, First
+      // Middle" shape back apart) — otherwise a second "Create Change" on an
+      // already-corrected name would prefill its First/Middle/Last inputs
+      // from the stale original Customer row instead of the last correction.
+      if (next.insured_type === "INDIVIDUAL") {
+        const [lastPart, ...rest] = (change.change_to || "").split(",");
+        const givenParts = rest.join(",").trim().split(/\s+/).filter(Boolean);
+        next.insured_last_name = lastPart?.trim() || null;
+        next.insured_first_name = givenParts[0] || null;
+        next.insured_middle_name = givenParts.slice(1).join(" ") || null;
+      }
+    } else if (CLAUSE_CHANGE_TYPES.has(change.change_type) && change.application_coverage_id) {
+      const idx = next.coverages.findIndex((c) => c.id === change.application_coverage_id);
+      if (idx !== -1) next.coverages[idx] = { ...next.coverages[idx], clause: change.change_to };
+    }
+  }
+  return next;
+}
+
+// One application's full detail — powers the Policy Applications tracker's
+// row detail popup. Scoped to the caller's own agent, same as the list route.
+// Any recorded PolicyApplicationChange rows are folded in (applyChangesToDetail
+// above) so an agent always sees the corrected picture, same as an approver
+// reviewing the same application does.
+router.get("/:id", validateParams(applicationIdParamSchema), async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { agent_id: true } });
+    if (!user?.agent_id) {
+      return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+    }
+
+    const application = await prisma.policyApplication.findFirst({
+      where: { id: req.params.id, agent_id: user.agent_id },
+      select: applicationDetailSelect,
+    });
+    if (!application) {
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    const changes = await prisma.policyApplicationChange.findMany({
+      where: { policy_application_id: req.params.id },
+      orderBy: { created_at: "asc" },
+    });
+
+    res.json(applyChangesToDetail(toApplicationDetail(application), changes));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Every recorded change for one application, oldest first — the Policy
+// Applications tracker detail popup's change-history list. Scoped to the
+// caller's own agent, same as GET /:id above; mirrors
+// GET /policy-approval/:id/changes exactly (same response shape), just with
+// that extra ownership check since this is the agent-facing route.
+router.get("/:id/changes", validateParams(applicationIdParamSchema), async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { agent_id: true } });
+    if (!user?.agent_id) {
+      return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+    }
+
+    const application = await prisma.policyApplication.findFirst({
+      where: { id: req.params.id, agent_id: user.agent_id },
+      select: { id: true },
+    });
+    if (!application) {
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    const changes = await prisma.policyApplicationChange.findMany({
+      where: { policy_application_id: req.params.id },
+      orderBy: { created_at: "asc" },
+      select: {
+        id: true,
+        change_type: true,
+        change_from: true,
+        change_to: true,
+        effective_date: true,
+        remarks: true,
+        created_at: true,
+        application_vehicle_id: true,
+        application_coverage_id: true,
+        created_by: { select: { full_name: true, email: true } },
+      },
+    });
+
+    res.json(
+      changes.map((c) => ({
+        id: c.id,
+        change_type: c.change_type,
+        change_from: c.change_from,
+        change_to: c.change_to,
+        effective_date: c.effective_date,
+        remarks: c.remarks,
+        created_at: c.created_at,
+        application_vehicle_id: c.application_vehicle_id,
+        application_coverage_id: c.application_coverage_id,
+        created_by_name: c.created_by.full_name || c.created_by.email,
+      }))
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PDF download for an already-saved application — the Policy Applications
+// tracker detail popup's "Re-export PDF" action. Any recorded changes are
+// folded in first (applyChangesToDetail above) so the exported PDF always
+// reflects the latest corrections, same as routes/policyApproval.js's own
+// GET /:id/pdf.
+router.get("/:id/pdf", validateParams(applicationIdParamSchema), async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { agent_id: true } });
+    if (!user?.agent_id) {
+      return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+    }
+
+    const application = await prisma.policyApplication.findFirst({
+      where: { id: req.params.id, agent_id: user.agent_id },
+      select: applicationDetailSelect,
+    });
+    if (!application) {
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    const changes = await prisma.policyApplicationChange.findMany({
+      where: { policy_application_id: req.params.id },
+      orderBy: { created_at: "asc" },
+    });
+
+    const detail = applyChangesToDetail(toApplicationDetail(application), changes);
+    const pdfBuffer = await buildPolicyApplicationPdf(toPreviewProps(detail));
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${detail.application_number}.pdf"`);
+    res.send(pdfBuffer);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Re-sends the application's policy schedule to whatever email is on file
+// for the insured customer/company — the Policy Applications tracker detail
+// popup's "Resend to client" action. Mirrors policyQuotations.js's
+// resend-email route. Any recorded changes are folded in first
+// (applyChangesToDetail above), so a resend after a correction has been
+// logged actually reflects it, instead of re-sending the original filing.
+router.post("/:id/resend-email", validateParams(applicationIdParamSchema), async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { agent_id: true } });
+    if (!user?.agent_id) {
+      return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+    }
+
+    const application = await prisma.policyApplication.findFirst({
+      where: { id: req.params.id, agent_id: user.agent_id },
+      select: applicationDetailSelect,
+    });
+    if (!application) {
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    const changes = await prisma.policyApplicationChange.findMany({
+      where: { policy_application_id: req.params.id },
+      orderBy: { created_at: "asc" },
+    });
+
+    const detail = applyChangesToDetail(toApplicationDetail(application), changes);
+    if (!detail.insured_email) {
+      return res.status(400).json({ error: "This customer/company has no email address on file" });
+    }
+
+    const html = `
+      <div style="font-family:Arial,sans-serif;color:#111">
+        <p>Dear ${detail.insured_name},</p>
+        <p>Please find your policy application from Bethel General Insurance and Surety Corp. attached as a PDF (Application No. ${detail.application_number}).</p>
+        <p>This application is not yet an issued policy. Please contact your agent (${detail.agent_name || detail.agent_code}) with any questions.</p>
+      </div>
+    `;
+    const text = [
+      `Dear ${detail.insured_name},`,
+      "",
+      `Please find your policy application from Bethel General Insurance and Surety Corp. attached as a PDF (Application No. ${detail.application_number}).`,
+      "",
+      `This application is not yet an issued policy. Please contact your agent (${detail.agent_name || detail.agent_code}) with any questions.`,
+    ].join("\n");
+
+    const pdfBuffer = await buildPolicyApplicationPdf(toPreviewProps(detail));
+
+    await sendMail({
+      to: detail.insured_email,
+      subject: `Your Bethel Insurance Policy Application ${detail.application_number}`,
+      html,
+      text,
+      attachments: [
+        {
+          filename: `${detail.application_number}.pdf`,
+          content: pdfBuffer,
+          contentType: "application/pdf",
+        },
+      ],
+    });
+
+    res.json({ sent: true, to: detail.insured_email });
+  } catch (err) {
+    if (sendIfHttpError(err, res)) return;
+    next(err);
+  }
+});
+
+// Attached to the router function (Express routers are just functions, so
+// this is safe) rather than duplicated — routes/policyApproval.js needs the
+// exact same detail shape/mapping for its own (non-agent-scoped) detail and
+// PDF routes, and this isn't a "layout" the way the PDF builders are, so
+// there's no reason to keep two copies in sync by hand.
+router.applicationDetailSelect = applicationDetailSelect;
+router.toApplicationDetail = toApplicationDetail;
+router.toPreviewProps = toPreviewProps;
+router.applyChangesToDetail = applyChangesToDetail;
+router.formatInsuredName = formatInsuredName;
+router.formatAddress = formatAddress;
 
 module.exports = router;

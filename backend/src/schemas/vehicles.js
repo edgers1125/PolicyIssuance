@@ -13,6 +13,7 @@ const updateVehicleSchema = z.object({
   year_model: z.preprocess((v) => (v === "" ? undefined : v), z.coerce.number().int().optional()),
   vehicle_type: z.string().optional(),
   color: z.string().optional(),
+  no_of_seats: z.coerce.number({ error: "no_of_seats is required" }).int().positive("no_of_seats must be a positive whole number"),
   // The UI sends "" for a blank value field — treat that as omitted.
   // initial_assessment_date is deliberately not accepted here — it's stamped
   // automatically by the route the first time a value is recorded.

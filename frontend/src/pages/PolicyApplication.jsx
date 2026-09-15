@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import {
   Container,
   Typography,
@@ -29,6 +28,7 @@ import {
 import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
 import EditIcon from "@mui/icons-material/Edit";
+import CloseIcon from "@mui/icons-material/Close";
 import { useAuth } from "../context/AuthContext";
 import {
   getProductCatalog,
@@ -43,12 +43,13 @@ import {
   updateAddress,
   createPolicyApplication,
   listPaymentMethods,
+  previewApplicationPdf,
 } from "../api/client";
 import { formatPHP, formatRate } from "../utils/currency";
 import { formatPeriodLabel } from "../utils/coveragePeriods";
 import { currentVehicleValue, findApplicableValueTier } from "../utils/vehicleValue";
 import { NumberField } from "../components/NumberField";
-import { PolicySchedulePreview } from "../components/PolicySchedulePreview";
+import { PdfViewer } from "../components/PdfViewer";
 
 const emptyCustomer = {
   first_name: "",
@@ -79,6 +80,7 @@ const emptyVehicle = {
   year_model: "",
   vehicle_type: "",
   color: "",
+  no_of_seats: "",
   estimated_value: "",
   // Set automatically the first time an estimated value is ever recorded —
   // never entered directly, and never sent back to the server.
@@ -99,6 +101,10 @@ const emptyAddress = {
   postal_code: "",
   country: "Philippines",
   existing_address_id: null,
+  // Only meaningful for a Property risk address — VALUE_PERCENTAGE coverage
+  // pricing prices off this the same way it prices off a vehicle's
+  // estimated_value for Motor. Unlike a vehicle, this never locks/depreciates.
+  estimated_value: "",
 };
 
 // Standard Philippine non-life insurance statutory rates, applied to total premium —
@@ -147,7 +153,7 @@ function addDaysToLocalDateTime(value, days) {
 // selection with no vehicle_indices applies to the whole policy — every
 // vehicle on the application; one with a specific (possibly multi-vehicle)
 // list applies to just those.
-function resolveCoverageSelection(cov, selection, vehicles) {
+function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
   if (!selection) return null;
 
   // Property has no vehicle concept at all — treat it as a single virtual
@@ -178,7 +184,10 @@ function resolveCoverageSelection(cov, selection, vehicles) {
     let payablePerVehicle;
 
     if (cov.pricing_mode === "VALUE_PERCENTAGE") {
-      const targetValue = vehicleCurrentValue(vehicles[idx]);
+      // Motor prices off the targeted vehicle's own (depreciated) value;
+      // Property has no vehicles at all, so it prices off the risk
+      // address's own estimated value instead.
+      const targetValue = idx !== null ? vehicleCurrentValue(vehicles[idx]) : Number(addressValue) || null;
       if (targetValue === null || targetValue === undefined) {
         return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
       }
@@ -237,7 +246,7 @@ function isCompanyComplete(c) {
 }
 
 function isVehicleComplete(v) {
-  return Boolean(v.plate_number && v.mv_file_no && v.engine_number && v.chassis_number);
+  return Boolean(v.plate_number && v.mv_file_no && v.engine_number && v.chassis_number && v.no_of_seats);
 }
 
 function isAddressComplete(a) {
@@ -577,6 +586,17 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly }
               />
             </Grid>
             <Grid size={{ xs: 12, sm: 6 }}>
+              <TextField
+                label="No. of seats"
+                type="number"
+                value={form.no_of_seats}
+                onChange={(e) => setForm({ ...form, no_of_seats: e.target.value })}
+                required
+                fullWidth
+                helperText="Drives the policy schedule's driver/occupants endorsement line"
+              />
+            </Grid>
+            <Grid size={{ xs: 12, sm: 6 }}>
               <NumberField
                 label="Estimated value"
                 value={form.estimated_value}
@@ -612,7 +632,7 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly }
   );
 }
 
-function AddressEditDialog({ open, onClose, address, token, onSaved }) {
+function AddressEditDialog({ open, onClose, address, token, onSaved, showEstimatedValue }) {
   const [form, setForm] = useState(emptyAddress);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
@@ -694,6 +714,18 @@ function AddressEditDialog({ open, onClose, address, token, onSaved }) {
                 fullWidth
               />
             </Grid>
+            {showEstimatedValue && (
+              <Grid size={{ xs: 12, sm: 6 }}>
+                <NumberField
+                  label="Estimated value"
+                  value={form.estimated_value}
+                  onChange={(v) => setForm({ ...form, estimated_value: v })}
+                  fullWidth
+                  helperText="Used to price VALUE_PERCENTAGE coverages for this property"
+                  slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                />
+              </Grid>
+            )}
           </Grid>
           {error && <Alert severity="error">{error}</Alert>}
         </Stack>
@@ -731,7 +763,34 @@ function PlateConflictDialog({ conflict, onCancel, onConfirm }) {
   );
 }
 
-export function PolicyApplication() {
+// Same UTC-getter approach as ApplicationReviewDialog.jsx's/EditQuotationDialog.jsx's
+// own toLocalDateTimeInput — the value round-trips to the server as a naive
+// datetime-local string, parsed in the server's own timezone (UTC, no TZ set
+// in the container), never the browser's.
+function toLocalDateTimeInput(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+
+// No longer a standalone route — rendered inside the Policy Applications
+// tracker's (`PolicyApplications.jsx`, `/policy-application`) "New
+// Application" Dialog, same pattern as QuotationCreator.jsx inside
+// Quotations.jsx's "New Quotation" Dialog. onClose shows a close IconButton
+// next to the title; onCreated(application) lets the tracker refresh its
+// list without closing the dialog (the form resets and stays open, for
+// filing another one for the same party).
+//
+// renewalPrefill (optional) — set only via the Client Policies page's
+// "Renew This Policy" action (routes/policies.js's GET
+// /:id/renewal-prefill, via PolicyApplications.jsx's ?renew= deep link) —
+// pre-fills this same wizard from an already-issued Policy's own live
+// records, exactly as if the agent had searched-and-reused each one by hand,
+// and pins coverage_start_at to (and never lets it precede) that policy's
+// own expiry_date. See the renewalPrefill effect below.
+export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
   const { token, permissions, agent } = useAuth();
   const canIssue = permissions?.includes("CREATE_APPLICATION.AGENT_ISSUANCE");
 
@@ -757,6 +816,21 @@ export function PolicyApplication() {
   // Which plate number was last checked per vehicle row, so blurring an
   // unchanged field doesn't keep re-triggering the lookup.
   const lastCheckedPlateRef = useRef({});
+  // Set true right before the renewalPrefill effect (below) sets a party's
+  // existing_customer_id/existing_company_id, so the "reset vehicles/
+  // addresses on party change" effect further down skips the one reset it
+  // would otherwise trigger — without this, that effect would immediately
+  // wipe out the very vehicles/addresses this same prefill just set.
+  const skipPartyResetRef = useRef(false);
+  // Renewal-specific — set only by the renewalPrefill effect below. Sent as
+  // renewed_policy_id in the create payload; minCoverageStartAt both floors
+  // the "Insured from" field's native min and is checked again in
+  // handlePreview (a native datetime-local min isn't reliably enforced
+  // across browsers for a typed-in value).
+  const [renewedPolicyId, setRenewedPolicyId] = useState(null);
+  const [renewedPolicyNumber, setRenewedPolicyNumber] = useState("");
+  const [minCoverageStartAt, setMinCoverageStartAt] = useState("");
+  const appliedRenewalPrefillRef = useRef(false);
 
   const [classId, setClassId] = useState("");
   const [variantId, setVariantId] = useState("");
@@ -772,12 +846,16 @@ export function PolicyApplication() {
   const [remarks, setRemarks] = useState("");
   const [misc, setMisc] = useState("");
   const [sendPolicyToEmail, setSendPolicyToEmail] = useState(false);
+  const [sendPolicyToEmailOnApproval, setSendPolicyToEmailOnApproval] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState("");
   const [paymentRemittance, setPaymentRemittance] = useState("");
   const [bethelPaymentMethodId, setBethelPaymentMethodId] = useState("");
   const [bethelPaymentMethods, setBethelPaymentMethods] = useState([]);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [confirmChecked, setConfirmChecked] = useState(false);
+  const [previewPdfUrl, setPreviewPdfUrl] = useState(null);
+  const [previewPdfLoading, setPreviewPdfLoading] = useState(false);
+  const [previewPdfError, setPreviewPdfError] = useState("");
 
   function loadParties() {
     return Promise.all([listMyCustomers(token).then(setMyCustomers), listMyCompanies(token).then(setMyCompanies)]);
@@ -813,6 +891,10 @@ export function PolicyApplication() {
           value_percentage_tiers: period.value_percentage_tiers,
           tier_based_prices: period.tier_based_prices,
           has_custom_tiers: period.has_custom_tiers,
+          // Whether this coverage actually has a rate/tier configured for
+          // this specific period yet — an allowable period can exist before
+          // anyone's set a price for it under Settings → Coverage Pricing.
+          has_pricing: period.has_pricing,
         }
       : cov;
   });
@@ -829,6 +911,14 @@ export function PolicyApplication() {
     return Boolean(days) && (cov.allowable_periods || []).some((p) => p.coverage_in_days === days);
   }
 
+  // False only once the coverage is actually flattened onto the chosen
+  // period (has_pricing undefined beforehand, e.g. no period chosen yet) —
+  // callers already gate on coverageAllowsPeriod first, so this only needs
+  // to catch the "period exists but nobody's priced it yet" case.
+  function coverageIsPriced(cov) {
+    return cov.has_pricing !== false;
+  }
+
   // coverage_end_at is never entered directly — it's always coverage_start_at
   // plus the chosen period, computed the same way the server re-derives it.
   const coverageEndAt = coverageStartAt && coveragePeriodDays
@@ -843,6 +933,9 @@ export function PolicyApplication() {
   // applies to the whole policy — Property has no vehicles at all, so it
   // always resolves as a single virtual target instead.
   const coverageVehicles = isMotor ? vehicles : [];
+  // Property's VALUE_PERCENTAGE stand-in for a vehicle's own value — see
+  // resolveCoverageSelection.
+  const riskAddressValue = isProperty ? Number(riskAddress.estimated_value) || null : null;
 
   // Total premium is the sum of every selected coverage's resolved premium —
   // the statutory charges below are derived from it, mirroring what the
@@ -850,7 +943,7 @@ export function PolicyApplication() {
   const totalPremium = Object.entries(coverageSelections).reduce((sum, [coverageId, selection]) => {
     const cov = coverages.find((c) => c.id === coverageId);
     if (!cov) return sum;
-    const resolved = resolveCoverageSelection(cov, selection, coverageVehicles);
+    const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue);
     return sum + (resolved?.premium_amount || 0);
   }, 0);
   const docStamps = totalPremium * DOC_STAMPS_RATE;
@@ -867,13 +960,101 @@ export function PolicyApplication() {
 
   // A reused vehicle/address only makes sense for the party it came from —
   // start fresh whenever the selected customer/company actually changes.
+  // Skipped once when the renewalPrefill effect (below) is what just changed
+  // the party — it sets its own vehicles/addresses in that same pass, which
+  // this reset would otherwise immediately wipe out.
   useEffect(() => {
+    if (skipPartyResetRef.current) {
+      skipPartyResetRef.current = false;
+      return;
+    }
     setVehicles([{ ...emptyVehicle }]);
     lastCheckedPlateRef.current = {};
     setRiskAddress({ ...emptyAddress });
     setInsuredAddress({ ...emptyAddress });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedPartyId]);
+
+  // Applies renewalPrefill (see the component doc-comment above) once the
+  // catalog/party lists are loaded — mirrors exactly what the agent would do
+  // by hand (search-and-reuse the same customer/vehicles/addresses, pick the
+  // same product variant and coverages), rather than trusting the frozen
+  // document data on the issued Policy. appliedRenewalPrefillRef guards
+  // against re-running (and clobbering whatever the agent has since typed)
+  // if this component ever re-renders with a new-but-equivalent prefill
+  // object, since myCustomers/myCompanies are deliberately not dependencies
+  // here — by the time `loading` goes false they're already the final,
+  // loaded values this effect needs (loadParties() is part of the same
+  // Promise.all loading gates on), so depending on them too would just
+  // re-run this after every later loadParties() refresh (e.g. right after
+  // submitting) and stomp on the next in-progress filing.
+  useEffect(() => {
+    if (!renewalPrefill || loading || appliedRenewalPrefillRef.current) return;
+    appliedRenewalPrefillRef.current = true;
+    skipPartyResetRef.current = true;
+
+    setRenewedPolicyId(renewalPrefill.renewed_policy_id);
+    setRenewedPolicyNumber(renewalPrefill.renewed_policy_number);
+    setMinCoverageStartAt(toLocalDateTimeInput(renewalPrefill.min_coverage_start_at));
+    setCoverageStartAt(toLocalDateTimeInput(renewalPrefill.min_coverage_start_at));
+
+    setInsuredType(renewalPrefill.insured_type);
+    if (renewalPrefill.insured_type === "INDIVIDUAL") {
+      const match = myCustomers.find((c) => c.id === renewalPrefill.existing_customer_id);
+      if (match) {
+        setNewCustomer({
+          first_name: match.first_name,
+          last_name: match.last_name,
+          middle_name: match.middle_name || "",
+          email: match.email,
+          mobile_number: match.mobile_number || "",
+          birthday: match.birthday ? match.birthday.slice(0, 10) : "",
+          gender: match.gender || "",
+          existing_customer_id: match.id,
+        });
+      }
+    } else {
+      const match = myCompanies.find((c) => c.id === renewalPrefill.existing_company_id);
+      if (match) {
+        setNewCompany({
+          company_code: match.company_code,
+          company_name: match.company_name,
+          tin_no: match.tin_no || "",
+          email: match.email,
+          existing_company_id: match.id,
+        });
+      }
+    }
+
+    setClassId(renewalPrefill.class_id);
+    setVariantId(renewalPrefill.product_variant_id);
+
+    if (renewalPrefill.insured_address) {
+      setInsuredAddress({ ...emptyAddress, ...renewalPrefill.insured_address });
+    }
+    if (renewalPrefill.risk_address) {
+      setRiskAddress({ ...emptyAddress, ...renewalPrefill.risk_address });
+    }
+    if (Array.isArray(renewalPrefill.vehicles) && renewalPrefill.vehicles.length > 0) {
+      setVehicles(renewalPrefill.vehicles.map((v) => ({ ...emptyVehicle, ...v, reassign_owner: false })));
+    }
+
+    setCoveragePeriodDays(renewalPrefill.coverage_period_days || "");
+    const selections = {};
+    for (const c of renewalPrefill.coverages || []) {
+      // vehicle_indices can only ever be reconstructed as "applies to all
+      // vehicles" — a PolicyCoverage row doesn't retain which vehicle it was
+      // originally scoped to (see schema/policies.prisma) — the agent can
+      // re-narrow it here same as on any other application.
+      selections[c.coverage_id] = {
+        coverage_amount: c.coverage_amount,
+        premium_amount: c.premium_amount,
+        vehicle_indices: null,
+      };
+    }
+    setCoverageSelections(selections);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [renewalPrefill, loading]);
 
   // The form is strictly linear: each step only appears once everything above
   // it is filled out, in this order — Insured Party, Insured Address,
@@ -948,6 +1129,12 @@ export function PolicyApplication() {
       const next = { ...prev };
       if (next[coverageId]) {
         delete next[coverageId];
+      } else if (!coverageIsPriced(cov)) {
+        // Nothing to price it with yet (no rate/tiers configured under
+        // Settings → Coverage Pricing for this period) — never let it be
+        // selected in the first place rather than letting the agent fill
+        // out the whole form and find out only when the server rejects it.
+        return prev;
       } else {
         // vehicle_indices null = applies to the whole policy (every vehicle),
         // the default — an agent narrows it to specific vehicles only for a
@@ -1028,6 +1215,7 @@ export function PolicyApplication() {
                 year_model: found.year_model || "",
                 vehicle_type: found.vehicle_type || "",
                 color: found.color || "",
+                no_of_seats: found.no_of_seats ?? "",
                 estimated_value: found.estimated_value ?? "",
                 initial_assessment_date: found.initial_assessment_date || null,
                 existing_vehicle_id: found.id,
@@ -1057,6 +1245,7 @@ export function PolicyApplication() {
               year_model: vehicle.year_model || "",
               vehicle_type: vehicle.vehicle_type || "",
               color: vehicle.color || "",
+              no_of_seats: vehicle.no_of_seats ?? "",
               estimated_value: vehicle.estimated_value ?? "",
               initial_assessment_date: vehicle.initial_assessment_date || null,
               existing_vehicle_id: vehicle.id,
@@ -1085,6 +1274,10 @@ export function PolicyApplication() {
     }
     if (!coverageStartAt) {
       setError("Set the insured from date.");
+      return;
+    }
+    if (renewedPolicyId && minCoverageStartAt && coverageStartAt < minCoverageStartAt) {
+      setError(`This renews ${renewedPolicyNumber} — coverage cannot start before it expires on ${minCoverageStartAt.replace("T", " ")}.`);
       return;
     }
     if (!coveragePeriodDays) {
@@ -1121,13 +1314,15 @@ export function PolicyApplication() {
         setError(`Select which vehicle(s) ${cov.coverage_name} applies to, or apply it to the whole policy.`);
         return;
       }
-      const resolved = resolveCoverageSelection(cov, selection, coverageVehicles);
+      const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue);
       if (resolved.pending) {
         setError(
           cov.pricing_mode === "VALUE_PERCENTAGE"
             ? resolved.noTier
-              ? `No pricing tier is configured for ${cov.coverage_name} at this vehicle's current value.`
-              : `${cov.coverage_name} needs its vehicle's estimated value assessed before it can be priced.`
+              ? `No pricing tier is configured for ${cov.coverage_name} at this ${isProperty ? "address's" : "vehicle's"} current value.`
+              : isProperty
+                ? `${cov.coverage_name} needs the risk address's estimated value entered before it can be priced.`
+                : `${cov.coverage_name} needs its vehicle's estimated value assessed before it can be priced.`
             : cov.pricing_mode === "FLAT_TIER"
               ? `Select an insured value for ${cov.coverage_name}.`
               : `Fill out the coverage amount for ${cov.coverage_name}.`
@@ -1193,25 +1388,36 @@ export function PolicyApplication() {
         // vehicle's value). coverage_amount for FLAT_TIER is the tier key the
         // agent picked, also unmultiplied, so the server can look it up
         // among the coverage's actual tiers.
-        coverages: coverageEntries.map(([coverage_id, v]) => ({
-          coverage_id,
-          coverage_amount: Number(v.coverage_amount) || 0,
-          premium_amount: Number(v.premium_amount) || 0,
-          vehicle_indices: v.vehicle_indices ?? null,
-        })),
+        coverages: coverageEntries.map(([coverage_id, v]) => {
+          const cov = coverages.find((c) => c.id === coverage_id);
+          return {
+            coverage_id,
+            // VALUE_PERCENTAGE never collects a coverage_amount from the agent
+            // (the server computes its own from the vehicle/address value) —
+            // coverage_amount is only required by the schema to reject an
+            // unfilled-in PERCENTAGE/FLAT_TIER selection, so send a harmless
+            // positive placeholder here instead of the unset 0.
+            coverage_amount: cov?.pricing_mode === "VALUE_PERCENTAGE" ? 1 : Number(v.coverage_amount) || 0,
+            premium_amount: Number(v.premium_amount) || 0,
+            vehicle_indices: v.vehicle_indices ?? null,
+          };
+        }),
         vehicles: isMotor ? vehicles : undefined,
         risk_address: isProperty ? riskAddress : undefined,
         insured_address: insuredAddress,
         remarks: remarks || undefined,
         misc: miscAmount,
         send_policy_to_email: sendPolicyToEmail,
+        send_policy_to_email_on_approval: sendPolicyToEmailOnApproval,
         payment_method: paymentMethod,
         payment_remittance: paymentRemittance,
         bethel_payment_method_id: paymentRemittance === "DIRECT_TO_BETHEL" ? bethelPaymentMethodId : undefined,
+        renewed_policy_id: renewedPolicyId || undefined,
       };
 
       const application = await createPolicyApplication(token, payload);
       setSuccess(application);
+      onCreated?.(application);
 
       // Reset for the next application, but keep the just-used party available
       // (locked, as if it were an existing match) in case another one follows.
@@ -1233,25 +1439,24 @@ export function PolicyApplication() {
       setRemarks("");
       setMisc("");
       setSendPolicyToEmail(false);
+      setSendPolicyToEmailOnApproval(false);
       setPaymentMethod("");
       setPaymentRemittance("");
       setBethelPaymentMethodId("");
       setPreviewOpen(false);
       setConfirmChecked(false);
+      // A renewal's date floor was specific to this one filing — the next
+      // application in the same session (same party, "filing another one")
+      // shouldn't inherit it.
+      setRenewedPolicyId(null);
+      setRenewedPolicyNumber("");
+      setMinCoverageStartAt("");
       await loadParties();
     } catch (err) {
       setError(err.message);
     } finally {
       setSubmitting(false);
     }
-  }
-
-  if (loading) {
-    return (
-      <Container maxWidth="sm" sx={{ py: 6, display: "flex", justifyContent: "center" }}>
-        <CircularProgress />
-      </Container>
-    );
   }
 
   // Shared between the on-screen preview (inside the dialog) and the hidden
@@ -1274,7 +1479,7 @@ export function PolicyApplication() {
     vehicles: isMotor ? vehicles : [],
     coverages: Object.entries(coverageSelections).map(([id, sel]) => {
       const cov = coverages.find((c) => c.id === id);
-      const resolved = cov ? resolveCoverageSelection(cov, sel, coverageVehicles) : null;
+      const resolved = cov ? resolveCoverageSelection(cov, sel, coverageVehicles, riskAddressValue) : null;
       // Only worth spelling out which vehicle(s) a coverage applies to when
       // there's more than one on the application — otherwise it's implicit.
       const scopedToAll = sel.vehicle_indices === null || sel.vehicle_indices === undefined;
@@ -1291,8 +1496,11 @@ export function PolicyApplication() {
         clause: cov?.clause || "",
         amount: resolved?.coverage_amount || 0,
         premium: resolved?.premium_amount || 0,
+        pricing_mode: cov?.pricing_mode,
       };
     }),
+    deductibleRate: selectedVariant?.deductible_rate,
+    authorizedRepairLimitRate: selectedVariant?.authorized_repair_limit_rate,
     totalPremium,
     docStamps,
     vat,
@@ -1302,11 +1510,63 @@ export function PolicyApplication() {
     remarks,
   };
 
+  // Fetches the actual PDFKit-rendered document the moment the preview
+  // dialog opens, so the dialog shows the real exported file (not a
+  // separate HTML mockup) and "Print / Save as PDF" just reuses it — no
+  // second request. previewProps is deliberately not a dependency here:
+  // while the dialog is open the form behind it is inert, so it can't
+  // change anyway, and re-running this on every keystroke before it opens
+  // would just be wasted requests.
+  useEffect(() => {
+    if (!previewOpen) return;
+    let cancelled = false;
+    let objectUrl = null;
+    setPreviewPdfLoading(true);
+    setPreviewPdfError("");
+    previewApplicationPdf(token, previewProps)
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setPreviewPdfUrl(objectUrl);
+      })
+      .catch((err) => {
+        if (!cancelled) setPreviewPdfError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setPreviewPdfLoading(false);
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      setPreviewPdfUrl(null);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewOpen]);
+
+  // Every hook above must run on every render regardless of loading state —
+  // this early return has to come after all of them, or the hook count
+  // changes between the loading and loaded renders and React throws
+  // ("Rendered more hooks than during the previous render").
+  if (loading) {
+    return (
+      <Container maxWidth="sm" sx={{ py: 6, display: "flex", justifyContent: "center" }}>
+        <CircularProgress />
+      </Container>
+    );
+  }
+
   return (
-    <Container maxWidth="sm" sx={{ py: { xs: 3, sm: 6 } }}>
-      <Typography variant="h5" sx={{ mb: 3, fontWeight: 700 }}>
-        Policy Application
-      </Typography>
+    <Container maxWidth="sm" sx={{ py: onClose ? 0 : { xs: 3, sm: 6 } }}>
+      <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", mb: 3 }}>
+        <Typography variant="h5" sx={{ fontWeight: 700 }}>
+          Policy Application
+        </Typography>
+        {onClose && (
+          <IconButton onClick={onClose} aria-label="Close">
+            <CloseIcon />
+          </IconButton>
+        )}
+      </Box>
 
       {success && (
         <Alert severity="success" sx={{ mb: 2 }}>
@@ -1316,6 +1576,12 @@ export function PolicyApplication() {
       {error && (
         <Alert severity="error" sx={{ mb: 2 }}>
           {error}
+        </Alert>
+      )}
+      {renewedPolicyId && (
+        <Alert severity="info" sx={{ mb: 2 }}>
+          Renewing Policy <strong>{renewedPolicyNumber}</strong> — coverage cannot start before it expires on{" "}
+          {minCoverageStartAt.replace("T", " ")}.
         </Alert>
       )}
 
@@ -1899,6 +2165,7 @@ export function PolicyApplication() {
                                         year_model: value.year_model || "",
                                         vehicle_type: value.vehicle_type || "",
                                         color: value.color || "",
+                                        no_of_seats: value.no_of_seats ?? "",
                                         estimated_value: value.estimated_value ?? "",
                                         initial_assessment_date: value.initial_assessment_date || null,
                                         existing_vehicle_id: value.id,
@@ -2008,6 +2275,17 @@ export function PolicyApplication() {
                         />
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
+                        <TextField
+                          label="No. of seats"
+                          type="number"
+                          value={v.no_of_seats}
+                          onChange={(e) => updateVehicleField(index, "no_of_seats", e.target.value)}
+                          required
+                          fullWidth
+                          disabled={Boolean(v.existing_vehicle_id)}
+                        />
+                      </Grid>
+                      <Grid size={{ xs: 12, sm: 6 }}>
                         <NumberField
                           label="Estimated value"
                           value={v.estimated_value}
@@ -2107,6 +2385,7 @@ export function PolicyApplication() {
                           province: value.province || "",
                           postal_code: value.postal_code || "",
                           country: value.country || "Philippines",
+                          estimated_value: value.estimated_value ?? "",
                           existing_address_id: value.id,
                         });
                       }
@@ -2178,6 +2457,23 @@ export function PolicyApplication() {
                     disabled={Boolean(riskAddress.existing_address_id)}
                   />
                 </Grid>
+                <Grid size={{ xs: 12, sm: 6 }}>
+                  <NumberField
+                    label="Estimated value"
+                    value={riskAddress.estimated_value}
+                    onChange={(value) => setRiskAddress({ ...riskAddress, estimated_value: value })}
+                    fullWidth
+                    // Already on file? The value has to be entered/updated via
+                    // "Edit Details" like the rest of a reused address's fields.
+                    disabled={Boolean(riskAddress.existing_address_id)}
+                    helperText={
+                      riskAddress.existing_address_id
+                        ? "Already on file — use Edit Details to change it"
+                        : "Used to price VALUE_PERCENTAGE coverages for this property"
+                    }
+                    slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                  />
+                </Grid>
               </Grid>
             </Paper>
           )}
@@ -2223,9 +2519,11 @@ export function PolicyApplication() {
                     type="datetime-local"
                     value={coverageStartAt}
                     onChange={(e) => setCoverageStartAt(e.target.value)}
-                    slotProps={{ inputLabel: { shrink: true } }}
+                    slotProps={{ inputLabel: { shrink: true }, htmlInput: { min: minCoverageStartAt || undefined } }}
                     required
                     fullWidth
+                    error={Boolean(renewedPolicyId && minCoverageStartAt && coverageStartAt && coverageStartAt < minCoverageStartAt)}
+                    helperText={renewedPolicyId ? `Cannot be before ${renewedPolicyNumber}'s expiry` : undefined}
                   />
                 </Grid>
                 <Grid size={{ xs: 12, sm: 6 }}>
@@ -2270,8 +2568,9 @@ export function PolicyApplication() {
                   <Stack spacing={1.5} divider={<Divider />}>
                     {coverages.map((cov) => {
                       const selection = coverageSelections[cov.id];
-                      const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles) : null;
+                      const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue) : null;
                       const periodAllowed = coverageAllowsPeriod(cov, coveragePeriodDays);
+                      const isPriced = !periodAllowed || coverageIsPriced(cov);
                       return (
                         <Box key={cov.id}>
                           <FormControlLabel
@@ -2279,7 +2578,7 @@ export function PolicyApplication() {
                               <Checkbox
                                 checked={Boolean(selection)}
                                 onChange={() => toggleCoverage(cov.id)}
-                                disabled={!periodAllowed}
+                                disabled={!periodAllowed || !isPriced}
                               />
                             }
                             label={
@@ -2288,7 +2587,9 @@ export function PolicyApplication() {
                                 : cov.coverage_name) +
                               (!periodAllowed && coveragePeriodDays
                                 ? ` — not offered for the ${formatPeriodLabel(coveragePeriodDays).toLowerCase()} period`
-                                : "")
+                                : periodAllowed && !isPriced
+                                  ? " — pricing not yet configured for this period"
+                                  : "")
                             }
                           />
                           {selection && isMotor && vehicles.length > 1 && (
@@ -2476,7 +2777,17 @@ export function PolicyApplication() {
                     onChange={(e) => setSendPolicyToEmail(e.target.checked)}
                   />
                 }
-                label="Send the policy directly to the customer's email once issued"
+                label="Email the customer now that the application is under approval (with payment instructions)"
+              />
+
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={sendPolicyToEmailOnApproval}
+                    onChange={(e) => setSendPolicyToEmailOnApproval(e.target.checked)}
+                  />
+                }
+                label="Email the customer their approved policy once this application is approved"
               />
 
               <TextField
@@ -2656,6 +2967,7 @@ export function PolicyApplication() {
                     year_model: updated.year_model || "",
                     vehicle_type: updated.vehicle_type || "",
                     color: updated.color || "",
+                    no_of_seats: updated.no_of_seats ?? "",
                     estimated_value: updated.estimated_value ?? "",
                     initial_assessment_date: updated.initial_assessment_date || null,
                     existing_vehicle_id: updated.id,
@@ -2690,6 +3002,7 @@ export function PolicyApplication() {
         onClose={() => setEditingAddressField(null)}
         address={editingAddressField === "risk" ? riskAddress : editingAddressField === "insured" ? insuredAddress : null}
         token={token}
+        showEstimatedValue={editingAddressField === "risk"}
         onSaved={(updated) => {
           const updatedFields = {
             address_line_1: updated.address_line_1,
@@ -2699,6 +3012,7 @@ export function PolicyApplication() {
             province: updated.province,
             postal_code: updated.postal_code || "",
             country: updated.country || "Philippines",
+            estimated_value: updated.estimated_value ?? "",
             existing_address_id: updated.id,
           };
           if (editingAddressField === "risk") {
@@ -2713,9 +3027,9 @@ export function PolicyApplication() {
 
       <Dialog open={previewOpen} onClose={() => setPreviewOpen(false)} fullWidth maxWidth="md">
         <DialogTitle>Policy Schedule Preview</DialogTitle>
-        <DialogContent sx={{ bgcolor: "#e9e9e9" }}>
-          <Box sx={{ my: 2, display: "flex", justifyContent: "center" }}>
-            <PolicySchedulePreview {...previewProps} />
+        <DialogContent>
+          <Box sx={{ my: 1 }}>
+            <PdfViewer url={previewPdfUrl} loading={previewPdfLoading} error={previewPdfError} />
           </Box>
 
           <FormControlLabel
@@ -2736,7 +3050,7 @@ export function PolicyApplication() {
           <Button onClick={() => setPreviewOpen(false)} disabled={submitting}>
             Back to edit
           </Button>
-          <Button variant="outlined" onClick={() => window.print()}>
+          <Button variant="outlined" onClick={() => window.open(previewPdfUrl, "_blank")} disabled={!previewPdfUrl}>
             Print / Save as PDF
           </Button>
           <Button
@@ -2748,11 +3062,6 @@ export function PolicyApplication() {
           </Button>
         </DialogActions>
       </Dialog>
-
-      {/* Printed independently of the dialog — printing the dialog directly
-          drags in its own chrome/scroll container and produces blank pages. */}
-      {previewOpen &&
-        createPortal(<PolicySchedulePreview {...previewProps} />, document.getElementById("print-root"))}
     </Container>
   );
 }

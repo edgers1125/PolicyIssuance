@@ -10,6 +10,29 @@ const {
   updateUserSchema,
   updateRolePermissionsSchema,
 } = require("../schemas/users");
+const { sendMail } = require("../lib/mailer");
+
+// Shared by the new-user invite and the re-verification (email/password
+// change) cases below — both are "here's your link to set a password" mail,
+// just with different framing copy.
+async function sendInviteEmail(email, link, { isNew }) {
+  const intro = isNew
+    ? "An account has been created for you on Bethel Policy Issuance."
+    : "Your Bethel Policy Issuance account needs a new password before you can sign in again.";
+  const cta = isNew ? "Set your password to get started" : "Set your new password";
+
+  await sendMail({
+    to: email,
+    subject: isNew ? "You've been invited to Bethel Policy Issuance" : "Set your new Bethel Policy Issuance password",
+    html: `
+      <div style="font-family:Arial,sans-serif;color:#111">
+        <p>${intro}</p>
+        <p><a href="${link}">${cta}</a>. This link expires in 7 days.</p>
+      </div>
+    `,
+    text: [intro, "", `${cta}: ${link}`, "", "This link expires in 7 days."].join("\n"),
+  });
+}
 
 const router = express.Router();
 
@@ -289,11 +312,20 @@ router.post("/", requirePermission("MANAGE_USERS"), validateBody(createUserSchem
 
     const inviteLink = `${process.env.FRONTEND_URL}/set-password?token=${inviteToken}`;
 
-    // No email provider configured yet — log the link and return it so the
-    // invite flow can be tested end-to-end without real email delivery.
-    console.log(`[mock email] Invite link for ${email}: ${inviteLink}`);
+    // Always log the link too — the fallback the UI already relies on
+    // (a manually-shareable link) if SMTP is down or unconfigured, so a
+    // failed/unsent email doesn't block onboarding this user.
+    console.log(`[email] Invite link for ${email}: ${inviteLink}`);
 
-    res.status(201).json({ user, inviteLink });
+    let emailSent = false;
+    try {
+      await sendInviteEmail(email, inviteLink, { isNew: true });
+      emailSent = true;
+    } catch (mailErr) {
+      console.error(`[email] Failed to send invite email to ${email}:`, mailErr.message || mailErr);
+    }
+
+    res.status(201).json({ user, inviteLink, emailSent });
   } catch (err) {
     next(err);
   }
@@ -395,11 +427,21 @@ router.patch("/:id", requirePermission("MANAGE_USERS"), validateBody(updateUserS
       }
     }
 
+    let emailSent = false;
     if (inviteLink) {
-      console.log(`[mock email] Re-verification link for ${data.email || targetUser.email}: ${inviteLink}`);
+      const targetEmail = data.email || targetUser.email;
+      // Same fallback as user creation — always log the link so it can be
+      // shared manually if the send below fails.
+      console.log(`[email] Re-verification link for ${targetEmail}: ${inviteLink}`);
+      try {
+        await sendInviteEmail(targetEmail, inviteLink, { isNew: false });
+        emailSent = true;
+      } catch (mailErr) {
+        console.error(`[email] Failed to send re-verification email to ${targetEmail}:`, mailErr.message || mailErr);
+      }
     }
 
-    res.json({ message: "User updated", inviteLink });
+    res.json({ message: "User updated", inviteLink, emailSent });
   } catch (err) {
     next(err);
   }

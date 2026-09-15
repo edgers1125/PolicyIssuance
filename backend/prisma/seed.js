@@ -78,6 +78,27 @@ const PERMISSIONS = [
     name: "Manage Coverage Pricing",
     description: "Choose how a coverage is priced and manage its value/tier pricing tables",
   },
+  { code: "QUOTATION_TRACKER", name: "Quotation Tracker", description: "Access the Quotation Tracker page" },
+  {
+    code: "QUOTATION_TRACKER.CREATE_QUOTATION",
+    name: "Create Quotation",
+    description: "Create a quotation under your own agent profile",
+  },
+  {
+    code: "QUOTATION_TRACKER.VIEW_QUOTATION",
+    name: "View Quotations",
+    description: "See the quotations table, scoped to your own agent",
+  },
+  {
+    code: "QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION",
+    name: "Create Quotation (Any Agent)",
+    description: "Create a quotation under an agent_id other than your own",
+  },
+  {
+    code: "QUOTATION_TRACKER.ADMIN_VIEW_QUOTATION",
+    name: "View All Quotations",
+    description: "See every quotation in the system, regardless of agent",
+  },
 ];
 
 // Every seeded coverage is offered at these two standard periods — 6 months
