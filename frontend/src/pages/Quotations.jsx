@@ -22,6 +22,10 @@ import {
   IconButton,
   Tooltip,
   Chip,
+  TextField,
+  MenuItem,
+  InputAdornment,
+  Stack,
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import EmailIcon from "@mui/icons-material/Email";
@@ -29,6 +33,7 @@ import PrintIcon from "@mui/icons-material/Print";
 import EditIcon from "@mui/icons-material/Edit";
 import PublishIcon from "@mui/icons-material/Publish";
 import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
+import SearchIcon from "@mui/icons-material/Search";
 import { useAuth } from "../context/AuthContext";
 import { listQuotations, resendQuotationEmail, downloadQuotationPdf } from "../api/client";
 import { formatPHP } from "../utils/currency";
@@ -38,32 +43,40 @@ import { EditQuotationDialog } from "./EditQuotationDialog";
 import { SubmitQuotationDialog } from "./SubmitQuotationDialog";
 
 // A quotation's status is never stored — it's entirely derived from whether
-// it's been converted into a policy application (see GET /policy-quotations'
-// `status`/`converted_application_number` fields). FOR_ISSUANCE links
+// it's been converted into a policy application and, once it has, whether
+// that application has itself been approved into an issued Policy yet (see
+// GET /policy-quotations' `status`/`converted_application_number`/
+// `policy_number` fields). Each state renders as a short, fixed-width chip —
+// the actual application/policy number (which can run long) moves into a
+// Tooltip instead of the chip's own label, so the column never stretches the
+// row to fit it. FOR_ISSUANCE/POLICY_ISSUED are both clickable, linking
 // straight to the resulting application on the Policy Applications page
 // (?open=<id>, which that page reads to auto-open the same detail popup a
 // row click would) so an agent/approver can jump from "what was quoted" to
-// "what's actually being issued" in one click.
+// "what it's actually become" in one click — POLICY_ISSUED still opens the
+// same application popup (the issued Policy's own detail has no dedicated
+// deep link yet), just naming the Policy number instead in both the tooltip
+// and (via the application's own detail) the popup itself.
 function QuotationStatus({ row }) {
-  if (row.status !== "FOR_ISSUANCE") {
-    return <Chip size="small" label="Submitted" color="info" />;
+  if (row.status === "SUBMITTED") {
+    return <Chip size="small" label="Submitted" color="default" variant="outlined" />;
   }
-  // A single clickable pill (rather than a chip plus a separate plain-text
-  // link) so "for issuance" and "which application it became" read as one
-  // navigable unit, not two disconnected pieces of UI.
+  const isIssued = row.status === "POLICY_ISSUED";
   return (
-    <Chip
-      component={RouterLink}
-      to={`/policy-application?open=${row.converted_application_id}`}
-      onClick={(e) => e.stopPropagation()}
-      clickable
-      size="small"
-      color="success"
-      variant="outlined"
-      icon={<ArrowForwardIcon fontSize="small" />}
-      label={`For Issuance · ${row.converted_application_number}`}
-      sx={{ fontWeight: 600 }}
-    />
+    <Tooltip title={isIssued ? `Policy ${row.policy_number}` : `Application ${row.converted_application_number}`}>
+      <Chip
+        component={RouterLink}
+        to={`/policy-application?open=${row.converted_application_id}`}
+        onClick={(e) => e.stopPropagation()}
+        clickable
+        size="small"
+        color={isIssued ? "success" : "warning"}
+        variant="outlined"
+        icon={<ArrowForwardIcon fontSize="small" />}
+        label={isIssued ? "Policy Issued" : "For Issuance"}
+        sx={{ fontWeight: 600 }}
+      />
+    </Tooltip>
   );
 }
 
@@ -192,6 +205,34 @@ export function Quotations() {
   const [editingId, setEditingId] = useState(null);
   const [submittingId, setSubmittingId] = useState(null);
 
+  // Search/filter bar — server-side (see listQuotationsQuerySchema), search
+  // debounced so it doesn't re-fetch on every keystroke.
+  const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const hasActiveFilters = Boolean(search || statusFilter);
+
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      setDebouncedSearch(search.trim());
+      setPage(0);
+    }, 300);
+    return () => clearTimeout(timeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search]);
+
+  function handleStatusFilterChange(value) {
+    setStatusFilter(value);
+    setPage(0);
+  }
+
+  function clearFilters() {
+    setSearch("");
+    setDebouncedSearch("");
+    setStatusFilter("");
+    setPage(0);
+  }
+
   function loadQuotations() {
     if (!canView) {
       setLoading(false);
@@ -199,7 +240,7 @@ export function Quotations() {
     }
     setLoading(true);
     setError("");
-    return listQuotations(token, page + 1, rowsPerPage)
+    return listQuotations(token, page + 1, rowsPerPage, { search: debouncedSearch, status: statusFilter })
       .then((data) => {
         setRows(data.data);
         setTotal(data.total);
@@ -211,7 +252,7 @@ export function Quotations() {
   useEffect(() => {
     loadQuotations();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, page, rowsPerPage]);
+  }, [token, page, rowsPerPage, debouncedSearch, statusFilter]);
 
   return (
     <Container maxWidth="xl" sx={{ py: { xs: 3, sm: 6 } }}>
@@ -225,6 +266,39 @@ export function Quotations() {
           </Button>
         )}
       </Box>
+
+      {canView && (
+        <Paper sx={{ p: 2, borderRadius: 3, mb: 2 }}>
+          <Stack direction={{ xs: "column", sm: "row" }} spacing={2} sx={{ alignItems: { xs: "stretch", sm: "center" } }}>
+            <TextField
+              placeholder="Search by quotation # or insured name"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              size="small"
+              fullWidth
+              slotProps={{ input: { startAdornment: <InputAdornment position="start"><SearchIcon fontSize="small" /></InputAdornment> } }}
+            />
+            <TextField
+              select
+              label="Status"
+              value={statusFilter}
+              onChange={(e) => handleStatusFilterChange(e.target.value)}
+              size="small"
+              sx={{ minWidth: 200 }}
+            >
+              <MenuItem value="">All statuses</MenuItem>
+              <MenuItem value="SUBMITTED">Submitted</MenuItem>
+              <MenuItem value="FOR_ISSUANCE">For Issuance</MenuItem>
+              <MenuItem value="POLICY_ISSUED">Policy Issued</MenuItem>
+            </TextField>
+            {hasActiveFilters && (
+              <Button onClick={clearFilters} size="small">
+                Clear filters
+              </Button>
+            )}
+          </Stack>
+        </Paper>
+      )}
 
       {error && (
         <Alert severity="error" sx={{ mb: 2 }}>
@@ -247,11 +321,9 @@ export function Quotations() {
                   <TableCell>Quotation #</TableCell>
                   {isAdminView && <TableCell>Agent</TableCell>}
                   <TableCell>Insured</TableCell>
-                  <TableCell>Class</TableCell>
-                  <TableCell>Product Variant</TableCell>
+                  <TableCell>Class / Variant</TableCell>
                   <TableCell>Status</TableCell>
-                  <TableCell>Insured From</TableCell>
-                  <TableCell>Insured To</TableCell>
+                  <TableCell>Coverage Period</TableCell>
                   <TableCell align="right">Total Premium</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell align="right">Actions</TableCell>
@@ -260,8 +332,8 @@ export function Quotations() {
               <TableBody>
                 {rows.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={isAdminView ? 11 : 10} align="center" sx={{ py: 4, color: "text.secondary" }}>
-                      No quotations yet.
+                    <TableCell colSpan={isAdminView ? 9 : 8} align="center" sx={{ py: 4, color: "text.secondary" }}>
+                      {hasActiveFilters ? "No quotations match your search/filters." : "No quotations yet."}
                     </TableCell>
                   </TableRow>
                 ) : (
@@ -272,16 +344,21 @@ export function Quotations() {
                       onClick={() => setSelected({ id: q.id, quotationNumber: q.quotation_number })}
                       sx={{ cursor: "pointer" }}
                     >
-                      <TableCell>{q.quotation_number}</TableCell>
+                      <TableCell sx={{ fontFamily: "monospace", whiteSpace: "nowrap" }}>{q.quotation_number}</TableCell>
                       {isAdminView && <TableCell>{q.agent_name || q.agent_code}</TableCell>}
                       <TableCell>{q.insured_name || "—"}</TableCell>
-                      <TableCell>{q.class_name}</TableCell>
-                      <TableCell>{q.variant_name}</TableCell>
+                      <TableCell>
+                        <Typography variant="body2">{q.class_name}</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {q.variant_name}
+                        </Typography>
+                      </TableCell>
                       <TableCell>
                         <QuotationStatus row={q} />
                       </TableCell>
-                      <TableCell>{fmtDate(q.coverage_start_at)}</TableCell>
-                      <TableCell>{fmtDate(q.coverage_end_at)}</TableCell>
+                      <TableCell sx={{ whiteSpace: "nowrap" }}>
+                        {fmtDate(q.coverage_start_at)} – {fmtDate(q.coverage_end_at)}
+                      </TableCell>
                       <TableCell align="right">{formatPHP(q.total_premium)}</TableCell>
                       <TableCell>{fmtDate(q.created_at)}</TableCell>
                       <TableCell align="right" onClick={(e) => e.stopPropagation()}>

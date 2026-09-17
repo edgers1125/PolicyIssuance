@@ -34,9 +34,15 @@ export function AppLayout() {
 
   // While permissions are still loading, show only the items that don't need
   // one at all, so nothing the user lacks access to flashes on screen first.
-  const visibleNavItems = navItems.filter(
-    (item) => !item.permission || (permissions && permissions.includes(item.permission))
-  );
+  // item.permission is either one code or an array (holding ANY one is
+  // enough) — see RequirePermission.jsx's own note on why (e.g. Approvals'
+  // two independently-gated tabs).
+  const visibleNavItems = navItems.filter((item) => {
+    if (!item.permission) return true;
+    if (!permissions) return false;
+    const required = Array.isArray(item.permission) ? item.permission : [item.permission];
+    return required.some((p) => permissions.includes(p));
+  });
 
   function toggleDrawer() {
     if (isMobile) {

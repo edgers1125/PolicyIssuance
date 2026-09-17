@@ -19,6 +19,12 @@ model User {
   approvals        ApprovalHistory[]
   cancellations    CancellationHistory[]
   application_changes PolicyApplicationChange[]
+  accomplished_inlease_tasks InLeaseBacklog[]
+  created_endorsement_requests EndorsementRequest[]
+  endorsement_approvals        EndorsementApprovalHistory[]
+  // Manually-recorded AgentPayableTransaction rows (PAYMENT type) this user
+  // has entered — null on a system-computed POLICY_COMMISSION row.
+  recorded_payable_transactions AgentPayableTransaction[]
 
   @@index([status])
 }

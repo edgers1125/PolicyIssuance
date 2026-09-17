@@ -12,7 +12,9 @@ const {
 const { documentPreviewPropsSchema } = require("../schemas/policyIntakeShared");
 const { CLAUSE_CHANGE_TYPES } = require("../schemas/policyApplicationChanges");
 const { currentVehicleValue } = require("../lib/vehicleValue");
+const { getAccessibleAgentIds } = require("../lib/agent");
 const { round2, resolveCoverageRows } = require("../lib/coveragePricing");
+const { resolveVehicleRenewal, resolveRiskAddressRenewal } = require("../lib/policyConflicts");
 const { sendIfHttpError } = require("../lib/httpError");
 const { sendMail } = require("../lib/mailer");
 const { buildSubmissionEmailContent } = require("../lib/applicationEmails");
@@ -43,8 +45,23 @@ router.get("/", validateQuery(listApplicationsQuerySchema), async (req, res, nex
       return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
     }
 
-    const { page, page_size: pageSize } = req.query;
-    const where = { agent_id: user.agent_id };
+    const { page, page_size: pageSize, search, status, policy_type, class_id } = req.query;
+    const where = {
+      agent_id: user.agent_id,
+      ...(status ? { status } : {}),
+      ...(policy_type ? { policy_type } : {}),
+      ...(class_id ? { product_variant: { insurance_class_id: class_id } } : {}),
+      ...(search
+        ? {
+            OR: [
+              { application_number: { contains: search, mode: "insensitive" } },
+              { company_name_snapshot: { contains: search, mode: "insensitive" } },
+              { customer: { first_name: { contains: search, mode: "insensitive" } } },
+              { customer: { last_name: { contains: search, mode: "insensitive" } } },
+            ],
+          }
+        : {}),
+    };
 
     const [total, applications] = await Promise.all([
       prisma.policyApplication.count({ where }),
@@ -116,7 +133,6 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       risk_address,
       insured_address,
       remarks,
-      misc,
       send_policy_to_email,
       send_policy_to_email_on_approval,
       payment_method,
@@ -147,7 +163,7 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
 
     const productVariant = await prisma.productVariant.findUnique({
       where: { id: product_variant_id },
-      select: { insurance_class: { select: { class_name: true } } },
+      select: { misc_fee: true, insurance_class: { select: { class_name: true } } },
     });
     if (!productVariant) {
       return res.status(400).json({ error: "product_variant_id does not match an existing product" });
@@ -223,13 +239,17 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
     const agent = await prisma.agent.findUnique({ where: { id: user.agent_id } });
 
     // The Client Policies page's "Renew This Policy" action carries the
-    // source Policy's id along in the create payload — this is the only
-    // place policy_type ever becomes RENEWAL (see ApplicationPolicyType's
-    // own comment). Ownership and the "can't start before the current
-    // policy expires" rule are both business logic, not something the
-    // static schema can express, so both are checked here rather than in
-    // createApplicationSchema.
+    // source Policy's id along in the create payload — an explicit choice by
+    // the agent, checked here rather than in createApplicationSchema since
+    // ownership and the "can't start before the current policy expires" rule
+    // are business logic, not something a static schema can express. When
+    // omitted, the vehicle/risk-address history check below (which runs
+    // regardless — see resolveVehicleRenewal/resolveRiskAddressRenewal)
+    // auto-derives the same thing: an application is never allowed through
+    // when the asset it names already has a still-active or still-pending
+    // claim on it, whether or not the agent explicitly asked to renew.
     let policyType = "NEW_POLICY";
+    let finalRenewedPolicyId = null;
     if (renewed_policy_id) {
       const renewedPolicy = await prisma.policy.findUnique({
         where: { id: renewed_policy_id },
@@ -245,6 +265,7 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
         return res.status(400).json({ error: "Coverage cannot start before the current policy's expiry date" });
       }
       policyType = "RENEWAL";
+      finalRenewedPolicyId = renewed_policy_id;
     }
 
     // The agent can only file applications for their own connected customers/companies.
@@ -256,8 +277,12 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
         return res.status(403).json({ error: "This customer isn't connected to your agent account" });
       }
     } else {
-      const link = await prisma.companyAgent.findUnique({
-        where: { company_id_agent_id: { company_id, agent_id: agent.id } },
+      // Also allows a company connected via this agent's own parent agency
+      // (Agent.company_id -> Agent.linked_company_id) — see
+      // getAccessibleAgentIds()'s own comment and routes/agents.js's POST /.
+      const accessibleAgentIds = await getAccessibleAgentIds(agent.id);
+      const link = await prisma.companyAgent.findFirst({
+        where: { company_id, agent_id: { in: accessibleAgentIds } },
       });
       if (!link) {
         return res.status(403).json({ error: "This company isn't connected to your agent account" });
@@ -279,16 +304,23 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       endAt,
     });
 
-    // Total premium is just the sum of every coverage's (server-resolved)
-    // premium — statutory charges are computed from that, and misc is
-    // whatever flat amount was entered. The grand total is computable from
-    // these components (total_premium + doc_stamps + vat + lgt + misc)
-    // wherever it's needed, so it's never stored.
-    const totalPremium = round2(resolvedRows.reduce((sum, r) => sum + r.premium_amount, 0));
-    const docStamps = round2(totalPremium * DOC_STAMPS_RATE);
-    const vat = round2(totalPremium * VAT_RATE);
-    const lgt = round2(totalPremium * LGT_RATE);
-    const miscAmount = round2(misc || 0);
+    // Statutory charges are computed off the full sum of every coverage's
+    // (server-resolved) premium regardless of is_misc — that flag only moves
+    // where a coverage's own premium is *displayed* (Premium vs.
+    // Miscellaneous), never what it's taxed against. total_premium itself
+    // (the "Premium" line) only ever sums the non-is_misc rows; every
+    // is_misc-flagged coverage's premium is added to misc instead, on top of
+    // the chosen product_variant's own flat fee (ProductVariant.misc_fee).
+    // The grand total is computable from these components
+    // (total_premium + doc_stamps + vat + lgt + misc) wherever it's needed,
+    // so it's never stored.
+    const grossPremium = round2(resolvedRows.reduce((sum, r) => sum + r.premium_amount, 0));
+    const totalPremium = round2(resolvedRows.filter((r) => !r.is_misc).reduce((sum, r) => sum + r.premium_amount, 0));
+    const miscFromCoverages = round2(grossPremium - totalPremium);
+    const docStamps = round2(grossPremium * DOC_STAMPS_RATE);
+    const vat = round2(grossPremium * VAT_RATE);
+    const lgt = round2(grossPremium * LGT_RATE);
+    const miscAmount = round2((Number(productVariant.misc_fee) || 0) + miscFromCoverages);
 
     let companyNameSnapshot = null;
     if (insured_type === "CORPORATE") {
@@ -303,7 +335,28 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
     // this customer/company before the transaction, so a bad id fails cleanly with 400.
     if (className === "Motor") {
       for (const v of vehicles) {
-        if (!v.existing_vehicle_id) continue;
+        if (!v.existing_vehicle_id) {
+          // A vehicle entered as brand new must actually BE new — a plate
+          // number is meant to uniquely identify one real vehicle, and
+          // Vehicle.plate_number carries no DB-level uniqueness (unlike
+          // mv_file_no/engine_number/chassis_number), so without this check
+          // an agent could sidestep the plate-lookup/reassignment flow
+          // entirely just by not selecting the match, creating a second
+          // Vehicle row for a plate that's already on file and defeating the
+          // vehicle-history check below (which is keyed on vehicle_id).
+          if (v.plate_number) {
+            const duplicate = await prisma.vehicle.findFirst({
+              where: { plate_number: { equals: v.plate_number, mode: "insensitive" } },
+              select: { id: true },
+            });
+            if (duplicate) {
+              return res.status(409).json({
+                error: `Plate number ${v.plate_number} is already on file for another vehicle — look it up and reuse or reassign it instead of entering it as new`,
+              });
+            }
+          }
+          continue;
+        }
 
         if (v.reassign_owner) {
           // Confirmed by the agent as belonging to (or about to belong to) this
@@ -320,6 +373,28 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
         });
         if (!owned) {
           return res.status(400).json({ error: "One of the selected vehicles is not on file for this customer/company" });
+        }
+      }
+
+      // A vehicle carries its own fixed Motor product variant (see
+      // Vehicle.product_variant_id) — every vehicle on one filing has to
+      // resolve to the same variant as the filing's own product_variant_id,
+      // never a free per-line choice. For a reused vehicle this is whatever
+      // is already on file (only PATCH /vehicles/:id can actually change
+      // it); for a brand-new one it's whatever the agent picked for it.
+      for (const v of vehicles) {
+        const vehicleVariantId = v.existing_vehicle_id
+          ? (
+              await prisma.vehicle.findUnique({
+                where: { id: v.existing_vehicle_id },
+                select: { product_variant_id: true },
+              })
+            )?.product_variant_id
+          : v.product_variant_id;
+        if (vehicleVariantId !== product_variant_id) {
+          return res.status(400).json({
+            error: "All vehicles on this application must be insured under the same product variant",
+          });
         }
       }
     }
@@ -339,6 +414,31 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
       !(await isAddressOwned(insured_address.existing_address_id))
     ) {
       return res.status(400).json({ error: "The selected insured address is not on file for this customer/company" });
+    }
+
+    // The actual "no double-insuring the same asset" enforcement — runs
+    // regardless of whether the agent went through the manual "Renew This
+    // Policy" flow above, closing the gap where a fresh filing (plate
+    // lookup found a match, or an agent just typed in an already-known
+    // vehicle) would otherwise never be checked at all. A brand-new vehicle
+    // has no existing_vehicle_id yet, so only already-on-file ones can have
+    // history to check; same for a brand-new risk address. Throws (409) via
+    // sendIfHttpError below on an unresolved conflict; otherwise resolves
+    // which single policy (if any) this counts as continuing.
+    if (className === "Motor") {
+      const vehicleIdsForHistory = vehicles.filter((v) => v.existing_vehicle_id).map((v) => v.existing_vehicle_id);
+      const { renewedPolicyId: autoRenewedPolicyId } = await resolveVehicleRenewal(vehicleIdsForHistory, startAt, endAt);
+      if (!finalRenewedPolicyId && autoRenewedPolicyId) {
+        finalRenewedPolicyId = autoRenewedPolicyId;
+        policyType = "RENEWAL";
+      }
+    }
+    if (requiresRiskAddress && risk_address.existing_address_id) {
+      const { renewedPolicyId: autoRenewedPolicyId } = await resolveRiskAddressRenewal(risk_address.existing_address_id, startAt, endAt);
+      if (!finalRenewedPolicyId && autoRenewedPolicyId) {
+        finalRenewedPolicyId = autoRenewedPolicyId;
+        policyType = "RENEWAL";
+      }
     }
 
     const result = await prisma.$transaction(async (tx) => {
@@ -369,7 +469,7 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
           bethel_payment_method_id: bethelPaymentMethod ? bethelPaymentMethod.id : null,
           remarks: remarks || null,
           policy_type: policyType,
-          renewed_policy_id: renewed_policy_id || null,
+          renewed_policy_id: finalRenewedPolicyId,
         },
       });
 
@@ -402,7 +502,13 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
               await tx.vehicle.update({
                 where: { id: vehicleId },
                 data: {
-                  plate_number: v.plate_number,
+                  // plate_number is deliberately NOT included — it's the
+                  // vehicle's fixed real-world identifier and must stay
+                  // whatever it already is on file, even across a
+                  // reassignment to a new owner/agent. A genuine plate-number
+                  // correction only ever happens through the dedicated Edit
+                  // Vehicle action (PATCH /vehicles/:id), which re-checks
+                  // uniqueness when it changes — see that route.
                   mv_file_no: v.mv_file_no,
                   engine_number: v.engine_number,
                   chassis_number: v.chassis_number,
@@ -441,6 +547,7 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
                 mv_file_no: v.mv_file_no,
                 engine_number: v.engine_number,
                 chassis_number: v.chassis_number,
+                product_variant_id: v.product_variant_id,
                 make: v.make || null,
                 model: v.model || null,
                 year_model: v.year_model ?? null,
@@ -577,6 +684,10 @@ const applicationDetailSelect = {
   status: true,
   policy_type: true,
   renewed_policy_id: true,
+  // Own policy_number of whatever this application renews/replaces — feeds
+  // the "Renewing/Replacing:" line on the application PDF (see
+  // pdf/policyApplicationPdf.js).
+  renewed_policy: { select: { policy_number: true } },
   application_date: true,
   submission_date: true,
   coverage_start_at: true,
@@ -601,7 +712,6 @@ const applicationDetailSelect = {
       variant_name: true,
       insurance_class: { select: { class_name: true } },
       deductible_rate: true,
-      authorized_repair_limit_rate: true,
     },
   },
   vehicles: {
@@ -734,12 +844,12 @@ function toApplicationDetail(application) {
     product_variant_id: application.product_variant_id,
     variant_name: application.product_variant.variant_name,
     deductible_rate: application.product_variant.deductible_rate,
-    authorized_repair_limit_rate: application.product_variant.authorized_repair_limit_rate,
     agent_code: application.agent.agent_code,
     agent_name: application.agent.agent_name,
     status: application.status,
     policy_type: application.policy_type,
     renewed_policy_id: application.renewed_policy_id,
+    renewed_policy_number: application.renewed_policy?.policy_number || null,
     application_date: application.application_date,
     submission_date: application.submission_date,
     coverage_start_at: application.coverage_start_at,
@@ -786,7 +896,6 @@ function toPreviewProps(detail) {
     vehicles: detail.vehicles || [],
     coverages: detail.coverages || [],
     deductibleRate: detail.deductible_rate,
-    authorizedRepairLimitRate: detail.authorized_repair_limit_rate,
     totalPremium: detail.total_premium,
     docStamps: detail.doc_stamps,
     vat: detail.vat,
@@ -794,6 +903,7 @@ function toPreviewProps(detail) {
     misc: detail.misc,
     totalAmount: detail.total_amount,
     remarks: detail.remarks,
+    renewingPolicyNumber: detail.renewed_policy_number || undefined,
   };
 }
 

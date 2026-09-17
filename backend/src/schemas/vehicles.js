@@ -6,6 +6,13 @@ const updateVehicleSchema = z.object({
   mv_file_no: requiredString("mv_file_no"),
   engine_number: requiredString("engine_number"),
   chassis_number: requiredString("chassis_number"),
+  // The one legitimate way to actually change which Motor ProductVariant a
+  // vehicle is insured under (see Vehicle.product_variant_id) — the route
+  // re-validates it's still a Motor-class variant. Optional: omitted leaves
+  // the vehicle's current variant untouched (every other field here is
+  // always sent in full regardless), so an edit that isn't about the variant
+  // doesn't need to also resend it.
+  product_variant_id: z.string().uuid("product_variant_id must be a valid UUID").optional(),
   make: z.string().optional(),
   model: z.string().optional(),
   // The UI sends "" for a blank year field — treat that as omitted rather

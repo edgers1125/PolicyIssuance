@@ -33,6 +33,7 @@ import {
   listApplicationChanges,
   createApplicationChange,
   approveApplication,
+  rejectApplication,
 } from "../api/client";
 import { PdfViewer } from "./PdfViewer";
 
@@ -166,6 +167,12 @@ export function ApplicationReviewDialog({ applicationId, applicationNumber, toke
   const [cocNumber, setCocNumber] = useState("");
   const [saNumber, setSaNumber] = useState("");
 
+  const [rejectOpen, setRejectOpen] = useState(false);
+  const [rejectRemarks, setRejectRemarks] = useState("");
+  const [rejecting, setRejecting] = useState(false);
+  const [rejectError, setRejectError] = useState("");
+  const [rejectedFlag, setRejectedFlag] = useState(false);
+
   useEffect(() => {
     if (!applicationId) return;
     let cancelled = false;
@@ -216,6 +223,10 @@ export function ApplicationReviewDialog({ applicationId, applicationNumber, toke
     setFormOpen(false);
     setCocNumber("");
     setSaNumber("");
+    setRejectOpen(false);
+    setRejectRemarks("");
+    setRejectError("");
+    setRejectedFlag(false);
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [applicationId]);
@@ -374,7 +385,26 @@ export function ApplicationReviewDialog({ applicationId, applicationNumber, toke
     }
   }
 
+  async function handleReject() {
+    if (!rejectRemarks.trim()) {
+      setRejectError("Enter a reason for rejecting this application");
+      return;
+    }
+    setRejecting(true);
+    setRejectError("");
+    try {
+      await rejectApplication(token, applicationId, { remarks: rejectRemarks.trim() });
+      setRejectedFlag(true);
+      onApproved?.();
+    } catch (err) {
+      setRejectError(err.message);
+    } finally {
+      setRejecting(false);
+    }
+  }
+
   const isApproved = detail?.status === "APPROVED" || Boolean(approvedPolicy);
+  const isRejected = detail?.status === "REJECTED" || rejectedFlag;
   const isClauseType = CLAUSE_CHANGE_TYPES.has(changeType);
 
   return (
@@ -409,6 +439,7 @@ export function ApplicationReviewDialog({ applicationId, applicationNumber, toke
                     Approved — policy <strong>{approvedPolicy.policy_number}</strong> has been issued.
                   </Alert>
                 )}
+                {isRejected && !approvedPolicy && <Alert severity="error">This application has been rejected.</Alert>}
 
                 <Box>
                   <Typography variant="subtitle2" sx={{ fontWeight: 600, mb: 0.5 }}>
@@ -426,7 +457,7 @@ export function ApplicationReviewDialog({ applicationId, applicationNumber, toke
                     <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
                       Recorded Changes
                     </Typography>
-                    {!isApproved && (
+                    {!isApproved && !isRejected && (
                       <Button
                         size="small"
                         startIcon={<AddIcon />}
@@ -687,7 +718,7 @@ export function ApplicationReviewDialog({ applicationId, applicationNumber, toke
                   )}
                 </Box>
 
-                {!isApproved && (
+                {!isApproved && !isRejected && (
                   <>
                     <Divider />
                     <Box>
@@ -717,6 +748,50 @@ export function ApplicationReviewDialog({ applicationId, applicationNumber, toke
                         label="I have reviewed this application and every recorded change above, and confirm this policy should be approved."
                       />
                     </Box>
+
+                    <Divider />
+                    <Box>
+                      <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "center", mb: rejectOpen ? 1 : 0 }}>
+                        <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+                          Reject Application
+                        </Typography>
+                        <Button
+                          size="small"
+                          color="error"
+                          onClick={() => {
+                            setRejectError("");
+                            setRejectOpen((open) => !open);
+                          }}
+                        >
+                          {rejectOpen ? "Cancel" : "Reject..."}
+                        </Button>
+                      </Stack>
+                      {rejectOpen && (
+                        <Stack spacing={1.5}>
+                          {rejectError && <Alert severity="error">{rejectError}</Alert>}
+                          <TextField
+                            label="Reason for rejection"
+                            value={rejectRemarks}
+                            onChange={(e) => setRejectRemarks(e.target.value)}
+                            size="small"
+                            fullWidth
+                            multiline
+                            minRows={2}
+                          />
+                          <Box>
+                            <Button
+                              variant="contained"
+                              color="error"
+                              size="small"
+                              onClick={handleReject}
+                              disabled={rejecting || !rejectRemarks.trim()}
+                            >
+                              {rejecting ? "Rejecting..." : "Confirm Reject"}
+                            </Button>
+                          </Box>
+                        </Stack>
+                      )}
+                    </Box>
                   </>
                 )}
               </Stack>
@@ -726,7 +801,7 @@ export function ApplicationReviewDialog({ applicationId, applicationNumber, toke
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose}>Close</Button>
-        {!loading && !error && !isApproved && (
+        {!loading && !error && !isApproved && !isRejected && (
           <Button variant="contained" color="success" onClick={handleApprove} disabled={!confirmApprove || approving}>
             {approving ? "Approving..." : "Approve"}
           </Button>

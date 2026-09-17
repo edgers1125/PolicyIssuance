@@ -16,16 +16,22 @@ model ProductVariant {
   variant_name       String       @db.VarChar(255)
   description        String?
   status             RecordStatus
-  // Both null until an admin sets them via Settings → Vehicle Rates
-  // (routes/catalog.js's PATCH /product-variants/:id) — a Motor variant with
-  // neither configured simply omits the policy schedule's Deductible/
-  // Authorized Repair Limit line rather than computing off a 0 rate.
-  // deductible_rate multiplies a vehicle's current depreciated value to get
-  // its deductible; authorized_repair_limit_rate then multiplies *that*
-  // deductible to get the authorized repair limit — see pdf/theme.js's
-  // computeDeductibleFigures().
-  deductible_rate                Decimal?     @db.Decimal(7, 4)
-  authorized_repair_limit_rate   Decimal?     @db.Decimal(7, 4)
+  // Null until an admin sets it via Settings → Vehicle Rates
+  // (routes/catalog.js's PATCH /product-variants/:id) — a Motor variant
+  // without one simply omits the policy schedule's Deductible/Authorized
+  // Repair Limit line rather than computing off a 0 rate. Multiplies a
+  // vehicle's current depreciated value to get its deductible; the
+  // authorized repair limit is then just that deductible plus the fixed
+  // ₱500 towing amount — see pdf/theme.js's computeDeductibleFigures()/
+  // TOWING_AMOUNT (there is no longer a separate repair-limit rate).
+  deductible_rate    Decimal?     @db.Decimal(7, 4)
+  // The flat "Miscellaneous" charge on every application/quotation filed
+  // under this variant — no longer an amount the agent types in per filing
+  // (routes/policyApplications.js's/policyQuotations.js's POST / read this
+  // directly off the chosen product_variant instead of req.body). Null is
+  // treated as ₱0, same "unconfigured means nothing charged" convention as
+  // deductible_rate above, rather than blocking issuance.
+  misc_fee           Decimal?     @db.Decimal(18, 2)
   created_at         DateTime     @default(now())
   updated_at         DateTime     @updatedAt
 
@@ -34,6 +40,9 @@ model ProductVariant {
   policy_applications PolicyApplication[]
   policy_quotations   PolicyQuotation[]
   policies            Policy[]
+  // Every Vehicle currently insured under this variant — see
+  // Vehicle.product_variant_id (Motor-only; enforced at the application layer).
+  vehicles            Vehicle[]
 
   @@index([insurance_class_id])
 }
@@ -47,6 +56,15 @@ model ProductCoverage {
   clause             String              @db.Text
   status             RecordStatus
   pricing_mode       CoveragePricingMode @default(PERCENTAGE)
+  // Whether this coverage's own premium_amount is folded into the filing's
+  // Miscellaneous charge instead of its own Premium total — checked at
+  // POST /policy-applications/POST /policy-quotations (see
+  // lib/coveragePricing.js's resolveCoverageRows, which reads this straight
+  // off the coverage row) so the split between total_premium and misc always
+  // reflects the catalog's current flagging at filing time. Defaults false
+  // at the DB level only so the migration adding it didn't fail on rows
+  // already on file; every catalog-write route always sends an explicit value.
+  is_misc            Boolean             @default(false)
   created_at         DateTime            @default(now())
   updated_at         DateTime            @updatedAt
 
@@ -54,6 +72,9 @@ model ProductCoverage {
   application_coverages ApplicationCoverage[]
   quotation_coverages   QuotationCoverage[]
   policy_coverages      PolicyCoverage[]
+  // ADD_COVERAGE endorsement lines proposing to add this catalog coverage to
+  // an already-issued policy — see EndorsementChange.product_coverage_id.
+  endorsement_changes   EndorsementChange[]
   // Every pricing table (the coverage's own default pricing, and each
   // agent's override of it) hangs off CoverageAllowablePeriod instead of
   // pointing back here directly — that row already carries the coverage_id,
@@ -84,9 +105,13 @@ model CoverageAllowablePeriod {
   percentage_pricing           CoveragePercentageBasedPricing?
   value_percentage_tiers       CoverageValuePercentageTier[]
   tier_based_prices            CoverageTierBasedPricing[]
+  seats_based_pricing          CoverageSeatsBasedPricing?
+  seats_tier_prices            CoverageSeatsTierPricing[]
   agent_netrates               AgentNetrate[]
   agent_value_percentage_tiers AgentValuePercentageTier[]
   agent_flat_tier_prices       AgentFlatTierPricing[]
+  agent_seats_based_pricing    AgentSeatsBasedPricing[]
+  agent_seats_tier_prices      AgentSeatsTierPricing[]
 
   @@unique([coverage_id, coverage_in_days])
   @@index([coverage_id])
@@ -141,4 +166,40 @@ model CoverageTierBasedPricing {
   allowable_period CoverageAllowablePeriod @relation(fields: [coverage_allowable_period_id], references: [id])
 
   @@unique([coverage_allowable_period_id, coverage_amount])
+}
+
+// VEHICLE_SEATS_BASED mode: the agent picks one of this coverage's insured
+// -amount-per-occupant tiers (CoverageSeatsTierPricing below) as "Insured
+// amount for each occupant" — coverage_amount is then the vehicle's own
+// no_of_seats * that amount (e.g. 15 seats * ₱100,000 = ₱1,500,000 insured),
+// and the premium floor is (no_of_seats - threshold_seats) * that same
+// tier's own rate_per_excess_seat (e.g. a 7-seat threshold on a 15-seater
+// picking the ₱100,000/₱90-per-seat tier floors at 8 * ₱90 = ₱720).
+// threshold_seats itself is coverage-wide, not per-tier — 1:1 per allowable
+// period, same shape as CoveragePercentageBasedPricing, since there's a
+// single default (not a tiered value) to replace per period.
+model CoverageSeatsBasedPricing {
+  id                           String   @id @default(uuid()) @db.Uuid
+  coverage_allowable_period_id String   @unique @db.Uuid
+  threshold_seats              Int
+  created_at                   DateTime @default(now())
+  updated_at                   DateTime @updatedAt
+
+  allowable_period CoverageAllowablePeriod @relation(fields: [coverage_allowable_period_id], references: [id])
+}
+
+// VEHICLE_SEATS_BASED mode's own tier menu — same shape/role as
+// CoverageTierBasedPricing (FLAT_TIER's own menu), just keyed by
+// insured_amount_per_occupant instead of a flat coverage_amount, and paired
+// with this tier's own rate_per_excess_seat rather than one fixed price.
+model CoverageSeatsTierPricing {
+  id                           String   @id @default(uuid()) @db.Uuid
+  coverage_allowable_period_id String   @db.Uuid
+  insured_amount_per_occupant  Decimal  @db.Decimal(18, 2)
+  rate_per_excess_seat         Decimal  @db.Decimal(10, 2)
+  created_at                   DateTime @default(now())
+
+  allowable_period CoverageAllowablePeriod @relation(fields: [coverage_allowable_period_id], references: [id])
+
+  @@unique([coverage_allowable_period_id, insured_amount_per_occupant])
 }

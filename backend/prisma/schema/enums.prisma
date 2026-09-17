@@ -29,6 +29,17 @@ enum InsuredType {
   CORPORATE
 }
 
+// Whether an Agent record is one specific person or an agency/company that
+// can have several individual employees under it — see Agent.company_id.
+// A CORPORATE agent never itself has a company_id (single level, no chains,
+// same depth as Customer.company_id -> Company); an INDIVIDUAL agent's own
+// company_id is optional and mutable, so an agent can be reassigned into or
+// out of a company at any time without touching historical records.
+enum AgentType {
+  INDIVIDUAL
+  CORPORATE
+}
+
 enum ApplicationStatus {
   DRAFT
   SUBMITTED
@@ -89,10 +100,16 @@ enum AddressRole {
 //    agent-entered amount or margin.
 //  - FLAT_TIER: the agent picks one of this coverage's fixed
 //    coverage-amount/price pairs — also no agent margin.
+//  - VEHICLE_SEATS_BASED: fully computed from the targeted vehicle's own
+//    no_of_seats against this coverage's threshold_seats/rate_per_excess_seat
+//    — charges nothing at or below the threshold, then rate_per_excess_seat
+//    for every seat beyond it. No agent-entered amount or margin, same as
+//    VALUE_PERCENTAGE.
 enum CoveragePricingMode {
   PERCENTAGE
   VALUE_PERCENTAGE
   FLAT_TIER
+  VEHICLE_SEATS_BASED
 }
 
 // Whether a filed PolicyApplication is a brand-new policy or a renewal of an
@@ -105,6 +122,16 @@ enum CoveragePricingMode {
 enum ApplicationPolicyType {
   NEW_POLICY
   RENEWAL
+}
+
+// What kind of in-lease task a backlog row represents — see InLeaseBacklog
+// (policies.prisma). FOR_UPLOAD is auto-created for every policy at issuance
+// (POST /policy-approval/:id/approve); FOR_ENDORSEMENT is auto-created for a
+// policy's own endorsement request once it's approved (POST /endorsements/:id/
+// approve), linked via InLeaseBacklog.endorsement_request_id.
+enum InLeaseTaskType {
+  FOR_UPLOAD
+  FOR_ENDORSEMENT
 }
 
 // What an approver can record against a PolicyApplication after it's been
@@ -128,4 +155,90 @@ enum ApplicationChangeType {
   VEHICLE_CHASSIS_NO
   ADD_CLAUSE
   REMOVE_CLAUSE
+}
+
+// EndorsementRequest's own lifecycle — SUBMITTED (filed by an agent, still
+// editable by an approver), then terminal APPROVED/REJECTED, same
+// once-decided-never-reopened shape as ApplicationStatus's own
+// APPROVED/REJECTED pair.
+enum EndorsementStatus {
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+// Whether an EndorsementRequest is an ordinary correction batch (the default
+// — one or more EndorsementChange lines, filed and reviewed the normal way)
+// or a policy cancellation, filed from the same Client Policies composer but
+// carrying exactly one CANCEL_POLICY change and no others — see
+// EndorsementRequest.request_type and routes/endorsements.js's POST /.
+enum EndorsementRequestType {
+  CORRECTION
+  CANCELLATION
+}
+
+// What one EndorsementChange line can amend against an already-issued
+// Policy. Most values are still the same "corrections only" scope as
+// ApplicationChangeType (no financial effect — POLICY_EFFECTIVE_DATE stands
+// in for that enum's own INSURED_FROM_DATE, since the thing being shifted
+// here is Policy.effective_date/expiry_date; EDIT_CLAUSE is the renamed-from-
+// ADD_CLAUSE fine-print-only edit). Three values ARE financial, and are what
+// AgentPayableTransactionType.ENDORSEMENT/CANCELLED_POLICY actually get
+// created for (see that enum's own note and routes/endorsements.js's
+// POST /:id/approve):
+//  - ADD_COVERAGE: prices a brand-new PolicyCoverage line through the same
+//    lib/coveragePricing.js engine an application/quotation uses, and — once
+//    approved — actually creates that PolicyCoverage row (the one
+//    EndorsementChangeType that writes a real row rather than only folding
+//    at read time) and credits the agent's payable ledger with its margin.
+//  - REMOVE_CLAUSE: repurposed from "remove text from a coverage's clause"
+//    (that's EDIT_CLAUSE's job now) to "remove this coverage line entirely"
+//    — soft-deletes the targeted PolicyCoverage (PolicyCoverage.removed_at)
+//    and debits the agent's payable ledger by the margin that coverage had
+//    contributed.
+//  - CANCEL_POLICY: the sole change on a CANCELLATION-type request (see
+//    EndorsementRequestType) — sets Policy.policy_status to CANCELLED and
+//    debits the agent's payable ledger with a day-prorated refund of the
+//    commission already earned on this policy.
+// See EndorsementChange (endorsements.prisma) for the extra columns
+// ADD_COVERAGE/REMOVE_CLAUSE need to carry their own pricing.
+enum EndorsementChangeType {
+  POLICY_EFFECTIVE_DATE
+  INSURED_NAME_DETAILS
+  INSURED_ADDRESS_DETAILS
+  VEHICLE_MODEL
+  VEHICLE_MV_FILE
+  VEHICLE_PLATE_NO
+  VEHICLE_TYPE
+  VEHICLE_MAKE
+  VEHICLE_COLOR
+  VEHICLE_ENGINE_NO
+  VEHICLE_CHASSIS_NO
+  EDIT_CLAUSE
+  REMOVE_CLAUSE
+  ADD_COVERAGE
+  CANCEL_POLICY
+}
+
+// What kind of entry sits in an agent's payable ledger — see
+// AgentPayableTransaction (agentPayables.prisma). ISSUANCE always credits the
+// balance (amount >= 0); PAYMENT always debits it (amount <= 0). ENDORSEMENT
+// can now run either direction — positive when an EndorsementChangeType.
+// ADD_COVERAGE line is approved (credits the new coverage's own margin),
+// negative when a REMOVE_CLAUSE line is approved (debits the removed
+// coverage's own margin) — see that enum's own comment; the DB CHECK
+// constraint (see the migration that added it, and the one that relaxed it)
+// only restricts ENDORSEMENT's sign insofar as it must be nonzero-consistent
+// with which of those two lines produced it, not a fixed direction the way
+// ISSUANCE/PAYMENT are. CANCELLED_POLICY always debits it (amount <= 0) —
+// created only by a CANCEL_POLICY endorsement's approval, as a day-prorated
+// refund of whatever commission (ISSUANCE + ENDORSEMENT credits) this policy
+// had already earned; see routes/endorsements.js's own proration comment.
+// See AgentPayableTransaction's own note on why this is a signed amount on
+// one table rather than a separate payments table.
+enum AgentPayableTransactionType {
+  ISSUANCE
+  ENDORSEMENT
+  CANCELLED_POLICY
+  PAYMENT
 }

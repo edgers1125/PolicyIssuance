@@ -17,6 +17,9 @@ const policyQuotationsRouter = require("./routes/policyQuotations");
 const policyApprovalRouter = require("./routes/policyApproval");
 const policiesRouter = require("./routes/policies");
 const paymentMethodsRouter = require("./routes/paymentMethods");
+const inLeaseBacklogRouter = require("./routes/inLeaseBacklog");
+const endorsementsRouter = require("./routes/endorsements");
+const accountingRouter = require("./routes/accounting");
 const { requireAuth } = require("./middleware/auth");
 const { getUserPermissionCodes } = require("./middleware/permissions");
 
@@ -39,6 +42,9 @@ app.use("/policy-quotations", policyQuotationsRouter);
 app.use("/policy-approval", policyApprovalRouter);
 app.use("/policies", policiesRouter);
 app.use("/payment-methods", paymentMethodsRouter);
+app.use("/inlease-backlogs", inLeaseBacklogRouter);
+app.use("/endorsements", endorsementsRouter);
+app.use("/accounting", accountingRouter);
 
 app.get("/me", requireAuth, async (req, res, next) => {
   try {

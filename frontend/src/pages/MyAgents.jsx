@@ -25,6 +25,11 @@ import {
   Checkbox,
   FormControlLabel,
   FormGroup,
+  FormControl,
+  FormLabel,
+  RadioGroup,
+  Radio,
+  Autocomplete,
   Divider,
   InputAdornment,
 } from "@mui/material";
@@ -34,11 +39,15 @@ import DeleteIcon from "@mui/icons-material/Delete";
 import { useAuth } from "../context/AuthContext";
 import {
   listAgents,
+  createAgent,
   listCoverages,
+  listCompaniesForAgentLinking,
   getAgentNetrates,
   updateAgentNetrates,
   updateAgentValueTiers,
   updateAgentFlatTiers,
+  updateAgentSeatsBasedPricing,
+  updateAgentSeatTiers,
 } from "../api/client";
 import { formatPHP, formatRate } from "../utils/currency";
 import { formatPeriodLabel } from "../utils/coveragePeriods";
@@ -62,6 +71,13 @@ function toFlatTierForm(tiers) {
   return (tiers || []).map((t) => ({ coverage_amount: String(t.coverage_amount), coverage_price: String(t.coverage_price) }));
 }
 
+function toSeatTierForm(tiers) {
+  return (tiers || []).map((t) => ({
+    insured_amount_per_occupant: String(t.insured_amount_per_occupant),
+    rate_per_excess_seat: String(t.rate_per_excess_seat),
+  }));
+}
+
 function sameTiers(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
@@ -74,6 +90,12 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  // Set once GET /:id/netrates comes back — true when this agent is an
+  // individual linked to a company (Agent.company_id), meaning what's shown
+  // below is the company's own rates (see lib/coveragePricing.js's own
+  // resolution) and editing here is disabled; the company's own row is
+  // where these actually get changed.
+  const [inheritedFrom, setInheritedFrom] = useState(null);
 
   // Every allowable period across every coverage, loaded once per dialog
   // open — rates/tiers below are only ever edited one period at a time, same
@@ -97,9 +119,10 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
     setError("");
     getAgentNetrates(token, agent.id, coveragePeriodDays)
       .then((data) => {
-        setCoverages(data);
+        setCoverages(data.coverages);
+        setInheritedFrom(data.is_inherited ? data.company_name : null);
         const initial = {};
-        for (const cov of data) {
+        for (const cov of data.coverages) {
           if (cov.pricing_mode === "PERCENTAGE" && cov.override) {
             initial[cov.id] = {
               netrate_percent: (Number(cov.override.netrate) * 100).toString(),
@@ -110,6 +133,11 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
             initial[cov.id] = { tiers: toValueTierForm(cov.value_percentage_override) };
           } else if (cov.pricing_mode === "FLAT_TIER" && cov.flat_tier_override) {
             initial[cov.id] = { tiers: toFlatTierForm(cov.flat_tier_override) };
+          } else if (cov.pricing_mode === "VEHICLE_SEATS_BASED" && (cov.seats_pricing_override || cov.seat_tier_override)) {
+            initial[cov.id] = {
+              threshold_seats: cov.seats_pricing_override ? String(cov.seats_pricing_override.threshold_seats) : "",
+              tiers: toSeatTierForm(cov.seat_tier_override),
+            };
           }
         }
         setOverrides(initial);
@@ -125,6 +153,8 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
         delete next[cov.id];
       } else if (cov.pricing_mode === "PERCENTAGE") {
         next[cov.id] = { netrate_percent: "", maximum_coverage: "" };
+      } else if (cov.pricing_mode === "VEHICLE_SEATS_BASED") {
+        next[cov.id] = { threshold_seats: "", tiers: [] };
       } else {
         next[cov.id] = { tiers: [] };
       }
@@ -143,6 +173,10 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
       const cov = coverages.find((c) => c.id === coverageId);
       if (cov.pricing_mode === "PERCENTAGE" && o.netrate_percent === "") {
         setError("Enter a net rate for every custom-rate coverage, or uncheck it.");
+        return;
+      }
+      if (cov.pricing_mode === "VEHICLE_SEATS_BASED" && o.threshold_seats === "") {
+        setError(`Enter a seat threshold for ${cov.coverage_name}, or uncheck it.`);
         return;
       }
       if (cov.pricing_mode !== "PERCENTAGE" && (!o.tiers || o.tiers.length === 0)) {
@@ -168,6 +202,35 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
       // changed (added, edited, or removed) rather than every coverage.
       for (const cov of coverages) {
         if (cov.pricing_mode === "PERCENTAGE") continue;
+
+        if (cov.pricing_mode === "VEHICLE_SEATS_BASED") {
+          const currentThreshold = overrides[cov.id]?.threshold_seats ?? null;
+          const originalThreshold = cov.seats_pricing_override ? String(cov.seats_pricing_override.threshold_seats) : null;
+          if (currentThreshold !== originalThreshold) {
+            await updateAgentSeatsBasedPricing(
+              token,
+              agent.id,
+              cov.id,
+              coveragePeriodDays,
+              currentThreshold === null || currentThreshold === "" ? null : Number(currentThreshold)
+            );
+          }
+
+          const currentTiers = overrides[cov.id]?.tiers || [];
+          const originalTiers = toSeatTierForm(cov.seat_tier_override);
+          if (!sameTiers(currentTiers, originalTiers)) {
+            const tiers = currentTiers.map((t) => ({
+              insured_amount_per_occupant: Number(t.insured_amount_per_occupant),
+              rate_per_excess_seat: Number(t.rate_per_excess_seat),
+            }));
+            const amounts = tiers.map((t) => t.insured_amount_per_occupant);
+            if (new Set(amounts).size !== amounts.length) {
+              throw new Error(`Each tier for ${cov.coverage_name} needs a distinct insured amount per occupant`);
+            }
+            await updateAgentSeatTiers(token, agent.id, cov.id, coveragePeriodDays, tiers);
+          }
+          continue;
+        }
 
         const current = overrides[cov.id]?.tiers || [];
         const original =
@@ -216,11 +279,18 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
           </Box>
         ) : (
           <Stack spacing={2}>
-            <Typography variant="body2" color="text.secondary">
-              Every coverage is available to every agent under its default pricing. Check a coverage below
-              to give this agent a custom pricing setup instead — a net rate for a percentage-based
-              coverage, or a whole custom tier table for a value/flat-tier one.
-            </Typography>
+            {inheritedFrom ? (
+              <Alert severity="info">
+                This agent's rates are managed via <strong>{inheritedFrom}</strong> — shown below read-only.
+                Open {inheritedFrom}'s own "Manage product access &amp; rates" to change them.
+              </Alert>
+            ) : (
+              <Typography variant="body2" color="text.secondary">
+                Every coverage is available to every agent under its default pricing. Check a coverage below
+                to give this agent a custom pricing setup instead — a net rate for a percentage-based
+                coverage, or a whole custom tier table for a value/flat-tier one.
+              </Typography>
+            )}
 
             <TextField
               select
@@ -254,6 +324,7 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
                               <Checkbox
                                 checked={Boolean(override)}
                                 onChange={() => toggleOverride(cov)}
+                                disabled={Boolean(inheritedFrom)}
                                 sx={{ pt: 0.25 }}
                               />
                             }
@@ -267,12 +338,21 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
                                     "Priced by vehicle-value tiers — check to give this agent a custom tier table"}
                                   {cov.pricing_mode === "FLAT_TIER" &&
                                     "Priced by fixed insured-value tiers — check to give this agent a custom tier menu"}
+                                  {cov.pricing_mode === "VEHICLE_SEATS_BASED" &&
+                                    (cov.standard_seats_pricing
+                                      ? `${cov.standard_seats_pricing.threshold_seats}-seat threshold, ${formatPHP(cov.standard_seats_pricing.rate_per_excess_seat)}/excess seat`
+                                      : "Priced by vehicle seat count — check to give this agent a custom threshold/rate")}
                                 </Typography>
                               </>
                             }
                           />
                           {override && (
-                            <OverrideFields cov={cov} override={override} onChange={updateOverrideField} />
+                            <OverrideFields
+                              cov={cov}
+                              override={override}
+                              onChange={updateOverrideField}
+                              disabled={Boolean(inheritedFrom)}
+                            />
                           )}
                         </Box>
                       );
@@ -287,16 +367,18 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
         )}
       </DialogContent>
       <DialogActions>
-        <Button onClick={onClose}>Cancel</Button>
-        <Button variant="contained" onClick={handleSave} disabled={submitting || loading}>
-          {submitting ? "Saving..." : "Save changes"}
-        </Button>
+        <Button onClick={onClose}>{inheritedFrom ? "Close" : "Cancel"}</Button>
+        {!inheritedFrom && (
+          <Button variant="contained" onClick={handleSave} disabled={submitting || loading}>
+            {submitting ? "Saving..." : "Save changes"}
+          </Button>
+        )}
       </DialogActions>
     </Dialog>
   );
 }
 
-function OverrideFields({ cov, override, onChange }) {
+function OverrideFields({ cov, override, onChange, disabled }) {
   if (cov.pricing_mode === "PERCENTAGE") {
     return (
       <Stack direction="row" spacing={2} sx={{ pl: 4, mt: 1.5 }}>
@@ -308,6 +390,7 @@ function OverrideFields({ cov, override, onChange }) {
           size="small"
           fullWidth
           required
+          disabled={disabled}
           slotProps={{ input: { endAdornment: <InputAdornment position="end">%</InputAdornment> } }}
         />
         <NumberField
@@ -316,6 +399,7 @@ function OverrideFields({ cov, override, onChange }) {
           onChange={(v) => onChange(cov.id, "maximum_coverage", v)}
           size="small"
           fullWidth
+          disabled={disabled}
           helperText="Blank = product standard"
           slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
         />
@@ -329,10 +413,15 @@ function OverrideFields({ cov, override, onChange }) {
           { key: "min_value", label: "Minimum value", adornment: "₱", position: "start" },
           { key: "rate_percentage", label: "Rate", adornment: "%", position: "end" },
         ]
-      : [
-          { key: "coverage_amount", label: "Insured value", adornment: "₱", position: "start" },
-          { key: "coverage_price", label: "Price", adornment: "₱", position: "start" },
-        ];
+      : cov.pricing_mode === "VEHICLE_SEATS_BASED"
+        ? [
+            { key: "insured_amount_per_occupant", label: "Insured amount/occupant", adornment: "₱", position: "start" },
+            { key: "rate_per_excess_seat", label: "Rate per excess seat", adornment: "₱", position: "start" },
+          ]
+        : [
+            { key: "coverage_amount", label: "Insured value", adornment: "₱", position: "start" },
+            { key: "coverage_price", label: "Price", adornment: "₱", position: "start" },
+          ];
   const emptyRow = Object.fromEntries(fields.map((f) => [f.key, ""]));
 
   function updateRow(index, key, value) {
@@ -354,6 +443,16 @@ function OverrideFields({ cov, override, onChange }) {
 
   return (
     <Stack spacing={1.5} sx={{ pl: 4, mt: 1.5 }}>
+      {cov.pricing_mode === "VEHICLE_SEATS_BASED" && (
+        <NumberField
+          label="Seat threshold"
+          value={override.threshold_seats}
+          onChange={(v) => onChange(cov.id, "threshold_seats", v)}
+          size="small"
+          disabled={disabled}
+          slotProps={{ input: { endAdornment: <InputAdornment position="end">seats</InputAdornment> } }}
+        />
+      )}
       {override.tiers.map((tier, index) => (
         <Stack key={index} direction="row" spacing={1} alignItems="center">
           {fields.map((f) => (
@@ -364,6 +463,7 @@ function OverrideFields({ cov, override, onChange }) {
               onChange={(v) => updateRow(index, f.key, v)}
               size="small"
               fullWidth
+              disabled={disabled}
               slotProps={{
                 input:
                   f.position === "start"
@@ -372,15 +472,264 @@ function OverrideFields({ cov, override, onChange }) {
               }}
             />
           ))}
-          <IconButton size="small" onClick={() => removeRow(index)}>
+          <IconButton size="small" onClick={() => removeRow(index)} disabled={disabled}>
             <DeleteIcon fontSize="small" />
           </IconButton>
         </Stack>
       ))}
-      <Button size="small" startIcon={<AddIcon />} onClick={addRow} sx={{ alignSelf: "flex-start" }}>
+      <Button size="small" startIcon={<AddIcon />} onClick={addRow} sx={{ alignSelf: "flex-start" }} disabled={disabled}>
         Add tier
       </Button>
     </Stack>
+  );
+}
+
+// The My Agents page's "Add Agent" action — registers either an INDIVIDUAL
+// agent (an actual person; optionally an employee of an existing company,
+// picked from the same roster) or a CORPORATE one (an agency/company, with
+// no login of its own — see Agent.company_id's schema comment). Agents are
+// only ever created here now; connecting a person to one for login purposes
+// happens on Manage Users' own Agent picker instead (see GET /users/agents).
+const emptyNewCompanyForm = { company_code: "", company_name: "", tin_no: "", email: "" };
+
+function AddAgentDialog({ open, onClose, agents, token, onCreated }) {
+  const [agentType, setAgentType] = useState("INDIVIDUAL");
+  const [agentCode, setAgentCode] = useState("");
+  const [agentName, setAgentName] = useState("");
+  const [workEmail, setWorkEmail] = useState("");
+  const [company, setCompany] = useState(null);
+  // Only meaningful for agentType CORPORATE — whether (and how) this agency
+  // is backed by a real insured-party Company record (Agent.linked_company_id).
+  // A company agent must always be backed by one — "existing" or "new" only,
+  // no "none" option (backend's own createAgentSchema refinement enforces
+  // this too, so this is UI-side symmetry, not the only guard).
+  const [companyLinkMode, setCompanyLinkMode] = useState("existing");
+  const [linkableCompanies, setLinkableCompanies] = useState([]);
+  const [linkedCompany, setLinkedCompany] = useState(null);
+  const [newCompanyForm, setNewCompanyForm] = useState(emptyNewCompanyForm);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+
+  const companyOptions = agents.filter((a) => a.agent_type === "CORPORATE");
+
+  // Loaded once per dialog open — every ACTIVE company not already backing
+  // another agency (see GET /companies/for-agent-linking).
+  useEffect(() => {
+    if (!open) return;
+    listCompaniesForAgentLinking(token)
+      .then(setLinkableCompanies)
+      .catch((err) => setError(err.message));
+  }, [open, token]);
+
+  function reset() {
+    setAgentType("INDIVIDUAL");
+    setAgentCode("");
+    setAgentName("");
+    setWorkEmail("");
+    setCompany(null);
+    setCompanyLinkMode("existing");
+    setLinkedCompany(null);
+    setNewCompanyForm(emptyNewCompanyForm);
+    setError("");
+  }
+
+  function handleClose() {
+    reset();
+    onClose();
+  }
+
+  // A CORPORATE agent is always backed by a real Company record now (either
+  // branch — select existing or create new, no "none" option) and takes its
+  // own name/code/work email straight from that company instead of the
+  // caller retyping the same three values twice — see routes/agents.js's
+  // POST /, which derives (and overrides whatever's sent for) these fields
+  // server-side whenever linked_company_id/new_company is present. Omitted
+  // here entirely in that case, same "let the server derive it" convention
+  // as every other field this app computes rather than trusts the client for.
+  const isCompanyBacked = agentType === "CORPORATE";
+  // What the Company name/Agent code/Work email fields display (read-only)
+  // while company-backed — mirrors whichever company record is currently
+  // selected/being filled in below, live, so the mapping is visible before
+  // submitting rather than only discovered afterward.
+  const derivedAgentName = companyLinkMode === "existing" ? linkedCompany?.company_name || "" : newCompanyForm.company_name;
+  const derivedAgentCode = companyLinkMode === "existing" ? linkedCompany?.company_code || "" : newCompanyForm.company_code;
+  const derivedWorkEmail = companyLinkMode === "existing" ? linkedCompany?.email || "" : newCompanyForm.email;
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError("");
+    setSubmitting(true);
+    try {
+      await createAgent(token, {
+        agent_type: agentType,
+        agent_code: isCompanyBacked ? undefined : agentCode,
+        agent_name: isCompanyBacked ? undefined : agentName,
+        work_email: isCompanyBacked ? undefined : workEmail,
+        company_id: agentType === "INDIVIDUAL" && company ? company.id : undefined,
+        linked_company_id:
+          agentType === "CORPORATE" && companyLinkMode === "existing" && linkedCompany ? linkedCompany.id : undefined,
+        new_company:
+          agentType === "CORPORATE" && companyLinkMode === "new"
+            ? {
+                company_code: newCompanyForm.company_code,
+                company_name: newCompanyForm.company_name,
+                tin_no: newCompanyForm.tin_no || undefined,
+                email: newCompanyForm.email,
+              }
+            : undefined,
+      });
+      onCreated();
+      handleClose();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onClose={handleClose} fullWidth maxWidth="sm">
+      <DialogTitle>Add Agent</DialogTitle>
+      <Box component="form" onSubmit={handleSubmit}>
+        <DialogContent>
+          <Stack spacing={2}>
+            <FormControl>
+              <FormLabel>Agent type</FormLabel>
+              <RadioGroup
+                row
+                value={agentType}
+                onChange={(e) => {
+                  setAgentType(e.target.value);
+                  setCompany(null);
+                }}
+              >
+                <FormControlLabel value="INDIVIDUAL" control={<Radio />} label="Individual" />
+                <FormControlLabel value="CORPORATE" control={<Radio />} label="Company" />
+              </RadioGroup>
+            </FormControl>
+
+            <TextField
+              label={agentType === "CORPORATE" ? "Company name" : "Full name"}
+              value={isCompanyBacked ? derivedAgentName : agentName}
+              onChange={(e) => setAgentName(e.target.value)}
+              required={!isCompanyBacked}
+              disabled={isCompanyBacked}
+              helperText={isCompanyBacked ? "Taken from the company record below" : undefined}
+              fullWidth
+              autoFocus={!isCompanyBacked}
+            />
+            <TextField
+              label="Agent code"
+              value={isCompanyBacked ? derivedAgentCode : agentCode}
+              onChange={(e) => setAgentCode(e.target.value)}
+              required={!isCompanyBacked}
+              disabled={isCompanyBacked}
+              helperText={isCompanyBacked ? "Taken from the company record below" : undefined}
+              fullWidth
+            />
+            <TextField
+              label="Work email"
+              type="email"
+              value={isCompanyBacked ? derivedWorkEmail : workEmail}
+              onChange={(e) => setWorkEmail(e.target.value)}
+              required={!isCompanyBacked}
+              disabled={isCompanyBacked}
+              helperText={isCompanyBacked ? "Taken from the company record below" : undefined}
+              fullWidth
+            />
+
+            {agentType === "INDIVIDUAL" && (
+              <Autocomplete
+                options={companyOptions}
+                getOptionLabel={(o) => o.agent_name}
+                value={company}
+                onChange={(e, value) => setCompany(value)}
+                renderInput={(params) => (
+                  <TextField
+                    {...params}
+                    label="Company (optional)"
+                    helperText="Leave blank if this agent isn't part of a company — their own rates apply. Set it later, or here, to have this agent's pricing follow the company's instead."
+                  />
+                )}
+              />
+            )}
+
+            {agentType === "CORPORATE" && (
+              <FormControl>
+                <FormLabel>Insured-party company record</FormLabel>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
+                  Every company agent must be backed by a real Company record, so it (and every agent employed under
+                  it) can also be selected as an insured party when filing an application or quotation.
+                </Typography>
+                <RadioGroup
+                  row
+                  value={companyLinkMode}
+                  onChange={(e) => {
+                    setCompanyLinkMode(e.target.value);
+                    setLinkedCompany(null);
+                    setNewCompanyForm(emptyNewCompanyForm);
+                  }}
+                >
+                  <FormControlLabel value="existing" control={<Radio />} label="Select existing" />
+                  <FormControlLabel value="new" control={<Radio />} label="Create new" />
+                </RadioGroup>
+              </FormControl>
+            )}
+
+            {agentType === "CORPORATE" && companyLinkMode === "existing" && (
+              <Autocomplete
+                options={linkableCompanies}
+                getOptionLabel={(o) => `${o.company_name} (${o.company_code})`}
+                value={linkedCompany}
+                onChange={(e, value) => setLinkedCompany(value)}
+                renderInput={(params) => <TextField {...params} label="Company" required />}
+              />
+            )}
+
+            {agentType === "CORPORATE" && companyLinkMode === "new" && (
+              <Stack spacing={2}>
+                <TextField
+                  label="Company code"
+                  value={newCompanyForm.company_code}
+                  onChange={(e) => setNewCompanyForm({ ...newCompanyForm, company_code: e.target.value })}
+                  required
+                  fullWidth
+                />
+                <TextField
+                  label="Company name"
+                  value={newCompanyForm.company_name}
+                  onChange={(e) => setNewCompanyForm({ ...newCompanyForm, company_name: e.target.value })}
+                  required
+                  fullWidth
+                />
+                <TextField
+                  label="TIN (optional)"
+                  value={newCompanyForm.tin_no}
+                  onChange={(e) => setNewCompanyForm({ ...newCompanyForm, tin_no: e.target.value })}
+                  fullWidth
+                />
+                <TextField
+                  label="Company email"
+                  type="email"
+                  value={newCompanyForm.email}
+                  onChange={(e) => setNewCompanyForm({ ...newCompanyForm, email: e.target.value })}
+                  required
+                  fullWidth
+                />
+              </Stack>
+            )}
+
+            {error && <Alert severity="error">{error}</Alert>}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleClose}>Cancel</Button>
+          <Button type="submit" variant="contained" disabled={submitting}>
+            {submitting ? "Creating..." : "Create agent"}
+          </Button>
+        </DialogActions>
+      </Box>
+    </Dialog>
   );
 }
 
@@ -388,10 +737,12 @@ export function MyAgents() {
   const { token, permissions } = useAuth();
   const canViewPremiums = permissions?.includes("MANAGE_AGENTS.VIEW_AGENT_PREMIUMS");
   const canManageRates = permissions?.includes("MANAGE_AGENTS.MANAGE_AGENT_RATES");
+  const canAddAgent = permissions?.includes("MANAGE_AGENTS.ADD_AGENT");
   const [agents, setAgents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [managingAgent, setManagingAgent] = useState(null);
+  const [addOpen, setAddOpen] = useState(false);
 
   function loadAgents() {
     return listAgents(token).then(setAgents);
@@ -407,9 +758,16 @@ export function MyAgents() {
 
   return (
     <Container maxWidth="xl" sx={{ py: { xs: 3, sm: 6 } }}>
-      <Typography variant="h5" sx={{ mb: 3, fontWeight: 700 }}>
-        My Agents
-      </Typography>
+      <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 3 }}>
+        <Typography variant="h5" sx={{ fontWeight: 700 }}>
+          My Agents
+        </Typography>
+        {canAddAgent && (
+          <Button variant="contained" startIcon={<AddIcon />} onClick={() => setAddOpen(true)}>
+            Add Agent
+          </Button>
+        )}
+      </Box>
 
       {error && (
         <Alert severity="error" sx={{ mb: 2 }}>
@@ -428,6 +786,7 @@ export function MyAgents() {
               <TableRow>
                 <TableCell>Agent code</TableCell>
                 <TableCell>Name</TableCell>
+                <TableCell>Type</TableCell>
                 <TableCell>Work email</TableCell>
                 <TableCell>Status</TableCell>
                 {canViewPremiums && (
@@ -446,7 +805,21 @@ export function MyAgents() {
                   <TableCell>
                     <Chip label={a.agent_code} size="small" />
                   </TableCell>
-                  <TableCell>{a.agent_name}</TableCell>
+                  <TableCell>
+                    {a.agent_name}
+                    {a.company_name && (
+                      <Typography variant="caption" color="text.secondary" component="div">
+                        Under {a.company_name}
+                      </Typography>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    <Chip
+                      label={a.agent_type === "CORPORATE" ? "Company" : "Individual"}
+                      size="small"
+                      variant="outlined"
+                    />
+                  </TableCell>
                   <TableCell>{a.work_email}</TableCell>
                   <TableCell>
                     <Chip
@@ -464,7 +837,7 @@ export function MyAgents() {
                   {canManageRates && (
                     <TableCell>
                       {a.special_rates.length > 0 ? (
-                        <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap sx={{ maxWidth: 260 }}>
+                        <Stack direction="row" spacing={0.5} useFlexGap sx={{ maxWidth: 260, flexWrap: "wrap" }}>
                           {a.special_rates.map((r) => (
                             <Chip
                               key={r.coverage_code}
@@ -502,6 +875,14 @@ export function MyAgents() {
         agent={managingAgent}
         token={token}
         onSaved={loadAgents}
+      />
+
+      <AddAgentDialog
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        agents={agents}
+        token={token}
+        onCreated={loadAgents}
       />
     </Container>
   );

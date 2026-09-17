@@ -25,13 +25,23 @@ model Policy {
   // reasoning as PolicyCoverage's own *_snapshot fields below.
   class_name_snapshot    String       @db.VarChar(100)
   variant_name_snapshot  String       @db.VarChar(255)
-  // Frozen off ProductVariant.deductible_rate/authorized_repair_limit_rate —
-  // these feed the policy schedule's Section III Deductible/Authorized
-  // Repair Limit line (see pdf/theme.js's computeDeductibleFigures()); a
-  // later change via Settings → Vehicle Rates must never alter what an
-  // already-issued policy's re-exported PDF shows.
-  deductible_rate_snapshot              Decimal? @db.Decimal(7, 4)
-  authorized_repair_limit_rate_snapshot Decimal? @db.Decimal(7, 4)
+  // Frozen off ProductVariant.deductible_rate — feeds the policy schedule's
+  // Section III Deductible/Authorized Repair Limit line (see
+  // pdf/theme.js's computeDeductibleFigures()/TOWING_AMOUNT — the repair
+  // limit is just this deductible plus the fixed ₱500 towing amount, no
+  // separate rate); a later change via Settings → Vehicle Rates must never
+  // alter what an already-issued policy's re-exported PDF shows.
+  deductible_rate_snapshot Decimal? @db.Decimal(7, 4)
+  // Frozen off the source PolicyApplication's own renewed_policy relation at
+  // approval time (its own policy_number, if the application was filed as a
+  // RENEWAL) — feeds the "Renewing/Replacing:" line printed above the Period
+  // of Insurance on the issued policy PDF (see pdf/policyPdf.js). Never a
+  // live join back to that other Policy row, same "an issued policy reads
+  // exactly as issued, forever" reasoning as every other *_snapshot field
+  // here — that other policy's own number can't change anyway (policy_number
+  // has no edit path), but this keeps the pattern consistent and avoids an
+  // extra join on every read.
+  renewed_policy_number_snapshot String? @db.VarChar(50)
   issue_date             DateTime     @db.Date
   effective_date         DateTime     @db.Date
   expiry_date            DateTime     @db.Date
@@ -46,8 +56,14 @@ model Policy {
   lgt                    Decimal      @db.Decimal(18, 2)
   misc                   Decimal      @db.Decimal(18, 2)
   remarks                String?
-  added_to_inlease       Boolean      @default(false)
-  inlease_added_at       DateTime?
+  // Set once a CANCEL_POLICY endorsement is approved against this policy
+  // (routes/endorsements.js's POST /:id/approve) — the cancellation
+  // endorsement's own effective_date, i.e. the date this policy actually
+  // stopped being in force (not the approval timestamp). Null for every
+  // policy that's never been cancelled. policy_status is what every read
+  // path actually branches on; this is just the "when" a CANCELLED policy
+  // needs alongside it.
+  cancelled_at           DateTime?    @db.Date
   created_at             DateTime     @default(now())
   updated_at             DateTime     @updatedAt
 
@@ -62,15 +78,64 @@ model Policy {
   coverages            PolicyCoverage[]
   cancellation_history CancellationHistory[]
   // Every PolicyApplication filed as a renewal of this policy (Client
-  // Policies page's "Renew This Policy" action) — see
-  // PolicyApplication.renewed_policy_id.
+  // Policies page's "Renew This Policy" action, or auto-detected — see
+  // lib/policyConflicts.js) — see PolicyApplication.renewed_policy_id.
   renewal_applications PolicyApplication[] @relation("PolicyRenewals")
+  // Every PolicyQuotation auto-detected as continuing this policy's vehicle/
+  // risk address — see PolicyQuotation.renewed_policy_id.
+  renewal_quotations   PolicyQuotation[]   @relation("QuotationRenewals")
+  // Replaces the old added_to_inlease/inlease_added_at flat booleans — see
+  // InLeaseBacklog below. One row per required in-lease task on this policy
+  // (today, just a single FOR_UPLOAD row created at issuance).
+  in_lease_backlogs    InLeaseBacklog[]
+  // Every endorsement ever filed against this policy, agent-submitted and
+  // approver-reviewed — see EndorsementRequest (endorsements.prisma). Never
+  // mutates this Policy row itself; only an APPROVED one's own changes are
+  // folded back in wherever this policy's detail/PDF is read (see
+  // routes/policies.js's applyEndorsementsToPolicyDetail()).
+  endorsement_requests EndorsementRequest[]
+  // The POLICY_COMMISSION ledger entry credited to the filing agent when this
+  // policy was approved — see AgentPayableTransaction (agentPayables.prisma).
+  payable_transactions AgentPayableTransaction[]
 
   @@index([policy_status])
   @@index([customer_id])
   @@index([company_id])
   @@index([agent_id])
   @@index([expiry_date])
+}
+
+// One required in-lease task against one Policy — replaces the old flat
+// Policy.added_to_inlease/inlease_added_at booleans, which could only ever
+// track a single yes/no per policy. A row is created unaccomplished
+// (accomplished_by_user_id/accomplished_at both null) and stays that way
+// until someone processes it from the In-Lease Backlogs page
+// (routes/inLeaseBacklog.js's POST /:id/accomplish) — "undo"
+// (POST /:id/undo) clears both back to null. A policy's own in-lease status
+// is never stored directly; it's derived by the route from whether every one
+// of its rows here has been accomplished (see toInLeaseSummary()).
+model InLeaseBacklog {
+  id                      String           @id @default(uuid()) @db.Uuid
+  policy_id               String           @db.Uuid
+  type                    InLeaseTaskType
+  // Set only on a FOR_ENDORSEMENT row (null for FOR_UPLOAD) — which
+  // EndorsementRequest this task exists for, so the In-Lease Backlogs page's
+  // detail dialog knows which endorsement's own changes to render in
+  // copyable format. Created by routes/endorsements.js's POST /:id/approve,
+  // alongside marking that request APPROVED.
+  endorsement_request_id  String?          @db.Uuid
+  accomplished_by_user_id String?          @db.Uuid
+  accomplished_at         DateTime?
+  created_at              DateTime         @default(now())
+  updated_at              DateTime         @updatedAt
+
+  policy              Policy              @relation(fields: [policy_id], references: [id])
+  endorsement_request EndorsementRequest? @relation(fields: [endorsement_request_id], references: [id])
+  accomplished_by     User?               @relation(fields: [accomplished_by_user_id], references: [id])
+
+  @@index([policy_id])
+  @@index([accomplished_by_user_id])
+  @@index([endorsement_request_id])
 }
 
 model PolicyVehicle {
@@ -98,6 +163,10 @@ model PolicyVehicle {
 
   policy  Policy  @relation(fields: [policy_id], references: [id])
   vehicle Vehicle @relation(fields: [vehicle_id], references: [id])
+
+  // Endorsement lines correcting one of this vehicle's own snapshot fields
+  // (VEHICLE_* EndorsementChangeType values) — see EndorsementChange.
+  endorsement_changes EndorsementChange[]
 
   @@index([policy_id])
 }
@@ -140,11 +209,55 @@ model PolicyCoverage {
   pricing_mode_snapshot  CoveragePricingMode
   coverage_amount        Decimal  @db.Decimal(18, 2)
   premium_amount         Decimal  @db.Decimal(18, 2)
+  // The agent's own margin on this line (premium_amount minus what's owed to
+  // Bethel) and the rate that produced it — mirrors ApplicationCoverage's own
+  // columns of the same name, added here specifically so an ADD_COVERAGE/
+  // REMOVE_CLAUSE endorsement has something to compute its
+  // AgentPayableTransaction off of without a live re-price. Null on every
+  // PolicyCoverage row created before this column existed (issuance never
+  // used to persist it, since a Policy's charges were frozen forever and
+  // nothing ever needed to remove a coverage from one) — routes/endorsements.js
+  // falls back to treating premium_amount itself as the margin for such a
+  // row (payable_to_bethel unknown => assume 0) rather than blocking removal
+  // of a legacy coverage entirely.
+  payable_to_bethel      Decimal? @db.Decimal(18, 2)
+  applied_rate           Decimal? @db.Decimal(10, 6)
+  // Frozen off ProductCoverage.is_misc at the moment this row was created —
+  // needed so a Policy's total_premium/misc split can be correctly
+  // recomputed after an ADD_COVERAGE/REMOVE_CLAUSE endorsement without a live
+  // join back to a catalog value that might have changed since. Defaults
+  // false at the DB level only so the migration adding it didn't fail on
+  // rows already on file (backfilled from the live ProductCoverage.is_misc
+  // in that same migration); every new write always sends an explicit value.
+  is_misc_snapshot       Boolean  @default(false)
+  // Only ever set on a row created by an ADD_COVERAGE endorsement — which of
+  // the policy's own vehicles this coverage was priced against (null = not
+  // vehicle-scoped, e.g. Property, or a PERCENTAGE/FLAT_TIER coverage that
+  // doesn't need one). A coverage created at issuance never sets this — see
+  // GET /policies/:id/renewal-prefill's own note on why an original
+  // PolicyCoverage row can't retain a vehicle scope.
+  policy_vehicle_id      String?  @db.Uuid
+  // Audit pointers only (not Prisma relations Prisma needs to traverse) —
+  // which EndorsementRequest created this row via ADD_COVERAGE, or soft-
+  // deleted it via REMOVE_CLAUSE. removed_at non-null means this line no
+  // longer counts toward the policy's own current coverages/charges (every
+  // read filters it out — see routes/policies.js's policyDetailSelect) but
+  // is kept on file rather than hard-deleted, same append-only-history
+  // reasoning as every other audit trail in this schema.
+  added_by_endorsement_id   String?   @db.Uuid
+  removed_at                DateTime?
+  removed_by_endorsement_id String?   @db.Uuid
   created_at             DateTime @default(now())
   updated_at             DateTime @updatedAt
 
   policy   Policy          @relation(fields: [policy_id], references: [id])
   coverage ProductCoverage @relation(fields: [coverage_id], references: [id])
 
+  // Endorsement lines amending this coverage line's own clause text
+  // (EDIT_CLAUSE) or removing it entirely (REMOVE_CLAUSE) — see
+  // EndorsementChange.
+  endorsement_changes EndorsementChange[]
+
   @@index([policy_id])
+  @@index([removed_at])
 }

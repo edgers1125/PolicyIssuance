@@ -36,6 +36,17 @@ const PERMISSIONS = [
     description: "See each agent's special rates and edit them",
   },
   {
+    code: "MANAGE_AGENTS.ADD_AGENT",
+    name: "Add Agent",
+    description: "Register a new individual agent or agent company",
+  },
+  { code: "MANAGE_ACCOUNTING", name: "Accounting", description: "Access the Accounting page" },
+  {
+    code: "MANAGE_ACCOUNTING.RECORD_PAYMENT",
+    name: "Record Payment",
+    description: "Record a payment made against an agent's payable balance",
+  },
+  {
     code: "CREATE_APPLICATION",
     name: "Policy Application",
     description: "Create and manage policy applications",
@@ -46,11 +57,31 @@ const PERMISSIONS = [
     description: "Submit and issue policy applications",
   },
   { code: "VIEW_POLICIES", name: "My Policies", description: "View issued policies" },
+  {
+    code: "VIEW_POLICIES.CREATE_ENDORSEMENT",
+    name: "Create Endorsement Request",
+    description: "File an endorsement request against one of your own issued policies",
+  },
   { code: "MANAGE_INLEASE", name: "In-Lease Backlogs", description: "Manage the In-Lease backlog queue" },
+  {
+    code: "MANAGE_INLEASE.MARK_DONE",
+    name: "Mark In-Lease Task Done",
+    description: "Submit an in-lease backlog task as accomplished",
+  },
+  {
+    code: "MANAGE_INLEASE.MARK_UNDONE",
+    name: "Mark In-Lease Task Undone",
+    description: "Revert an accomplished in-lease backlog task back to pending",
+  },
   {
     code: "APPROVE_APPLICATION",
     name: "Policy Approval",
     description: "Approve or reject policy applications",
+  },
+  {
+    code: "APPROVE_ENDORSEMENT",
+    name: "Endorsement Approval",
+    description: "Review, amend, approve, or reject endorsement requests against issued policies",
   },
   { code: "MANAGE_SETTINGS", name: "Settings", description: "Access system settings" },
   {
@@ -77,6 +108,36 @@ const PERMISSIONS = [
     code: "MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING",
     name: "Manage Coverage Pricing",
     description: "Choose how a coverage is priced and manage its value/tier pricing tables",
+  },
+  {
+    code: "MANAGE_SETTINGS.MANAGE_PRODUCTS",
+    name: "Manage Products",
+    description: "Access the Manage Products page",
+  },
+  {
+    code: "MANAGE_SETTINGS.MANAGE_PRODUCTS.ADD_CLASS",
+    name: "Add/Remove Insurance Classes",
+    description: "Create and remove insurance classes",
+  },
+  {
+    code: "MANAGE_SETTINGS.MANAGE_PRODUCTS.ADD_VARIANT",
+    name: "Add/Remove Product Variants",
+    description: "Create and remove product variants",
+  },
+  {
+    code: "MANAGE_SETTINGS.MANAGE_PRODUCTS.ADD_COVERAGE",
+    name: "Add/Remove Coverages",
+    description: "Create and remove coverages",
+  },
+  {
+    code: "MANAGE_SETTINGS.MANAGE_PRODUCTS.EDIT_DETAILS",
+    name: "Edit Product Details",
+    description: "Rename or re-code an insurance class, product variant, or coverage",
+  },
+  {
+    code: "MANAGE_SETTINGS.MANAGE_PRODUCTS.EDIT_PRICING",
+    name: "Edit Pricing (Manage Products)",
+    description: "Edit a product variant's rates and a coverage's pricing mode/rate/tiers from the Manage Products page",
   },
   { code: "QUOTATION_TRACKER", name: "Quotation Tracker", description: "Access the Quotation Tracker page" },
   {

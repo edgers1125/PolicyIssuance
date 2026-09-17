@@ -219,21 +219,24 @@ function labelValue(doc, label, value, x, y, width) {
   doc.font(FONT_BODY).text(` ${value || "—"}`);
 }
 
+// Towing is a fixed amount at every stage (quotation, application, and
+// issued policy alike) — never a rate, never configurable — per the same
+// "Authorized Repair Limit = Deductible + Towing" formula below.
+const TOWING_AMOUNT = 500;
+
 // Section III's Deductible/Authorized Repair Limit figures for one
 // VALUE_PERCENTAGE coverage row. `amount` is that row's own coverage_amount
 // (already the targeted vehicle's current depreciated value — see
-// lib/coveragePricing.js's VALUE_PERCENTAGE branch); deductibleRate/
-// authorizedRepairLimitRate come from the filed ProductVariant
-// (catalog.prisma). Authorized repair limit is deductible *
-// authorizedRepairLimitRate, not amount * authorizedRepairLimitRate — it's a
-// multiple of the deductible, not of the vehicle's value. Returns null for
-// either figure whenever its rate isn't configured, rather than silently
-// computing off an assumed-0 rate.
-function computeDeductibleFigures(amount, deductibleRate, authorizedRepairLimitRate) {
+// lib/coveragePricing.js's VALUE_PERCENTAGE branch); deductibleRate comes
+// from the filed ProductVariant (catalog.prisma). Authorized repair limit is
+// simply the deductible plus the fixed TOWING_AMOUNT — there's no separate
+// rate for it any more. Returns null for both figures whenever
+// deductibleRate isn't configured, rather than silently computing off an
+// assumed-0 rate.
+function computeDeductibleFigures(amount, deductibleRate) {
   const hasDeductibleRate = deductibleRate !== null && deductibleRate !== undefined;
   const deductible = hasDeductibleRate ? Number(amount) * Number(deductibleRate) : null;
-  const hasRepairLimitRate = authorizedRepairLimitRate !== null && authorizedRepairLimitRate !== undefined;
-  const authorizedRepairLimit = deductible !== null && hasRepairLimitRate ? deductible * Number(authorizedRepairLimitRate) : null;
+  const authorizedRepairLimit = deductible !== null ? deductible + TOWING_AMOUNT : null;
   return { deductible, authorizedRepairLimit };
 }
 
@@ -255,4 +258,5 @@ module.exports = {
   SIGNATURE_BLOCK_HEIGHT,
   labelValue,
   computeDeductibleFigures,
+  TOWING_AMOUNT,
 };

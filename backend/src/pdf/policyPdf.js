@@ -13,7 +13,10 @@ const {
   SIGNATURE_BLOCK_HEIGHT,
   labelValue,
   computeDeductibleFigures,
+  TOWING_AMOUNT,
 } = require("./theme");
+const { drawLetterhead } = require("./letterhead");
+const { drawEndorsementPage } = require("./endorsementPdf");
 
 // Renders an *issued* Policy as a PDF Buffer — the final, signed document
 // (see routes/policies.js's toPolicyPdfProps, which builds `props` entirely
@@ -30,8 +33,7 @@ const {
 // `props` shape: policyNumber, cocNumber?, saNumber?, classNameLabel,
 // variantName, insuredName, insuredAddress, agentCode, issueDate,
 // coverageStartAt, coverageEndAt, vehicles, coverages, deductibleRate,
-// authorizedRepairLimitRate, totalPremium, docStamps, vat, lgt, misc,
-// totalAmount, remarks.
+// totalPremium, docStamps, vat, lgt, misc, totalAmount, remarks.
 function buildPolicyPdf(props) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: "legal", margin: 40, bufferPages: true });
@@ -48,7 +50,7 @@ function buildPolicyPdf(props) {
 
     drawLogoWatermark(doc);
 
-    const titleTop = doc.page.margins.top;
+    const titleTop = drawLetterhead(doc, left, doc.page.margins.top, pageWidth);
 
     doc.font(FONT_BODY_BOLD).fontSize(13).fillColor("#111111");
     doc.text("POLICY SCHEDULE", left, titleTop, { width: pageWidth, align: "center" });
@@ -128,6 +130,15 @@ function buildPolicyPdf(props) {
     }
 
     sectionRule();
+    // Printed above Period of Insurance whenever this policy was issued as a
+    // RENEWAL — frozen at approval time onto renewed_policy_number_snapshot
+    // (see routes/policyApproval.js's POST /:id/approve).
+    if (props.renewingPolicyNumber) {
+      doc.font(FONT_BODY_BOLD).fontSize(BASE_FONT_SIZE).fillColor("#111111");
+      doc.text("Renewing/Replacing : ", left, doc.y, { continued: true, width: pageWidth });
+      doc.font(FONT_BODY).text(props.renewingPolicyNumber);
+      doc.moveDown(0.3);
+    }
     const from = fmtDateTime(props.coverageStartAt);
     const to = fmtDateTime(props.coverageEndAt);
     doc.font(FONT_BODY_BOLD).fontSize(BASE_FONT_SIZE).fillColor("#111111");
@@ -162,7 +173,7 @@ function buildPolicyPdf(props) {
         labelValue(doc, "Body:", v.vehicle_type || "—", left, rowY2, half);
         labelValue(doc, "Serial No.:", v.chassis_number, left + half, rowY2, half);
         const rowY3 = doc.y + 5;
-        labelValue(doc, "Make:", v.make || "—", left, rowY3, half);
+        labelValue(doc, "Make:", [v.make, v.model].filter(Boolean).join(" ") || "—", left, rowY3, half);
         labelValue(doc, "Authentication No.:", v.engine_number, left + half, rowY3, half);
         const rowY4 = doc.y + 5;
         labelValue(doc, "Plate No.:", v.plate_number, left, rowY4, half);
@@ -234,10 +245,11 @@ function buildPolicyPdf(props) {
           .stroke();
         doc.moveDown(0.3);
 
-        const { deductible, authorizedRepairLimit } = computeDeductibleFigures(c.amount, props.deductibleRate, props.authorizedRepairLimitRate);
+        const { deductible, authorizedRepairLimit } = computeDeductibleFigures(c.amount, props.deductibleRate);
         doc.font(FONT_BODY_BOLD).fontSize(BASE_FONT_SIZE).text("Deductible: ", left, doc.y, { continued: true });
         drawCurrencyInline(doc, deductible, { bold: true });
-        doc.text("   |   Towing:  ", { continued: true });
+        doc.text("   |   Towing: ", { continued: true });
+        drawCurrencyInline(doc, TOWING_AMOUNT, { bold: true });
         doc.text("   |   Authorized Repair Limit: ", { continued: true });
         drawCurrencyInline(doc, authorizedRepairLimit, { bold: true, continued: false });
         doc.moveDown(0.3);
@@ -388,6 +400,40 @@ function buildPolicyPdf(props) {
 
       const clauseSigY = Math.min(doc.y + 24, doc.page.height - doc.page.margins.bottom - (SIGNATURE_BLOCK_HEIGHT + 8));
       drawSignatureBlock(doc, left + pageWidth - sigWidth, clauseSigY, sigWidth, { signed: true });
+    }
+
+    // Every APPROVED endorsement recorded against this policy (see
+    // routes/policies.js's applyEndorsementsToPolicyDetail, which is what
+    // populates props.endorsements — never anything SUBMITTED/REJECTED) gets
+    // its own amendment page appended right after the main schedule, in this
+    // same PDF file, oldest first — "also export the list of endorsements in
+    // the same file right after the policy". Always signed (an approved
+    // endorsement is as final as the policy itself) and never carries the
+    // "PENDING APPROVAL" stamp.
+    const endorsements = Array.isArray(props.endorsements) ? props.endorsements : [];
+    for (const endorsement of endorsements) {
+      doc.addPage();
+      drawEndorsementPage(doc, {
+        endorsementNumber: endorsement.endorsementNumber,
+        policyNumber: props.policyNumber,
+        classNameLabel: props.classNameLabel,
+        variantName: props.variantName,
+        insuredName: props.insuredName,
+        insuredAddress: props.insuredAddress,
+        agentCode: props.agentCode,
+        dateIssued: endorsement.dateIssued,
+        effectiveDate: endorsement.effectiveDate,
+        expiryDate: endorsement.expiryDate,
+        totalPremium: props.totalPremium,
+        docStamps: props.docStamps,
+        vat: props.vat,
+        lgt: props.lgt,
+        misc: props.misc,
+        totalAmount: props.totalAmount,
+        changes: endorsement.changes,
+        isPreview: false,
+        signed: true,
+      });
     }
 
     doc.end();

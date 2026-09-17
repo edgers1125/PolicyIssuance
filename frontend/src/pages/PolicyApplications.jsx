@@ -17,9 +17,13 @@ import {
   CircularProgress,
   Dialog,
   DialogContent,
-  Chip,
+  TextField,
+  MenuItem,
+  InputAdornment,
+  Stack,
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
+import SearchIcon from "@mui/icons-material/Search";
 import { useAuth } from "../context/AuthContext";
 import {
   listApplications,
@@ -29,7 +33,7 @@ import {
   getPolicyRenewalPrefill,
 } from "../api/client";
 import { formatPHP } from "../utils/currency";
-import { StatusChip } from "../components/StatusChip";
+import { StatusChip, STATUS_LABELS } from "../components/StatusChip";
 import { ApplicationDetailDialog } from "../components/ApplicationDetailDialog";
 import { PolicyApplication as PolicyApplicationCreator } from "./PolicyApplication";
 
@@ -39,12 +43,6 @@ function fmtDate(value) {
   if (Number.isNaN(d.getTime())) return "—";
   return d.toLocaleDateString("en-PH", { year: "numeric", month: "short", day: "numeric" });
 }
-
-// ApplicationPolicyType's own label/color mapping — kept local, same
-// precedent as ClientPolicies.jsx's own POLICY_STATUS_LABELS, since this is
-// a small enum only this table (and PolicyApproval.jsx's) needs to display.
-const POLICY_TYPE_LABELS = { NEW_POLICY: "New Policy", RENEWAL: "Renewal" };
-const POLICY_TYPE_COLORS = { NEW_POLICY: "default", RENEWAL: "info" };
 
 export function PolicyApplications() {
   const { token } = useAuth();
@@ -61,6 +59,36 @@ export function PolicyApplications() {
   // to pre-fill the wizard from an already-issued Policy (Client Policies
   // page's "Renew This Policy" action).
   const [renewalPrefill, setRenewalPrefill] = useState(null);
+
+  // Search/filter bar — search is debounced (see the effect below) so it
+  // doesn't re-fetch on every keystroke; status applies immediately. Both are
+  // server-side (see listApplicationsQuerySchema), not a client-side filter
+  // over just the current page.
+  const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const hasActiveFilters = Boolean(search || statusFilter);
+
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      setDebouncedSearch(search.trim());
+      setPage(0);
+    }, 300);
+    return () => clearTimeout(timeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search]);
+
+  function handleStatusFilterChange(value) {
+    setStatusFilter(value);
+    setPage(0);
+  }
+
+  function clearFilters() {
+    setSearch("");
+    setDebouncedSearch("");
+    setStatusFilter("");
+    setPage(0);
+  }
 
   // Deep-link from the Quotation Tracker's "For Issuance" status — clicking
   // the converted application's number there routes here with ?open=<id>
@@ -90,28 +118,35 @@ export function PolicyApplications() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
+  // Fetches everything the wizard needs to open pre-filled from an
+  // already-issued Policy (routes/policies.js's GET /:id/renewal-prefill)
+  // and opens the "New Application" dialog with it, replacing whatever the
+  // dialog currently holds — shared by the ?renew= deep link below (Client
+  // Policies page's "Renew This Policy" action) and PolicyApplication.jsx's
+  // own onRenewalRequested (a vehicle/address conflict surfaced mid-wizard,
+  // proactively or as a submit-time 409 — see lib/policyConflicts.js).
+  function openRenewalPrefill(policyId) {
+    return getPolicyRenewalPrefill(token, policyId)
+      .then((prefill) => {
+        setRenewalPrefill(prefill);
+        setCreateOpen(true);
+      })
+      .catch((err) => setError(err.message));
+  }
+
   // Deep-link from the Client Policies page's "Renew This Policy" action —
-  // routes here with ?renew=<policyId>, fetches everything the wizard needs
-  // to open pre-filled (routes/policies.js's GET /:id/renewal-prefill), and
-  // opens the same "New Application" dialog a manual click would, just
-  // pre-filled. Same param-stripping pattern as ?open= above.
+  // routes here with ?renew=<policyId>. Same param-stripping pattern as
+  // ?open= above.
   useEffect(() => {
     const renewId = searchParams.get("renew");
     if (!renewId) return;
     let cancelled = false;
-    getPolicyRenewalPrefill(token, renewId)
-      .then((prefill) => {
-        if (cancelled) return;
-        setRenewalPrefill(prefill);
-        setCreateOpen(true);
-      })
-      .catch((err) => !cancelled && setError(err.message))
-      .finally(() => {
-        if (cancelled) return;
-        const next = new URLSearchParams(searchParams);
-        next.delete("renew");
-        setSearchParams(next, { replace: true });
-      });
+    openRenewalPrefill(renewId).finally(() => {
+      if (cancelled) return;
+      const next = new URLSearchParams(searchParams);
+      next.delete("renew");
+      setSearchParams(next, { replace: true });
+    });
     return () => {
       cancelled = true;
     };
@@ -121,7 +156,10 @@ export function PolicyApplications() {
   function loadApplications() {
     setLoading(true);
     setError("");
-    return listApplications(token, page + 1, rowsPerPage)
+    return listApplications(token, page + 1, rowsPerPage, {
+      search: debouncedSearch,
+      status: statusFilter,
+    })
       .then((data) => {
         setRows(data.data);
         setTotal(data.total);
@@ -133,7 +171,7 @@ export function PolicyApplications() {
   useEffect(() => {
     loadApplications();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, page, rowsPerPage]);
+  }, [token, page, rowsPerPage, debouncedSearch, statusFilter]);
 
   return (
     <Container maxWidth="xl" sx={{ py: { xs: 3, sm: 6 } }}>
@@ -153,6 +191,39 @@ export function PolicyApplications() {
         </Button>
       </Box>
 
+      <Paper sx={{ p: 2, borderRadius: 3, mb: 2 }}>
+        <Stack direction={{ xs: "column", sm: "row" }} spacing={2} sx={{ alignItems: { xs: "stretch", sm: "center" } }}>
+          <TextField
+            placeholder="Search by application # or insured name"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            size="small"
+            fullWidth
+            slotProps={{ input: { startAdornment: <InputAdornment position="start"><SearchIcon fontSize="small" /></InputAdornment> } }}
+          />
+          <TextField
+            select
+            label="Status"
+            value={statusFilter}
+            onChange={(e) => handleStatusFilterChange(e.target.value)}
+            size="small"
+            sx={{ minWidth: 200 }}
+          >
+            <MenuItem value="">All statuses</MenuItem>
+            {Object.entries(STATUS_LABELS).map(([value, label]) => (
+              <MenuItem key={value} value={value}>
+                {label}
+              </MenuItem>
+            ))}
+          </TextField>
+          {hasActiveFilters && (
+            <Button onClick={clearFilters} size="small">
+              Clear filters
+            </Button>
+          )}
+        </Stack>
+      </Paper>
+
       {error && (
         <Alert severity="error" sx={{ mb: 2 }}>
           {error}
@@ -171,12 +242,9 @@ export function PolicyApplications() {
                 <TableRow>
                   <TableCell>Application #</TableCell>
                   <TableCell>Insured</TableCell>
-                  <TableCell>Class</TableCell>
-                  <TableCell>Product Variant</TableCell>
+                  <TableCell>Class / Variant</TableCell>
                   <TableCell>Status</TableCell>
-                  <TableCell>Type</TableCell>
-                  <TableCell>Insured From</TableCell>
-                  <TableCell>Insured To</TableCell>
+                  <TableCell>Coverage Period</TableCell>
                   <TableCell align="right">Total Premium</TableCell>
                   <TableCell>Created</TableCell>
                 </TableRow>
@@ -184,8 +252,8 @@ export function PolicyApplications() {
               <TableBody>
                 {rows.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={10} align="center" sx={{ py: 4, color: "text.secondary" }}>
-                      No policy applications yet.
+                    <TableCell colSpan={7} align="center" sx={{ py: 4, color: "text.secondary" }}>
+                      {hasActiveFilters ? "No applications match your search/filters." : "No policy applications yet."}
                     </TableCell>
                   </TableRow>
                 ) : (
@@ -196,22 +264,20 @@ export function PolicyApplications() {
                       onClick={() => setSelected({ id: a.id, applicationNumber: a.application_number })}
                       sx={{ cursor: "pointer" }}
                     >
-                      <TableCell>{a.application_number}</TableCell>
+                      <TableCell sx={{ fontFamily: "monospace", whiteSpace: "nowrap" }}>{a.application_number}</TableCell>
                       <TableCell>{a.insured_name || "—"}</TableCell>
-                      <TableCell>{a.class_name}</TableCell>
-                      <TableCell>{a.variant_name}</TableCell>
+                      <TableCell>
+                        <Typography variant="body2">{a.class_name}</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {a.variant_name}
+                        </Typography>
+                      </TableCell>
                       <TableCell>
                         <StatusChip status={a.status} />
                       </TableCell>
-                      <TableCell>
-                        <Chip
-                          size="small"
-                          label={POLICY_TYPE_LABELS[a.policy_type] || a.policy_type}
-                          color={POLICY_TYPE_COLORS[a.policy_type] || "default"}
-                        />
+                      <TableCell sx={{ whiteSpace: "nowrap" }}>
+                        {fmtDate(a.coverage_start_at)} – {fmtDate(a.coverage_end_at)}
                       </TableCell>
-                      <TableCell>{fmtDate(a.coverage_start_at)}</TableCell>
-                      <TableCell>{fmtDate(a.coverage_end_at)}</TableCell>
                       <TableCell align="right">{formatPHP(a.total_premium)}</TableCell>
                       <TableCell>{fmtDate(a.created_at)}</TableCell>
                     </TableRow>
@@ -258,12 +324,20 @@ export function PolicyApplications() {
       >
         <DialogContent>
           <PolicyApplicationCreator
+            // Forces a full remount whenever the renewal target changes
+            // (including from onRenewalRequested while this same dialog is
+            // already open) — a fresh instance rather than trying to patch
+            // renewalPrefill onto a wizard that may already be mid-filled,
+            // which could otherwise leave a stale mix of the abandoned
+            // attempt and the new prefill.
+            key={renewalPrefill?.renewed_policy_id || "new"}
             onClose={() => {
               setCreateOpen(false);
               setRenewalPrefill(null);
             }}
             onCreated={loadApplications}
             renewalPrefill={renewalPrefill}
+            onRenewalRequested={openRenewalPrefill}
           />
         </DialogContent>
       </Dialog>

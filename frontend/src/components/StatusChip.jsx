@@ -3,7 +3,9 @@ import { Chip } from "@mui/material";
 // Shared by PolicyApplications.jsx (an agent's own tracker) and
 // PolicyApproval.jsx (the cross-agent approval queue) — both render the same
 // ApplicationStatus values, so the label/color mapping lives in one place.
-const STATUS_LABELS = {
+// STATUS_LABELS is also exported so both pages' own status-filter dropdown
+// can list the same options/labels instead of a third duplicated map.
+export const STATUS_LABELS = {
   DRAFT: "Draft",
   SUBMITTED: "Submitted",
   FOR_EDIT_MANAGER: "For Edit (Manager)",

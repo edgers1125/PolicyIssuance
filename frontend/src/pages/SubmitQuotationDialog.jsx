@@ -37,8 +37,8 @@ export function SubmitQuotationDialog({ quotationId, token, onClose, onSubmitted
   const [paymentMethod, setPaymentMethod] = useState("");
   const [paymentRemittance, setPaymentRemittance] = useState("");
   const [bethelPaymentMethodId, setBethelPaymentMethodId] = useState("");
-  const [sendPolicyToEmail, setSendPolicyToEmail] = useState(false);
-  const [sendPolicyToEmailOnApproval, setSendPolicyToEmailOnApproval] = useState(false);
+  const [sendPolicyToEmail, setSendPolicyToEmail] = useState(true);
+  const [sendPolicyToEmailOnApproval, setSendPolicyToEmailOnApproval] = useState(true);
 
   const [previewOpen, setPreviewOpen] = useState(false);
   const [confirmChecked, setConfirmChecked] = useState(false);
@@ -99,7 +99,6 @@ export function SubmitQuotationDialog({ quotationId, token, onClose, onSubmitted
         pricing_mode: c.pricing_mode,
       })),
       deductibleRate: detail.deductible_rate,
-      authorizedRepairLimitRate: detail.authorized_repair_limit_rate,
       totalPremium: detail.total_premium,
       docStamps: detail.doc_stamps,
       vat: detail.vat,
@@ -107,6 +106,7 @@ export function SubmitQuotationDialog({ quotationId, token, onClose, onSubmitted
       misc: detail.misc,
       totalAmount: detail.total_amount,
       remarks: detail.remarks || "",
+      renewingPolicyNumber: detail.renewed_policy_number || undefined,
     };
   }
 

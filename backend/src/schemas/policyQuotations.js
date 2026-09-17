@@ -28,7 +28,9 @@ const createQuotationSchema = z
     risk_address: addressInputSchema.optional(),
     insured_address: addressInputSchema.optional(),
     remarks: z.string().optional(),
-    misc: z.coerce.number().optional(),
+    // No longer client-supplied — the "Miscellaneous" charge is now a flat
+    // fee configured on the chosen product_variant (ProductVariant.misc_fee)
+    // rather than an amount the agent types in per filing.
     send_policy_to_email: z.boolean().optional(),
     // Which agent this quotation is filed under — omitted, it's always the
     // caller's own linked agent. Only a caller holding
@@ -69,11 +71,19 @@ const submitQuotationSchema = paymentFieldsSchema
   .extend({ send_policy_to_email: z.boolean().optional(), send_policy_to_email_on_approval: z.boolean().optional() })
   .refine(refineBethelPaymentMethod, bethelPaymentMethodRefinement);
 
-// Pagination for GET /policy-quotations — capped page_size so a caller can't
-// force one giant unpaginated fetch.
+// Pagination + search/filters for GET /policy-quotations — capped page_size
+// so a caller can't force one giant unpaginated fetch. `status` is
+// SUBMITTED/FOR_ISSUANCE/POLICY_ISSUED, the same derived-not-stored triple
+// the route's own response already computes off `converted_application`/its
+// own `policy` relation (see GET / above) — filtering on it means "not yet
+// converted" / "converted, still pending approval" / "converted and
+// approved", not a real column.
 const listQuotationsQuerySchema = z.object({
   page: z.coerce.number().int().positive().optional().default(1),
   page_size: z.coerce.number().int().positive().max(100).optional().default(20),
+  search: z.string().trim().optional(),
+  status: z.enum(["SUBMITTED", "FOR_ISSUANCE", "POLICY_ISSUED"]).optional(),
+  class_id: z.string().uuid("class_id must be a valid UUID").optional(),
 });
 
 // :id path param shared by GET /:id and POST /:id/resend-email.

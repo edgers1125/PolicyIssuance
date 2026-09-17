@@ -75,6 +75,13 @@ const emptyVehicle = {
   mv_file_no: "",
   engine_number: "",
   chassis_number: "",
+  // Only ever set here when this row was populated from an existing
+  // (matched/reused) vehicle — a brand-new row leaves this blank and
+  // inherits the filing's own variantId at submit time instead (see
+  // handleConfirmSubmit's vehicles payload) — every vehicle on one filing
+  // must resolve to the same Motor product variant (see
+  // Vehicle.product_variant_id), so there's no separate per-row picker.
+  product_variant_id: "",
   make: "",
   model: "",
   year_model: "",
@@ -206,6 +213,31 @@ function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
       }
       coverageAmount = Number(tier.coverage_amount);
       payablePerVehicle = Number(tier.coverage_price);
+    } else if (cov.pricing_mode === "VEHICLE_SEATS_BASED") {
+      // Property has no vehicles at all — seat-based pricing has nothing to
+      // key off in that case.
+      if (idx === null) {
+        return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
+      }
+      const seats = Number(vehicles[idx]?.no_of_seats);
+      if (!Number.isFinite(seats) || seats <= 0) {
+        return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
+      }
+      if (cov.seats_threshold === null || cov.seats_threshold === undefined) {
+        return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true, noTier: true };
+      }
+      // selection.coverage_amount is the agent's chosen "insured amount for
+      // each occupant" — the tier key, same convention as FLAT_TIER's own
+      // coverage_amount — not the final total insured value.
+      const tier = (cov.seats_tier_prices || []).find(
+        (t) => String(t.insured_amount_per_occupant) === String(selection.coverage_amount)
+      );
+      if (!tier) {
+        return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
+      }
+      const excessSeats = Math.max(0, seats - Number(cov.seats_threshold));
+      coverageAmount = seats * Number(tier.insured_amount_per_occupant);
+      payablePerVehicle = excessSeats * Number(tier.rate_per_excess_seat);
     } else {
       coverageAmount = Number(selection.coverage_amount) || 0;
       payablePerVehicle = coverageAmount * Number(cov.rate);
@@ -473,7 +505,7 @@ function CompanyEditDialog({ open, onClose, company, token, onSaved }) {
 // that reassignment actually happens at submission time. The edits still
 // take effect the same way: they're carried in local state and persisted
 // then, exactly like the rest of a reassign_owner vehicle's fields already are.
-function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly }) {
+function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly, variants }) {
   const [form, setForm] = useState(emptyVehicle);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
@@ -515,6 +547,16 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly }
                 onChange={(e) => setForm({ ...form, plate_number: e.target.value })}
                 required
                 fullWidth
+                // In localOnly mode (a vehicle pending reassignment), the
+                // backend deliberately never writes plate_number back during
+                // that reassignment — see the reassign_owner branches in
+                // policyApplications.js/policyQuotations.js — so editing it
+                // here would silently not persist. A real correction is a
+                // separate action: reset this vehicle row entirely and, if
+                // needed, correct the plate via a normal (non-reassignment)
+                // Edit Vehicle after it's already on file.
+                disabled={localOnly}
+                helperText={localOnly ? "Fixed during reassignment — correct it separately afterward if it's wrong" : undefined}
               />
             </Grid>
             <Grid size={{ xs: 12, sm: 6 }}>
@@ -543,6 +585,23 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly }
                 required
                 fullWidth
               />
+            </Grid>
+            <Grid size={{ xs: 12, sm: 6 }}>
+              <TextField
+                select
+                label="Product variant"
+                value={form.product_variant_id || ""}
+                onChange={(e) => setForm({ ...form, product_variant_id: e.target.value })}
+                required
+                fullWidth
+                helperText="Changing this only applies going forward — an already-issued policy keeps reading whichever variant it was actually issued under."
+              >
+                {(variants || []).map((v) => (
+                  <MenuItem key={v.id} value={v.id}>
+                    {v.variant_name}
+                  </MenuItem>
+                ))}
+              </TextField>
             </Grid>
             <Grid size={{ xs: 12, sm: 6 }}>
               <TextField
@@ -790,7 +849,13 @@ function toLocalDateTimeInput(value) {
 // records, exactly as if the agent had searched-and-reused each one by hand,
 // and pins coverage_start_at to (and never lets it precede) that policy's
 // own expiry_date. See the renewalPrefill effect below.
-export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
+// onRenewalRequested (optional) — passed by PolicyApplications.jsx so this
+// wizard can hand off to the same renewal-prefill flow the Client Policies
+// page's own "Renew This Policy" action uses, from wherever a vehicle's
+// policy history surfaces here: a proactive plate-match nudge, or a reactive
+// 409 conflict on submit (see lib/policyConflicts.js's structured `conflict`
+// body). Omitted, those spots just show the plain info/error with no action.
+export function PolicyApplication({ onClose, onCreated, renewalPrefill, onRenewalRequested } = {}) {
   const { token, permissions, agent } = useAuth();
   const canIssue = permissions?.includes("CREATE_APPLICATION.AGENT_ISSUANCE");
 
@@ -816,6 +881,17 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
   // Which plate number was last checked per vehicle row, so blurring an
   // unchanged field doesn't keep re-triggering the lookup.
   const lastCheckedPlateRef = useRef({});
+  // { [vehicleRowIndex]: latest_policy-or-null } — populated the moment a
+  // plate lookup matches an on-file vehicle (GET /vehicles/lookup now
+  // includes latest_policy), so a row can proactively show "this vehicle
+  // already has policy history" before the agent even finishes the form,
+  // rather than only finding out from a 409 at submit time.
+  const [vehiclePolicyHistory, setVehiclePolicyHistory] = useState({});
+  // Set from a submit failure's structured `conflict` body (see
+  // lib/policyConflicts.js) — the reactive fallback for whatever the
+  // proactive vehiclePolicyHistory banner above didn't already catch (a
+  // risk address, or a vehicle re-checked fresh at submit time).
+  const [submitConflict, setSubmitConflict] = useState(null);
   // Set true right before the renewalPrefill effect (below) sets a party's
   // existing_customer_id/existing_company_id, so the "reset vehicles/
   // addresses on party change" effect further down skips the one reset it
@@ -844,7 +920,6 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
   const [riskAddress, setRiskAddress] = useState(emptyAddress);
   const [insuredAddress, setInsuredAddress] = useState(emptyAddress);
   const [remarks, setRemarks] = useState("");
-  const [misc, setMisc] = useState("");
   const [sendPolicyToEmail, setSendPolicyToEmail] = useState(false);
   const [sendPolicyToEmailOnApproval, setSendPolicyToEmailOnApproval] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState("");
@@ -890,6 +965,8 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
           is_custom_rate: period.is_custom_rate,
           value_percentage_tiers: period.value_percentage_tiers,
           tier_based_prices: period.tier_based_prices,
+          seats_threshold: period.seats_threshold,
+          seats_tier_prices: period.seats_tier_prices,
           has_custom_tiers: period.has_custom_tiers,
           // Whether this coverage actually has a rate/tier configured for
           // this specific period yet — an allowable period can exist before
@@ -928,6 +1005,31 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
   const isMotor = selectedClass?.class_name === "Motor";
   const isProperty = selectedClass?.class_name === "Property";
 
+  // A vehicle carries its own fixed Motor product variant (see
+  // Vehicle.product_variant_id) — every already-matched/reused vehicle on
+  // this filing has to agree on one, so there's no separate "Product
+  // Variant" step for Motor any more (see the Vehicles Paper below): the
+  // variant is derived from whichever matched vehicle already has one, and
+  // only left as a free pick (variantId, still the same state used for
+  // Property) when nothing's been matched yet.
+  const matchedVehicleVariantIds = isMotor
+    ? Array.from(new Set(vehicles.filter((v) => v.existing_vehicle_id && v.product_variant_id).map((v) => v.product_variant_id)))
+    : [];
+  const hasVehicleVariantConflict = matchedVehicleVariantIds.length > 1;
+
+  // Keeps variantId in lock-step with whichever variant a matched vehicle
+  // already carries, so a brand-new vehicle row added afterward (which has
+  // no product_variant_id of its own — see emptyVehicle) inherits the right
+  // one at submit time without the agent ever picking it explicitly.
+  useEffect(() => {
+    if (!isMotor || hasVehicleVariantConflict) return;
+    const derived = matchedVehicleVariantIds[0];
+    if (derived && derived !== variantId) {
+      setVariantId(derived);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isMotor, matchedVehicleVariantIds.join(","), hasVehicleVariantConflict]);
+
   // resolveCoverageSelection needs the actual vehicle list to look up
   // specific vehicle_indices, or expand to every vehicle for a coverage that
   // applies to the whole policy — Property has no vehicles at all, so it
@@ -949,7 +1051,9 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
   const docStamps = totalPremium * DOC_STAMPS_RATE;
   const vat = totalPremium * VAT_RATE;
   const lgt = totalPremium * LGT_RATE;
-  const miscAmount = Number(misc) || 0;
+  // No longer agent-entered — a flat fee fixed per product variant (see
+  // ProductVariant.misc_fee), the same figure the server itself charges.
+  const miscAmount = Number(selectedVariant?.misc_fee) || 0;
   const totalAmount = totalPremium + docStamps + vat + lgt + miscAmount;
 
   const selectedPartyId =
@@ -1058,10 +1162,14 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
 
   // The form is strictly linear: each step only appears once everything above
   // it is filled out, in this order — Insured Party, Insured Address,
-  // Insurance Class, Vehicles/Risk Address, Product Variant, Coverage Period
-  // & Coverages, then Payment & Delivery (and Charges after that). Every
-  // application needs an insured address regardless of class, so it can be
-  // collected right after the party, before the class is even chosen.
+  // Insurance Class, Vehicles/Risk Address (Motor's own Vehicles step now
+  // also collects the Product Variant inline — see the Vehicles Paper below
+  // — since a vehicle carries its own fixed one; Property still picks it as
+  // its own separate step, right after Risk Address, since it has no
+  // vehicles to derive one from), Coverage Period & Coverages, then Payment
+  // & Delivery (and Charges after that). Every application needs an insured
+  // address regardless of class, so it can be collected right after the
+  // party, before the class is even chosen.
   const insuredPartyComplete =
     insuredType === "INDIVIDUAL" ? isCustomerComplete(newCustomer) : isCompanyComplete(newCompany);
 
@@ -1073,7 +1181,7 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
   const vehicleOrRiskAddressComplete = !vehicleOrRiskAddressRequired
     ? true
     : isMotor
-      ? vehicles.some(isVehicleComplete)
+      ? vehicles.some(isVehicleComplete) && !hasVehicleVariantConflict
       : isAddressComplete(riskAddress);
 
   const productVariantComplete = Boolean(variantId);
@@ -1085,8 +1193,13 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
   const showInsuredAddress = insuredPartyComplete;
   const showInsuranceClass = showInsuredAddress && insuredAddressComplete;
   const showVehicleOrRiskAddress = showInsuranceClass && insuranceClassComplete;
-  const showProductVariant = showVehicleOrRiskAddress && vehicleOrRiskAddressComplete;
-  const showCoverage = showProductVariant && productVariantComplete;
+  // Property only, now — Motor's own variant is picked inline inside the
+  // Vehicles Paper (see productVariantComplete's own use below), so there's
+  // nothing left to gate as a separate step for that class.
+  const showProductVariant = showVehicleOrRiskAddress && vehicleOrRiskAddressComplete && isProperty;
+  const showCoverage = isProperty
+    ? showProductVariant && productVariantComplete
+    : showVehicleOrRiskAddress && vehicleOrRiskAddressComplete && productVariantComplete;
   const showPaymentDelivery = showCoverage && coverageComplete;
 
   function handleClassChange(id) {
@@ -1163,6 +1276,11 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
   function removeVehicle(index) {
     setVehicles((prev) => prev.filter((_, i) => i !== index));
     delete lastCheckedPlateRef.current[index];
+    setVehiclePolicyHistory((prev) => {
+      const next = { ...prev };
+      delete next[index];
+      return next;
+    });
     // Any coverage scoped to specific vehicles is referencing positions in
     // that array — removing one shifts everything after it down by one, so
     // those references need the same treatment or they'd silently point at
@@ -1210,6 +1328,7 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
                 mv_file_no: found.mv_file_no,
                 engine_number: found.engine_number,
                 chassis_number: found.chassis_number,
+                product_variant_id: found.product_variant_id || "",
                 make: found.make || "",
                 model: found.model || "",
                 year_model: found.year_model || "",
@@ -1224,6 +1343,7 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
             : vv
         )
       );
+      setVehiclePolicyHistory((prev) => ({ ...prev, [index]: found.latest_policy || null }));
       return;
     }
 
@@ -1240,6 +1360,7 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
               mv_file_no: vehicle.mv_file_no,
               engine_number: vehicle.engine_number,
               chassis_number: vehicle.chassis_number,
+              product_variant_id: vehicle.product_variant_id || "",
               make: vehicle.make || "",
               model: vehicle.model || "",
               year_model: vehicle.year_model || "",
@@ -1254,11 +1375,17 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
           : v
       )
     );
+    setVehiclePolicyHistory((prev) => ({ ...prev, [index]: vehicle.latest_policy || null }));
     setPlateConflict(null);
   }
 
   function resetVehicleRow(index) {
     setVehicles((prev) => prev.map((v, i) => (i === index ? { ...emptyVehicle } : v)));
+    setVehiclePolicyHistory((prev) => {
+      const next = { ...prev };
+      delete next[index];
+      return next;
+    });
     delete lastCheckedPlateRef.current[index];
   }
 
@@ -1289,7 +1416,13 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
       return;
     }
     if (vehicleOrRiskAddressRequired && !vehicleOrRiskAddressComplete) {
-      setError(isMotor ? "Add at least one complete vehicle." : "Fill out the risk address.");
+      setError(
+        isMotor
+          ? hasVehicleVariantConflict
+            ? "Every vehicle must be insured under the same product variant — fix the mismatched vehicle(s) first."
+            : "Add at least one complete vehicle."
+          : "Fill out the risk address."
+      );
       return;
     }
     if (!insuredAddressComplete) {
@@ -1344,6 +1477,7 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
     }
 
     setConfirmChecked(false);
+    setSubmitConflict(null);
     setPreviewOpen(true);
   }
 
@@ -1385,28 +1519,35 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
         // against what's payable to Bethel, then expands each into one row
         // per targeted vehicle itself (and for VALUE_PERCENTAGE ignores
         // coverage_amount entirely, computing its own from each target
-        // vehicle's value). coverage_amount for FLAT_TIER is the tier key the
-        // agent picked, also unmultiplied, so the server can look it up
-        // among the coverage's actual tiers.
+        // vehicle's value). coverage_amount for FLAT_TIER/VEHICLE_SEATS_BASED
+        // is the tier key the agent picked (an insured value, or an insured
+        // amount per occupant respectively), also unmultiplied, so the
+        // server can look it up among the coverage's actual tiers.
         coverages: coverageEntries.map(([coverage_id, v]) => {
           const cov = coverages.find((c) => c.id === coverage_id);
           return {
             coverage_id,
-            // VALUE_PERCENTAGE never collects a coverage_amount from the agent
-            // (the server computes its own from the vehicle/address value) —
-            // coverage_amount is only required by the schema to reject an
-            // unfilled-in PERCENTAGE/FLAT_TIER selection, so send a harmless
-            // positive placeholder here instead of the unset 0.
+            // VALUE_PERCENTAGE never collects a coverage_amount from the
+            // agent (the server computes its own from the vehicle/address
+            // value) — coverage_amount is only required by the schema to
+            // reject an unfilled-in PERCENTAGE/FLAT_TIER/VEHICLE_SEATS_BASED
+            // selection, so send a harmless positive placeholder here
+            // instead of the unset 0.
             coverage_amount: cov?.pricing_mode === "VALUE_PERCENTAGE" ? 1 : Number(v.coverage_amount) || 0,
             premium_amount: Number(v.premium_amount) || 0,
             vehicle_indices: v.vehicle_indices ?? null,
           };
         }),
-        vehicles: isMotor ? vehicles : undefined,
+        // A brand-new vehicle row carries no product_variant_id of its own
+        // (see emptyVehicle) — it inherits the filing's own variantId here;
+        // a matched/reused row already has one (see handlePlateBlur/
+        // handleConfirmPlateMatch/the plate Autocomplete's onChange), always
+        // the same value by now (see hasVehicleVariantConflict, which blocks
+        // submission otherwise).
+        vehicles: isMotor ? vehicles.map((v) => ({ ...v, product_variant_id: v.product_variant_id || variantId })) : undefined,
         risk_address: isProperty ? riskAddress : undefined,
         insured_address: insuredAddress,
         remarks: remarks || undefined,
-        misc: miscAmount,
         send_policy_to_email: sendPolicyToEmail,
         send_policy_to_email_on_approval: sendPolicyToEmailOnApproval,
         payment_method: paymentMethod,
@@ -1454,6 +1595,7 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
       await loadParties();
     } catch (err) {
       setError(err.message);
+      setSubmitConflict(err.data?.conflict || null);
     } finally {
       setSubmitting(false);
     }
@@ -1500,7 +1642,6 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
       };
     }),
     deductibleRate: selectedVariant?.deductible_rate,
-    authorizedRepairLimitRate: selectedVariant?.authorized_repair_limit_rate,
     totalPremium,
     docStamps,
     vat,
@@ -1508,6 +1649,7 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
     misc: miscAmount,
     totalAmount,
     remarks,
+    renewingPolicyNumber: renewedPolicyId ? renewedPolicyNumber : undefined,
   };
 
   // Fetches the actual PDFKit-rendered document the moment the preview
@@ -2045,6 +2187,40 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
                 </Button>
               </Box>
 
+              {/* A vehicle carries its own fixed Motor product variant (see
+                  Vehicle.product_variant_id) — no separate "Product Variant"
+                  step for Motor any more. Locked/derived once any vehicle
+                  below is matched to one already on file; otherwise a free
+                  pick, applied to every new vehicle added afterward. */}
+              {hasVehicleVariantConflict ? (
+                <Alert severity="error" sx={{ mb: 2 }}>
+                  These vehicles are insured under different product variants — every vehicle on one application must
+                  share the same one. Remove or replace one of the mismatched vehicles below.
+                </Alert>
+              ) : (
+                <TextField
+                  select
+                  label="Product variant"
+                  value={variantId}
+                  onChange={(e) => handleVariantChange(e.target.value)}
+                  required
+                  fullWidth
+                  disabled={matchedVehicleVariantIds.length > 0}
+                  helperText={
+                    matchedVehicleVariantIds.length > 0
+                      ? "Taken from the vehicle already on file below — edit that vehicle to change it."
+                      : "Applies to every vehicle added on this application."
+                  }
+                  sx={{ mb: 2 }}
+                >
+                  {variants.map((v) => (
+                    <MenuItem key={v.id} value={v.id}>
+                      {v.variant_name}
+                    </MenuItem>
+                  ))}
+                </TextField>
+              )}
+
               <Stack spacing={2} divider={<Divider />}>
                 {vehicles.map((v, index) => (
                   <Box key={index}>
@@ -2064,19 +2240,56 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
                         sx={{ mb: 1.5 }}
                         icon={<EditIcon fontSize="inherit" />}
                         action={
-                          <Button
-                            color="inherit"
-                            size="small"
-                            variant="outlined"
-                            onClick={() => setEditingVehicleIndex(index)}
-                          >
-                            Edit Details
-                          </Button>
+                          <Stack direction="row" spacing={1}>
+                            <Button
+                              color="inherit"
+                              size="small"
+                              variant="outlined"
+                              onClick={() => setEditingVehicleIndex(index)}
+                            >
+                              Edit Details
+                            </Button>
+                            <Button
+                              color="inherit"
+                              size="small"
+                              variant="outlined"
+                              onClick={() => resetVehicleRow(index)}
+                            >
+                              Use a different vehicle
+                            </Button>
+                          </Stack>
                         }
                       >
                         You're using a vehicle already on file for this {insuredType === "INDIVIDUAL" ? "customer" : "company"}.
                       </Alert>
                     )}
+                    {vehiclePolicyHistory[index] && (() => {
+                      const policy = vehiclePolicyHistory[index];
+                      const isActive = policy.status === "ACTIVE";
+                      const dateLabel = new Date(policy.expiry_date).toLocaleDateString();
+                      return (
+                        <Alert
+                          severity={isActive ? "warning" : "info"}
+                          sx={{ mb: 1.5 }}
+                          action={
+                            onRenewalRequested && (
+                              <Button
+                                color="inherit"
+                                size="small"
+                                variant="outlined"
+                                onClick={() => onRenewalRequested(policy.id)}
+                              >
+                                Renew this policy
+                              </Button>
+                            )
+                          }
+                        >
+                          {isActive
+                            ? `This vehicle already has an active policy (${policy.policy_number}) until ${dateLabel} — coverage on this application must start on or after that date.`
+                            : `This vehicle's last policy (${policy.policy_number}) expired ${dateLabel} — this filing will be recorded as a renewal of it.`}
+                        </Alert>
+                      );
+                    })()}
                     {v.reassign_owner && (
                       <Alert
                         severity="info"
@@ -2113,6 +2326,14 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
                         <Autocomplete
                           freeSolo
                           disableClearable
+                          // A matched vehicle's plate number is fixed — see
+                          // the identical rule in the reassign_owner backend
+                          // branches (policyApplications.js/policyQuotations.js).
+                          // A genuine correction only ever happens through
+                          // "Edit Details" (PATCH /vehicles/:id), which
+                          // re-checks uniqueness; backing out of the match
+                          // entirely uses "Use a different vehicle" above.
+                          disabled={Boolean(v.existing_vehicle_id)}
                           options={selectedParty?.vehicles || []}
                           value={
                             v.existing_vehicle_id
@@ -2160,6 +2381,7 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
                                         mv_file_no: value.mv_file_no,
                                         engine_number: value.engine_number,
                                         chassis_number: value.chassis_number,
+                                        product_variant_id: value.product_variant_id || "",
                                         make: value.make || "",
                                         model: value.model || "",
                                         year_model: value.year_model || "",
@@ -2687,6 +2909,34 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
                                 </TextField>
                               )}
 
+                              {cov.pricing_mode === "VEHICLE_SEATS_BASED" && (
+                                <TextField
+                                  select
+                                  label="Insured amount for each occupant"
+                                  value={
+                                    (cov.seats_tier_prices || []).some(
+                                      (t) => String(t.insured_amount_per_occupant) === String(selection.coverage_amount)
+                                    )
+                                      ? String(selection.coverage_amount)
+                                      : ""
+                                  }
+                                  onChange={(e) => updateCoverageField(cov.id, "coverage_amount", e.target.value)}
+                                  required
+                                  fullWidth
+                                  size="small"
+                                  sx={{ mb: 1 }}
+                                >
+                                  {(cov.seats_tier_prices || []).map((tier) => (
+                                    <MenuItem
+                                      key={tier.insured_amount_per_occupant}
+                                      value={String(tier.insured_amount_per_occupant)}
+                                    >
+                                      {formatPHP(tier.insured_amount_per_occupant)}/occupant — {formatPHP(tier.rate_per_excess_seat)}/excess seat
+                                    </MenuItem>
+                                  ))}
+                                </TextField>
+                              )}
+
                               {cov.pricing_mode === "VALUE_PERCENTAGE" && resolved.pending && (
                                 <Alert severity="info" sx={{ mb: 1 }}>
                                   {resolved.noTier
@@ -2727,6 +2977,12 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
                                             Rate: <strong>{formatRate(resolved.effectiveRate)}</strong>
                                           </span>
                                         </>
+                                      )}
+                                      {cov.pricing_mode === "VEHICLE_SEATS_BASED" && (
+                                        <span>
+                                          Insured amount: <strong>{formatPHP(resolved.coverage_amount)}</strong>{" "}
+                                          (seat threshold {cov.seats_threshold})
+                                        </span>
                                       )}
                                       <span>
                                         Payable to Bethel: <strong>{formatPHP(resolved.payable_to_bethel)}</strong>
@@ -2842,11 +3098,6 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
                 Charges
               </Typography>
               <Stack spacing={1.5}>
-                <Grid container spacing={2}>
-                  <Grid size={{ xs: 6, sm: 3 }}>
-                    <NumberField label="Miscellaneous" value={misc} onChange={setMisc} fullWidth size="small" />
-                  </Grid>
-                </Grid>
                 <Stack spacing={0.5}>
                   <Box sx={{ display: "flex", justifyContent: "space-between" }}>
                     <Typography variant="body2" color="text.secondary">
@@ -2952,6 +3203,7 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
         vehicle={editingVehicleIndex !== null ? vehicles[editingVehicleIndex] : null}
         localOnly={Boolean(editingVehicleIndex !== null && vehicles[editingVehicleIndex]?.reassign_owner)}
         token={token}
+        variants={variants}
         onSaved={(updated) => {
           setVehicles((prev) =>
             prev.map((v, i) =>
@@ -2962,6 +3214,7 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
                     mv_file_no: updated.mv_file_no,
                     engine_number: updated.engine_number,
                     chassis_number: updated.chassis_number,
+                    product_variant_id: updated.product_variant_id || "",
                     make: updated.make || "",
                     model: updated.model || "",
                     year_model: updated.year_model || "",
@@ -3041,7 +3294,22 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill } = {}) {
           />
 
           {error && (
-            <Alert severity="error" sx={{ mb: 1 }}>
+            <Alert
+              severity="error"
+              sx={{ mb: 1 }}
+              action={
+                submitConflict && onRenewalRequested ? (
+                  <Button
+                    color="inherit"
+                    size="small"
+                    variant="outlined"
+                    onClick={() => onRenewalRequested(submitConflict.policy_id)}
+                  >
+                    Renew this policy
+                  </Button>
+                ) : undefined
+              }
+            >
               {error}
             </Alert>
           )}

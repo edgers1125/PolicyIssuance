@@ -31,6 +31,16 @@ function belowBethelError(coverageName, payableToBethel) {
 // Throws HttpError for any of the above; never touches `res` itself so it
 // can be shared between routes with different response shapes.
 async function resolveCoverageRows({ coverages, className, vehicles, vehicleValues, addressValue, agentId, startAt, endAt }) {
+  // An individual agent linked to a company (Agent.company_id) prices off
+  // that company's own AgentNetrate/AgentValuePercentageTier/
+  // AgentFlatTierPricing rows, not their own (now-dormant) ones — see
+  // Agent.company_id's own comment in schema/parties.prisma. Resolved once
+  // here, in the one place every agent-override lookup below reads from,
+  // rather than asking each call site (policyApplications.js/
+  // policyQuotations.js) to remember to do it themselves.
+  const callerAgent = await prisma.agent.findUnique({ where: { id: agentId }, select: { company_id: true } });
+  const effectiveAgentId = callerAgent?.company_id || agentId;
+
   const coverageIds = coverages.map((c) => c.coverage_id);
   const coverageDetails = await prisma.productCoverage.findMany({
     where: { id: { in: coverageIds } },
@@ -39,6 +49,10 @@ async function resolveCoverageRows({ coverages, className, vehicles, vehicleValu
       coverage_name: true,
       maximum_coverage: true,
       pricing_mode: true,
+      // Whether this coverage's own premium folds into the Miscellaneous
+      // charge instead of the Premium total — see routes/policyApplications.js's/
+      // routes/policyQuotations.js's own split of resolvedRows by this flag.
+      is_misc: true,
       allowable_periods: { select: { coverage_in_days: true } },
     },
   });
@@ -71,11 +85,18 @@ async function resolveCoverageRows({ coverages, className, vehicles, vehicleValu
       value_percentage_tiers: true,
       tier_based_prices: true,
       agent_netrates: {
-        where: { agent_id: agentId },
+        where: { agent_id: effectiveAgentId },
         select: { netrate: true, maximum_coverage: true },
       },
-      agent_value_percentage_tiers: { where: { agent_id: agentId } },
-      agent_flat_tier_prices: { where: { agent_id: agentId } },
+      agent_value_percentage_tiers: { where: { agent_id: effectiveAgentId } },
+      agent_flat_tier_prices: { where: { agent_id: effectiveAgentId } },
+      seats_based_pricing: { select: { threshold_seats: true } },
+      agent_seats_based_pricing: {
+        where: { agent_id: effectiveAgentId },
+        select: { threshold_seats: true },
+      },
+      seats_tier_prices: true,
+      agent_seats_tier_prices: { where: { agent_id: effectiveAgentId } },
     },
   });
   const periodByCoverageId = new Map(periodsAtChosenLength.map((p) => [p.coverage_id, p]));
@@ -138,6 +159,7 @@ async function resolveCoverageRows({ coverages, className, vehicles, vehicleValu
           payable_to_bethel: payableToBethel,
           applied_rate: rate,
           vehicle_index: vehicleIndex,
+          is_misc: coverage.is_misc,
         });
       }
       continue;
@@ -163,6 +185,51 @@ async function resolveCoverageRows({ coverages, className, vehicles, vehicleValu
           payable_to_bethel: payableToBethel,
           applied_rate: 0,
           vehicle_index: vehicleIndex,
+          is_misc: coverage.is_misc,
+        });
+      }
+      continue;
+    }
+
+    if (coverage.pricing_mode === "VEHICLE_SEATS_BASED") {
+      const seatsPricing = period.agent_seats_based_pricing[0] || period.seats_based_pricing;
+      if (!seatsPricing) {
+        throw new HttpError(400, `No seat threshold is configured for ${coverage.coverage_name}`);
+      }
+      const threshold = Number(seatsPricing.threshold_seats);
+      // c.coverage_amount is the agent's chosen "insured amount for each
+      // occupant" — the tier key, same convention as FLAT_TIER's own
+      // coverage_amount — not the final total insured value (that's seats *
+      // this amount, computed per targeted vehicle below).
+      const seatTiers = period.agent_seats_tier_prices.length > 0
+        ? period.agent_seats_tier_prices
+        : period.seats_tier_prices;
+      const tier = seatTiers.find((t) => Number(t.insured_amount_per_occupant) === c.coverage_amount);
+      if (!tier) {
+        throw new HttpError(400, `Insured amount per occupant for ${coverage.coverage_name} does not match one of its available tiers`);
+      }
+      const ratePerSeat = Number(tier.rate_per_excess_seat);
+      for (const vehicleIndex of targetIndices) {
+        if (vehicleIndex === null) {
+          throw new HttpError(400, `${coverage.coverage_name} requires a vehicle to price by seat count`);
+        }
+        const seats = Number(vehicles[vehicleIndex]?.no_of_seats);
+        if (!Number.isFinite(seats) || seats <= 0) {
+          throw new HttpError(400, `${coverage.coverage_name} requires a valid seat count for the targeted vehicle`);
+        }
+        const excessSeats = Math.max(0, seats - threshold);
+        const payableToBethel = round2(excessSeats * ratePerSeat);
+        if (round2(premiumAmount) < payableToBethel) {
+          throw new HttpError(400, belowBethelError(coverage.coverage_name, payableToBethel));
+        }
+        resolvedRows.push({
+          coverage_id: c.coverage_id,
+          coverage_amount: round2(seats * Number(tier.insured_amount_per_occupant)),
+          premium_amount: round2(premiumAmount),
+          payable_to_bethel: payableToBethel,
+          applied_rate: ratePerSeat,
+          vehicle_index: vehicleIndex,
+          is_misc: coverage.is_misc,
         });
       }
       continue;
@@ -196,6 +263,7 @@ async function resolveCoverageRows({ coverages, className, vehicles, vehicleValu
         payable_to_bethel: payableToBethel,
         applied_rate: effectiveRate,
         vehicle_index: vehicleIndex,
+        is_misc: coverage.is_misc,
       });
     }
   }
@@ -203,4 +271,30 @@ async function resolveCoverageRows({ coverages, className, vehicles, vehicleValu
   return resolvedRows;
 }
 
-module.exports = { round2, resolveCoverageRows };
+const DOC_STAMPS_RATE = 0.125;
+const VAT_RATE = 0.12;
+const LGT_RATE = 0.002;
+
+// Same total_premium/doc_stamps/vat/lgt/misc split routes/policyApplications.js
+// and routes/policyQuotations.js each compute inline off a fresh
+// resolveCoverageRows() result — pulled out here (rather than also inlined a
+// third time) specifically for routes/endorsements.js's POST /:id/approve,
+// which has to recompute a Policy's own charge totals from its current set of
+// PolicyCoverage rows after an ADD_COVERAGE/REMOVE_CLAUSE line changes that
+// set, not from a one-shot resolveCoverageRows() call. `rows` is anything
+// carrying { premium_amount, is_misc } — a resolveCoverageRows() row or a
+// PolicyCoverage row alike.
+function computeChargeTotals(rows, miscFee) {
+  const grossPremium = round2(rows.reduce((sum, r) => sum + Number(r.premium_amount), 0));
+  const totalPremium = round2(
+    rows.filter((r) => !r.is_misc).reduce((sum, r) => sum + Number(r.premium_amount), 0)
+  );
+  const miscFromCoverages = round2(grossPremium - totalPremium);
+  const docStamps = round2(grossPremium * DOC_STAMPS_RATE);
+  const vat = round2(grossPremium * VAT_RATE);
+  const lgt = round2(grossPremium * LGT_RATE);
+  const misc = round2((Number(miscFee) || 0) + miscFromCoverages);
+  return { totalPremium, docStamps, vat, lgt, misc };
+}
+
+module.exports = { round2, resolveCoverageRows, computeChargeTotals, DOC_STAMPS_RATE, VAT_RATE, LGT_RATE };

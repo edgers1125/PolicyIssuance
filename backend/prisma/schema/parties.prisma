@@ -15,6 +15,8 @@ model Company {
   policy_quotations   PolicyQuotation[]
   policies            Policy[]
   company_agents      CompanyAgent[]
+  // CORPORATE Agent rows backed by this Company — see Agent.linked_company_id.
+  linked_agents       Agent[]
 }
 
 model Customer {
@@ -47,18 +49,69 @@ model Agent {
   agent_name String       @db.VarChar(255)
   work_email String       @unique @db.VarChar(255)
   status     RecordStatus
+  // Defaults INDIVIDUAL at the DB level only so the migration adding this
+  // didn't fail on the row(s) already on file — every create path (POST
+  // /agents) always sends an explicit value.
+  agent_type AgentType    @default(INDIVIDUAL)
+  // Only meaningful (and only ever set) when agent_type is INDIVIDUAL — which
+  // CORPORATE agent this individual is currently an employee of, if any. A
+  // policy/application/quotation's own agent_id always stays pointed at the
+  // specific individual who filed it (never rewritten to the company) — this
+  // is purely what pricing (AgentNetrate/AgentValuePercentageTier/
+  // AgentFlatTierPricing) resolves through instead of the individual's own,
+  // now-dormant override rows (see lib/coveragePricing.js). Self-referential
+  // rather than a separate "AgentCompany" table, mirroring how Customer/
+  // Company already coexist for insureds, just kept on one table here since
+  // a CORPORATE agent needs the exact same columns (code/name/email/status)
+  // an INDIVIDUAL one does.
+  company_id String?      @db.Uuid
+  // Only meaningful (and only ever set) when agent_type is CORPORATE — the
+  // real insured-party Company record this agency is backed by, if any.
+  // Wholly separate from company_id above (which is the self-referential
+  // "which agency does this individual work under" pointer): this instead
+  // links a CORPORATE Agent row to the actual Company table quotations/
+  // applications name as an insured party, so an agency can also be filed
+  // for as a client — see routes/agents.js's POST / (create-or-select a
+  // Company in the same request) and routes/companies.js's GET / (widens an
+  // individual's own party picker to include their parent agency's linked
+  // company, not just their own directly-linked ones).
+  linked_company_id String? @db.Uuid
+  // Denormalized running total of this agent's AgentPayableTransaction
+  // ledger (SUM(amount) WHERE agent_id = this.id) — kept in sync by every
+  // write to that table (POST /policy-approval/:id/approve, and
+  // routes/accounting.js's POST /payments) purely so the Accounting
+  // Overview page can list every agent's current balance in one query
+  // instead of a GROUP BY over the whole ledger on every load. The ledger
+  // table itself stays the source of truth for auditing — this column is a
+  // cache, never edited directly outside those same writes.
+  payable    Decimal      @default(0) @db.Decimal(18, 2)
   created_at DateTime     @default(now())
   updated_at DateTime     @updatedAt
+
+  company        Agent?   @relation("AgentCompanyEmployees", fields: [company_id], references: [id])
+  employees      Agent[]  @relation("AgentCompanyEmployees")
+  linked_company Company? @relation(fields: [linked_company_id], references: [id])
 
   users                        User[]
   agent_netrates               AgentNetrate[]
   agent_value_percentage_tiers AgentValuePercentageTier[]
   agent_flat_tier_prices       AgentFlatTierPricing[]
+  agent_seats_based_pricing    AgentSeatsBasedPricing[]
+  agent_seats_tier_prices      AgentSeatsTierPricing[]
   policy_applications          PolicyApplication[]
   policy_quotations            PolicyQuotation[]
   policies                     Policy[]
   customer_agents              CustomerAgent[]
   company_agents               CompanyAgent[]
+  // Endorsement requests this agent has filed against one of their own
+  // clients' policies — see EndorsementRequest.created_by_agent_id.
+  created_endorsement_requests EndorsementRequest[]
+  // This agent's own payable ledger — see AgentPayableTransaction
+  // (agentPayables.prisma).
+  payable_transactions         AgentPayableTransaction[]
+
+  @@index([company_id])
+  @@index([linked_company_id])
 }
 
 model CustomerAgent {
@@ -142,5 +195,43 @@ model AgentFlatTierPricing {
   allowable_period CoverageAllowablePeriod @relation(fields: [coverage_allowable_period_id], references: [id])
 
   @@unique([agent_id, coverage_allowable_period_id, coverage_amount])
+  @@index([agent_id])
+}
+
+// VEHICLE_SEATS_BASED-mode override: this agent's own threshold for a
+// coverage at one allowable period, replacing the coverage's own
+// CoverageSeatsBasedPricing.threshold_seats for that period entirely — the
+// tier menu itself (insured-amount-per-occupant + rate) is overridden
+// separately, via AgentSeatsTierPricing below.
+model AgentSeatsBasedPricing {
+  id                           String   @id @default(uuid()) @db.Uuid
+  agent_id                     String   @db.Uuid
+  coverage_allowable_period_id String   @db.Uuid
+  threshold_seats              Int
+  created_at                   DateTime @default(now())
+  updated_at                   DateTime @updatedAt
+
+  agent            Agent                   @relation(fields: [agent_id], references: [id])
+  allowable_period CoverageAllowablePeriod @relation(fields: [coverage_allowable_period_id], references: [id])
+
+  @@unique([agent_id, coverage_allowable_period_id])
+  @@index([agent_id])
+}
+
+// VEHICLE_SEATS_BASED-mode override of the tier menu itself — same shape/role
+// as AgentFlatTierPricing, just keyed by insured_amount_per_occupant instead
+// of coverage_amount, and paired with this tier's own rate_per_excess_seat.
+model AgentSeatsTierPricing {
+  id                           String   @id @default(uuid()) @db.Uuid
+  agent_id                     String   @db.Uuid
+  coverage_allowable_period_id String   @db.Uuid
+  insured_amount_per_occupant  Decimal  @db.Decimal(18, 2)
+  rate_per_excess_seat         Decimal  @db.Decimal(10, 2)
+  created_at                   DateTime @default(now())
+
+  agent            Agent                   @relation(fields: [agent_id], references: [id])
+  allowable_period CoverageAllowablePeriod @relation(fields: [coverage_allowable_period_id], references: [id])
+
+  @@unique([agent_id, coverage_allowable_period_id, insured_amount_per_occupant])
   @@index([agent_id])
 }

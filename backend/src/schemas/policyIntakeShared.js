@@ -26,6 +26,17 @@ const vehicleInputSchema = z.object({
   mv_file_no: requiredString("mv_file_no"),
   engine_number: requiredString("engine_number"),
   chassis_number: requiredString("chassis_number"),
+  // The Motor ProductVariant this vehicle is (or, for a brand-new one, is
+  // about to be) insured under — see Vehicle.product_variant_id. Always sent
+  // in full, same "reused rows carry their real values too" convention as
+  // plate_number above: for an existing vehicle the route only ever reads
+  // this off the DB row itself (never trusts a client-sent change here — see
+  // PATCH /vehicles/:id for the one legitimate way to actually change it),
+  // for a brand-new one it's what gets written. Every vehicle on one
+  // application/quotation must resolve to the same variant as the filing's
+  // own product_variant_id — checked by the route, since it needs a DB
+  // lookup a schema can't do.
+  product_variant_id: z.string().uuid("product_variant_id must be a valid UUID"),
   make: z.string().optional(),
   model: z.string().optional(),
   // The UI sends "" for a blank year field — treat that as omitted rather
@@ -159,12 +170,12 @@ const documentPreviewPropsSchema = z.object({
   coverageEndAt: z.coerce.date().optional(),
   vehicles: z.array(previewVehicleSchema).optional().default([]),
   coverages: z.array(previewCoverageSchema).optional().default([]),
-  // The filed product variant's own rates (see catalog.prisma's
-  // ProductVariant.deductible_rate/authorized_repair_limit_rate) — used to
-  // compute the Section III Deductible/Authorized Repair Limit line.
-  // Omitted/undefined whenever the variant hasn't had either configured.
+  // The filed product variant's own rate (see catalog.prisma's
+  // ProductVariant.deductible_rate) — used to compute the Section III
+  // Deductible/Authorized Repair Limit line (the repair limit itself is just
+  // that deductible plus a fixed towing amount — see pdf/theme.js's
+  // TOWING_AMOUNT). Omitted/undefined whenever the variant hasn't configured one.
   deductibleRate: z.coerce.number().nonnegative().optional(),
-  authorizedRepairLimitRate: z.coerce.number().nonnegative().optional(),
   totalPremium: z.coerce.number().optional().default(0),
   docStamps: z.coerce.number().optional().default(0),
   vat: z.coerce.number().optional().default(0),
@@ -172,6 +183,11 @@ const documentPreviewPropsSchema = z.object({
   misc: z.coerce.number().optional().default(0),
   totalAmount: z.coerce.number().optional().default(0),
   remarks: z.string().optional(),
+  // The connected prior policy's own number, when this filing is a renewal/
+  // replacement of it — drives the "Renewing/Replacing:" line printed above
+  // Period of Insurance (see pdf/quotationPdf.js, pdf/policyApplicationPdf.js,
+  // pdf/policyPdf.js). Omitted for a brand-new filing with no such connection.
+  renewingPolicyNumber: z.string().optional(),
 });
 
 module.exports = {

@@ -1,13 +1,14 @@
 const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { requirePermission } = require("../middleware/permissions");
+const { requireAnyPermission } = require("../middleware/permissions");
 const { validateBody, validateQuery } = require("../middleware/validate");
 const {
   getPricingQuerySchema,
   updatePricingModeSchema,
   updateValuePercentageTiersSchema,
   updateFlatTiersSchema,
+  updateSeatTiersSchema,
   createAllowablePeriodSchema,
 } = require("../schemas/coveragePricing");
 
@@ -20,7 +21,13 @@ const router = express.Router();
 // 403 them for lacking this permission even though they have nothing to do
 // with coverage pricing. Each route below takes the auth/permission checks
 // as its own middleware instead, so they only ever apply to these 4 routes.
-const guard = [requireAuth, requirePermission("MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING")];
+// Either the standalone Manage Coverage Pricing page's permission or Manage
+// Products' own EDIT_PRICING sub-permission unlocks these — the same pricing
+// editor is embedded in both places (see components/CoveragePricingEditor.jsx).
+const guard = [
+  requireAuth,
+  requireAnyPermission(["MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING", "MANAGE_SETTINGS.MANAGE_PRODUCTS.EDIT_PRICING"]),
+];
 
 async function findCoverageOr404(res, id) {
   const coverage = await prisma.productCoverage.findUnique({ where: { id } });
@@ -79,6 +86,12 @@ router.post(
   }
 );
 
+// Removing an allowable period is a staged action from Manage Products'
+// period chips (mark for deletion, then Save) — see
+// PATCH /manage-products/batch-delete in routes/catalog.js, which handles
+// periods alongside class/variant/coverage deletions in one transaction so
+// a whole batch of pending deletions across every tier commits as one request.
+
 router.get("/coverages/:id/pricing", ...guard, validateQuery(getPricingQuerySchema), async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -89,7 +102,7 @@ router.get("/coverages/:id/pricing", ...guard, validateQuery(getPricingQuerySche
     const period = await findAllowablePeriodOr400(res, id, coverage_in_days);
     if (!period) return;
 
-    const [valuePercentageTiers, flatTiers, percentagePricing] = await Promise.all([
+    const [valuePercentageTiers, flatTiers, percentagePricing, seatsBasedPricing, seatTiers] = await Promise.all([
       prisma.coverageValuePercentageTier.findMany({
         where: { coverage_allowable_period_id: period.id },
         orderBy: { min_value: "asc" },
@@ -101,6 +114,13 @@ router.get("/coverages/:id/pricing", ...guard, validateQuery(getPricingQuerySche
       prisma.coveragePercentageBasedPricing.findUnique({
         where: { coverage_allowable_period_id: period.id },
       }),
+      prisma.coverageSeatsBasedPricing.findUnique({
+        where: { coverage_allowable_period_id: period.id },
+      }),
+      prisma.coverageSeatsTierPricing.findMany({
+        where: { coverage_allowable_period_id: period.id },
+        orderBy: { insured_amount_per_occupant: "asc" },
+      }),
     ]);
 
     res.json({
@@ -108,6 +128,8 @@ router.get("/coverages/:id/pricing", ...guard, validateQuery(getPricingQuerySche
       standard_rate: percentagePricing?.standard_rate ?? null,
       value_percentage_tiers: valuePercentageTiers,
       tier_based_prices: flatTiers,
+      threshold_seats: seatsBasedPricing?.threshold_seats ?? null,
+      seat_tier_prices: seatTiers,
     });
   } catch (err) {
     next(err);
@@ -120,7 +142,7 @@ router.patch("/coverages/:id/pricing", ...guard, validateBody(updatePricingModeS
     const coverage = await findCoverageOr404(res, id);
     if (!coverage) return;
 
-    const { pricing_mode, coverage_in_days, standard_rate } = req.body;
+    const { pricing_mode, coverage_in_days, standard_rate, threshold_seats } = req.body;
     const period = await findAllowablePeriodOr400(res, id, coverage_in_days);
     if (!period) return;
 
@@ -137,6 +159,14 @@ router.patch("/coverages/:id/pricing", ...guard, validateBody(updatePricingModeS
         where: { coverage_allowable_period_id: period.id },
         update: { standard_rate },
         create: { coverage_allowable_period_id: period.id, standard_rate },
+      });
+    }
+
+    if (pricing_mode === "VEHICLE_SEATS_BASED" && threshold_seats !== undefined) {
+      await prisma.coverageSeatsBasedPricing.upsert({
+        where: { coverage_allowable_period_id: period.id },
+        update: { threshold_seats },
+        create: { coverage_allowable_period_id: period.id, threshold_seats },
       });
     }
 
@@ -227,6 +257,51 @@ router.put(
       });
 
       res.json({ message: "Flat tiers updated" });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// Replaces this coverage's entire VEHICLE_SEATS_BASED tier menu ("Insured
+// amount for each occupant" options) for one allowable period — same
+// replace-all pattern as the flat-tier route above, just keyed by
+// insured_amount_per_occupant instead of coverage_amount.
+router.put(
+  "/coverages/:id/seats-tiers",
+  ...guard,
+  validateBody(updateSeatTiersSchema),
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      const coverage = await findCoverageOr404(res, id);
+      if (!coverage) return;
+
+      const { coverage_in_days, tiers } = req.body;
+      const period = await findAllowablePeriodOr400(res, id, coverage_in_days);
+      if (!period) return;
+
+      const amounts = tiers.map((t) => t.insured_amount_per_occupant);
+      if (new Set(amounts).size !== amounts.length) {
+        return res.status(400).json({ error: "Each tier needs a distinct insured_amount_per_occupant" });
+      }
+
+      await prisma.$transaction(async (tx) => {
+        await tx.coverageSeatsTierPricing.deleteMany({
+          where: { coverage_allowable_period_id: period.id },
+        });
+        if (tiers.length > 0) {
+          await tx.coverageSeatsTierPricing.createMany({
+            data: tiers.map((t) => ({
+              coverage_allowable_period_id: period.id,
+              insured_amount_per_occupant: t.insured_amount_per_occupant,
+              rate_per_excess_seat: t.rate_per_excess_seat,
+            })),
+          });
+        }
+      });
+
+      res.json({ message: "Seat tiers updated" });
     } catch (err) {
       next(err);
     }

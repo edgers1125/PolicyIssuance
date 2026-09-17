@@ -13,8 +13,9 @@ const {
 } = require("../schemas/policyQuotations");
 const { documentPreviewPropsSchema } = require("../schemas/policyIntakeShared");
 const { currentVehicleValue } = require("../lib/vehicleValue");
+const { getAccessibleAgentIds } = require("../lib/agent");
 const { round2, resolveCoverageRows } = require("../lib/coveragePricing");
-const { assertVehiclesFree, assertRiskAddressFree } = require("../lib/policyConflicts");
+const { resolveVehicleRenewal, resolveRiskAddressRenewal } = require("../lib/policyConflicts");
 const { sendIfHttpError } = require("../lib/httpError");
 const { sendMail } = require("../lib/mailer");
 const { buildSubmissionEmailContent } = require("../lib/applicationEmails");
@@ -100,6 +101,28 @@ async function resolveWriteAgent(req, res, actingPermissions) {
   return prisma.agent.findUnique({ where: { id: user.agent_id } });
 }
 
+// Shared by POST / (initial delivery) and POST /:id/resend-email (resend) —
+// same cover-note wording either way, since a resend is just "here it is
+// again," not a distinct message. Kept as a local function rather than a
+// lib/ file since it's only ever used from this one router.
+function buildQuotationEmailContent(detail) {
+  const html = `
+    <div style="font-family:Arial,sans-serif;color:#111">
+      <p>Dear ${detail.insured_name},</p>
+      <p>Please find your quotation from Bethel General Insurance and Surety Corp. attached as a PDF (Quotation No. ${detail.quotation_number}).</p>
+      <p>This quotation is not a policy and does not bind coverage. Please contact your agent (${detail.agent_name || detail.agent_code}) with any questions.</p>
+    </div>
+  `;
+  const text = [
+    `Dear ${detail.insured_name},`,
+    "",
+    `Please find your quotation from Bethel General Insurance and Surety Corp. attached as a PDF (Quotation No. ${detail.quotation_number}).`,
+    "",
+    `This quotation is not a policy and does not bind coverage. Please contact your agent (${detail.agent_name || detail.agent_code}) with any questions.`,
+  ].join("\n");
+  return { subject: `Your Bethel Insurance Quotation ${detail.quotation_number}`, html, text };
+}
+
 const DOC_STAMPS_RATE = 0.125;
 const VAT_RATE = 0.12;
 const LGT_RATE = 0.002;
@@ -150,8 +173,29 @@ router.get("/", validateQuery(listQuotationsQuerySchema), async (req, res, next)
     const scope = await resolveScope(req, res, VIEW_CODE, ADMIN_VIEW_CODE);
     if (!scope) return;
 
-    const { page, page_size: pageSize } = req.query;
-    const where = scope.agentId ? { agent_id: scope.agentId } : {};
+    const { page, page_size: pageSize, search, status, class_id } = req.query;
+    const where = {
+      ...(scope.agentId ? { agent_id: scope.agentId } : {}),
+      ...(class_id ? { product_variant: { insurance_class_id: class_id } } : {}),
+      // status is derived, not a column — see the schema's own note.
+      ...(status === "FOR_ISSUANCE"
+        ? { converted_application: { is: { policy: null } } }
+        : status === "POLICY_ISSUED"
+          ? { converted_application: { is: { policy: { isNot: null } } } }
+          : status === "SUBMITTED"
+            ? { converted_application: null }
+            : {}),
+      ...(search
+        ? {
+            OR: [
+              { quotation_number: { contains: search, mode: "insensitive" } },
+              { company_name_snapshot: { contains: search, mode: "insensitive" } },
+              { customer: { first_name: { contains: search, mode: "insensitive" } } },
+              { customer: { last_name: { contains: search, mode: "insensitive" } } },
+            ],
+          }
+        : {}),
+    };
 
     const [total, quotations] = await Promise.all([
       prisma.policyQuotation.count({ where }),
@@ -177,9 +221,14 @@ router.get("/", validateQuery(listQuotationsQuerySchema), async (req, res, next)
           // Presence alone is enough to know whether this quotation has
           // already been converted — used to disable Edit/Submit in the
           // tracker's Actions column once it has, and to resolve the
-          // "For Issuance" status/link below (application_number is what the
-          // tracker links out to on the Policy Applications page).
-          converted_application: { select: { id: true, application_number: true } },
+          // "For Issuance"/"Policy Issued" status/link below
+          // (application_number is what the tracker links out to on the
+          // Policy Applications page; policy, once the application has
+          // itself been approved, carries the resulting Policy's own number
+          // instead — see POST /policy-approval/:id/approve).
+          converted_application: {
+            select: { id: true, application_number: true, policy: { select: { id: true, policy_number: true } } },
+          },
           agent: { select: { agent_code: true, agent_name: true } },
         },
       }),
@@ -201,12 +250,18 @@ router.get("/", validateQuery(listQuotationsQuerySchema), async (req, res, next)
         created_at: q.created_at,
         converted: Boolean(q.converted_application),
         // Status is never stored — it's entirely derived from whether this
-        // quotation has a converted_application, the same way `converted`
-        // already was. FOR_ISSUANCE carries the resulting application's id/
-        // number so the tracker can render a clickable link straight to it.
-        status: q.converted_application ? "FOR_ISSUANCE" : "SUBMITTED",
+        // quotation has a converted_application and, once it does, whether
+        // that application has itself been approved into a Policy yet (its
+        // own `policy` relation, set only by POST /policy-approval/:id/
+        // approve). FOR_ISSUANCE carries the resulting application's id/
+        // number so the tracker can render a clickable link straight to it;
+        // POLICY_ISSUED instead carries the resulting Policy's own number —
+        // once approved, that's the number that actually matters.
+        status: !q.converted_application ? "SUBMITTED" : q.converted_application.policy ? "POLICY_ISSUED" : "FOR_ISSUANCE",
         converted_application_id: q.converted_application?.id || null,
         converted_application_number: q.converted_application?.application_number || null,
+        policy_id: q.converted_application?.policy?.id || null,
+        policy_number: q.converted_application?.policy?.policy_number || null,
         agent_code: q.agent.agent_code,
         agent_name: q.agent.agent_name,
       })),
@@ -237,7 +292,6 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
       risk_address,
       insured_address,
       remarks,
-      misc,
       send_policy_to_email,
     } = req.body;
 
@@ -247,7 +301,7 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
 
     const productVariant = await prisma.productVariant.findUnique({
       where: { id: product_variant_id },
-      select: { insurance_class: { select: { class_name: true } } },
+      select: { misc_fee: true, insurance_class: { select: { class_name: true } } },
     });
     if (!productVariant) {
       return res.status(400).json({ error: "product_variant_id does not match an existing product" });
@@ -311,8 +365,12 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
         return res.status(403).json({ error: "This customer isn't connected to your agent account" });
       }
     } else {
-      const link = await prisma.companyAgent.findUnique({
-        where: { company_id_agent_id: { company_id, agent_id: agent.id } },
+      // Also allows a company connected via this agent's own parent agency
+      // (Agent.company_id -> Agent.linked_company_id) — see
+      // getAccessibleAgentIds()'s own comment and routes/agents.js's POST /.
+      const accessibleAgentIds = await getAccessibleAgentIds(agent.id);
+      const link = await prisma.companyAgent.findFirst({
+        where: { company_id, agent_id: { in: accessibleAgentIds } },
       });
       if (!link) {
         return res.status(403).json({ error: "This company isn't connected to your agent account" });
@@ -330,11 +388,17 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
       endAt,
     });
 
-    const totalPremium = round2(resolvedRows.reduce((sum, r) => sum + r.premium_amount, 0));
-    const docStamps = round2(totalPremium * DOC_STAMPS_RATE);
-    const vat = round2(totalPremium * VAT_RATE);
-    const lgt = round2(totalPremium * LGT_RATE);
-    const miscAmount = round2(misc || 0);
+    // Same is_misc split as applications (see policyApplications.js's own
+    // POST / for the full reasoning) — statutory charges tax the full
+    // premium sum regardless of is_misc; total_premium (the "Premium" line)
+    // only sums the non-is_misc rows, with the rest folded into misc.
+    const grossPremium = round2(resolvedRows.reduce((sum, r) => sum + r.premium_amount, 0));
+    const totalPremium = round2(resolvedRows.filter((r) => !r.is_misc).reduce((sum, r) => sum + r.premium_amount, 0));
+    const miscFromCoverages = round2(grossPremium - totalPremium);
+    const docStamps = round2(grossPremium * DOC_STAMPS_RATE);
+    const vat = round2(grossPremium * VAT_RATE);
+    const lgt = round2(grossPremium * LGT_RATE);
+    const miscAmount = round2((Number(productVariant.misc_fee) || 0) + miscFromCoverages);
 
     let companyNameSnapshot = null;
     if (insured_type === "CORPORATE") {
@@ -347,7 +411,25 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
 
     if (className === "Motor") {
       for (const v of vehicles) {
-        if (!v.existing_vehicle_id) continue;
+        if (!v.existing_vehicle_id) {
+          // Same plate-uniqueness rule POST /policy-applications enforces —
+          // a plate number identifies one real vehicle, and Vehicle.plate_number
+          // carries no DB-level uniqueness, so this is the only thing stopping
+          // an agent from sidestepping the plate-lookup/reassignment flow and
+          // creating a second Vehicle row for an already-on-file plate.
+          if (v.plate_number) {
+            const duplicate = await prisma.vehicle.findFirst({
+              where: { plate_number: { equals: v.plate_number, mode: "insensitive" } },
+              select: { id: true },
+            });
+            if (duplicate) {
+              return res.status(409).json({
+                error: `Plate number ${v.plate_number} is already on file for another vehicle — look it up and reuse or reassign it instead of entering it as new`,
+              });
+            }
+          }
+          continue;
+        }
 
         if (v.reassign_owner) {
           const vehicleExists = await prisma.vehicle.findUnique({ where: { id: v.existing_vehicle_id } });
@@ -362,6 +444,24 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
         });
         if (!owned) {
           return res.status(400).json({ error: "One of the selected vehicles is not on file for this customer/company" });
+        }
+      }
+
+      // Same "one vehicle, one fixed Motor variant" consistency check as
+      // POST /policy-applications — see Vehicle.product_variant_id.
+      for (const v of vehicles) {
+        const vehicleVariantId = v.existing_vehicle_id
+          ? (
+              await prisma.vehicle.findUnique({
+                where: { id: v.existing_vehicle_id },
+                select: { product_variant_id: true },
+              })
+            )?.product_variant_id
+          : v.product_variant_id;
+        if (vehicleVariantId !== product_variant_id) {
+          return res.status(400).json({
+            error: "All vehicles on this quotation must be insured under the same product variant",
+          });
         }
       }
     }
@@ -381,6 +481,24 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
       !(await isAddressOwned(insured_address.existing_address_id))
     ) {
       return res.status(400).json({ error: "The selected insured address is not on file for this customer/company" });
+    }
+
+    // A quotation is a non-binding preview, so vehicle/risk-address history
+    // is only ever silently recorded here (enforce: false — never blocks),
+    // purely so the quotation itself already carries which policy it'd
+    // continue. The real enforcement (and a fresh recompute, in case
+    // something changed since) happens for real at POST /:id/submit, the
+    // moment this actually turns into a binding application — same
+    // non-binding-preview-vs-real-commit split coverage pricing already
+    // follows elsewhere in this app.
+    let renewedPolicyId = null;
+    if (className === "Motor") {
+      const vehicleIdsForHistory = vehicles.filter((v) => v.existing_vehicle_id).map((v) => v.existing_vehicle_id);
+      const resolved = await resolveVehicleRenewal(vehicleIdsForHistory, startAt, endAt, { enforce: false });
+      renewedPolicyId = resolved.renewedPolicyId;
+    } else if (requiresRiskAddress && risk_address.existing_address_id) {
+      const resolved = await resolveRiskAddressRenewal(risk_address.existing_address_id, startAt, endAt, { enforce: false });
+      renewedPolicyId = resolved.renewedPolicyId;
     }
 
     const result = await prisma.$transaction(async (tx) => {
@@ -404,6 +522,7 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
           misc: miscAmount,
           send_policy_to_email: Boolean(send_policy_to_email),
           remarks: remarks || null,
+          renewed_policy_id: renewedPolicyId,
         },
       });
 
@@ -429,7 +548,10 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
               await tx.vehicle.update({
                 where: { id: vehicleId },
                 data: {
-                  plate_number: v.plate_number,
+                  // plate_number deliberately omitted — see the identical
+                  // note in routes/policyApplications.js's own reassign_owner
+                  // branch; it stays fixed across reassignment, correctable
+                  // only via PATCH /vehicles/:id.
                   mv_file_no: v.mv_file_no,
                   engine_number: v.engine_number,
                   chassis_number: v.chassis_number,
@@ -464,6 +586,7 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
                 mv_file_no: v.mv_file_no,
                 engine_number: v.engine_number,
                 chassis_number: v.chassis_number,
+                product_variant_id: v.product_variant_id,
                 make: v.make || null,
                 model: v.model || null,
                 year_model: v.year_model ?? null,
@@ -538,6 +661,36 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
       return quotation;
     });
 
+    // "Send this quotation to the customer's email" — mirrors the same
+    // "email after commit, never inside the transaction, swallow-and-log a
+    // failure" pattern every other automatic email in this app follows
+    // (POST /policy-applications, POST /:id/submit below, users.js's invite
+    // email). The create response has already succeeded by the time this
+    // runs, so a mail failure must never turn a created quotation into an
+    // error response.
+    if (result.send_policy_to_email) {
+      try {
+        const fullQuotation = await prisma.policyQuotation.findUnique({
+          where: { id: result.id },
+          select: quotationDetailSelect,
+        });
+        const detail = toQuotationDetail(fullQuotation);
+        if (detail.insured_email) {
+          const pdfBuffer = await buildQuotationPdf(toPreviewProps(detail));
+          const { subject, html, text } = buildQuotationEmailContent(detail);
+          await sendMail({
+            to: detail.insured_email,
+            subject,
+            html,
+            text,
+            attachments: [{ filename: `${detail.quotation_number}.pdf`, content: pdfBuffer, contentType: "application/pdf" }],
+          });
+        }
+      } catch (mailErr) {
+        console.error("[policyQuotations] failed to send quotation email", mailErr);
+      }
+    }
+
     res.status(201).json(result);
   } catch (err) {
     if (sendIfHttpError(err, res)) return;
@@ -573,7 +726,6 @@ const quotationDetailSelect = {
       variant_name: true,
       insurance_class: { select: { class_name: true } },
       deductible_rate: true,
-      authorized_repair_limit_rate: true,
     },
   },
   // Ordered so a coverage's vehicle_indices (positions into this array) mean
@@ -635,6 +787,10 @@ const quotationDetailSelect = {
   // Presence alone tells the Quotation Tracker whether this quotation can
   // still be edited/submitted — see toQuotationDetail's `converted` field.
   converted_application: { select: { id: true, application_number: true } },
+  // The policy this quotation was auto-detected as continuing (see
+  // lib/policyConflicts.js, enforce:false) — its own policy_number feeds the
+  // "Renewing/Replacing:" line on the quotation PDF.
+  renewed_policy: { select: { policy_number: true } },
 };
 
 // Turns the raw Prisma record (relations and all) into the flat shape the
@@ -675,7 +831,6 @@ function toQuotationDetail(quotation) {
     product_variant_id: quotation.product_variant_id,
     variant_name: quotation.product_variant.variant_name,
     deductible_rate: quotation.product_variant.deductible_rate,
-    authorized_repair_limit_rate: quotation.product_variant.authorized_repair_limit_rate,
     agent_code: quotation.agent.agent_code,
     agent_name: quotation.agent.agent_name,
     quotation_date: quotation.quotation_date,
@@ -704,6 +859,7 @@ function toQuotationDetail(quotation) {
     // this row — it's already become a real policy application.
     converted: Boolean(quotation.converted_application),
     converted_application_number: quotation.converted_application?.application_number || null,
+    renewed_policy_number: quotation.renewed_policy?.policy_number || null,
   };
 }
 
@@ -724,7 +880,6 @@ function toPreviewProps(detail) {
     vehicles: detail.vehicles || [],
     coverages: detail.coverages || [],
     deductibleRate: detail.deductible_rate,
-    authorizedRepairLimitRate: detail.authorized_repair_limit_rate,
     totalPremium: detail.total_premium,
     docStamps: detail.doc_stamps,
     vat: detail.vat,
@@ -732,6 +887,7 @@ function toPreviewProps(detail) {
     misc: detail.misc,
     totalAmount: detail.total_amount,
     remarks: detail.remarks,
+    renewingPolicyNumber: detail.renewed_policy_number || undefined,
   };
 }
 
@@ -794,11 +950,20 @@ router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(update
         // ADMIN_CREATE_QUOTATION caller editing someone else's quotation
         // must still re-price against that agent's rates, not their own).
         agent_id: true,
-        product_variant: { select: { insurance_class: { select: { class_name: true } } } },
+        // misc_fee is re-read here (not just insurance_class) because
+        // coverages — the only thing this route recomputes — can now carry
+        // their own is_misc flag; the flat variant fee it's added to hasn't
+        // changed, but the coverage-derived portion of misc needs to stay in
+        // sync with whatever coverages this edit actually saves.
+        product_variant: { select: { misc_fee: true, insurance_class: { select: { class_name: true } } } },
         converted_application: { select: { application_number: true } },
         vehicles: {
           orderBy: { created_at: "asc" },
-          select: { id: true, vehicle_id: true, vehicle: { select: { estimated_value: true, initial_assessment_date: true } } },
+          select: {
+            id: true,
+            vehicle_id: true,
+            vehicle: { select: { estimated_value: true, initial_assessment_date: true, no_of_seats: true } },
+          },
         },
         // Only ever has a RISK row for Property — needed the same way
         // vehicles are, to re-price a VALUE_PERCENTAGE coverage; the risk
@@ -806,7 +971,7 @@ router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(update
         // read-only lookup, never written back.
         addresses: {
           where: { role: "RISK" },
-          select: { address: { select: { estimated_value: true } } },
+          select: { address_id: true, address: { select: { estimated_value: true } } },
         },
       },
     });
@@ -823,10 +988,13 @@ router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(update
     const className = quotation.product_variant.insurance_class.class_name;
 
     // resolveCoverageRows only needs enough of each vehicle to resolve
-    // VALUE_PERCENTAGE pricing (its current depreciated value) — vehicles
-    // themselves aren't editable here, so `existing_vehicle_id` is set but
-    // never actually used by that path.
-    const vehicles = quotation.vehicles.map((v) => ({ existing_vehicle_id: v.vehicle_id }));
+    // VALUE_PERCENTAGE/VEHICLE_SEATS_BASED pricing (current depreciated value/
+    // seat count) — vehicles themselves aren't editable here, so
+    // `existing_vehicle_id` is set but never actually used by either path.
+    const vehicles = quotation.vehicles.map((v) => ({
+      existing_vehicle_id: v.vehicle_id,
+      no_of_seats: v.vehicle.no_of_seats,
+    }));
     const vehicleValues =
       className === "Motor"
         ? quotation.vehicles.map((v) => currentVehicleValue(v.vehicle.estimated_value, v.vehicle.initial_assessment_date))
@@ -848,11 +1016,27 @@ router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(update
       endAt,
     });
 
-    const totalPremium = round2(resolvedRows.reduce((sum, r) => sum + r.premium_amount, 0));
-    const docStamps = round2(totalPremium * DOC_STAMPS_RATE);
-    const vat = round2(totalPremium * VAT_RATE);
-    const lgt = round2(totalPremium * LGT_RATE);
+    // Same is_misc split as POST / above.
+    const grossPremium = round2(resolvedRows.reduce((sum, r) => sum + r.premium_amount, 0));
+    const totalPremium = round2(resolvedRows.filter((r) => !r.is_misc).reduce((sum, r) => sum + r.premium_amount, 0));
+    const miscFromCoverages = round2(grossPremium - totalPremium);
+    const docStamps = round2(grossPremium * DOC_STAMPS_RATE);
+    const vat = round2(grossPremium * VAT_RATE);
+    const lgt = round2(grossPremium * LGT_RATE);
+    const miscAmount = round2((Number(quotation.product_variant.misc_fee) || 0) + miscFromCoverages);
     const policyQuotationVehicleIds = quotation.vehicles.map((v) => v.id);
+
+    // Re-derived on every edit (still non-enforced — see POST /) since a
+    // changed coverage period can change which policy (if any) this would
+    // continue.
+    let renewedPolicyId = null;
+    if (className === "Motor") {
+      const resolved = await resolveVehicleRenewal(quotation.vehicles.map((v) => v.vehicle_id), startAt, endAt, { enforce: false });
+      renewedPolicyId = resolved.renewedPolicyId;
+    } else if (className === "Property" && quotation.addresses[0]?.address_id) {
+      const resolved = await resolveRiskAddressRenewal(quotation.addresses[0].address_id, startAt, endAt, { enforce: false });
+      renewedPolicyId = resolved.renewedPolicyId;
+    }
 
     const updated = await prisma.$transaction(async (tx) => {
       await tx.quotationCoverage.deleteMany({ where: { quotation_id: quotation.id } });
@@ -878,6 +1062,8 @@ router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(update
           doc_stamps: docStamps,
           vat,
           lgt,
+          misc: miscAmount,
+          renewed_policy_id: renewedPolicyId,
         },
         select: quotationDetailSelect,
       });
@@ -973,13 +1159,22 @@ router.post("/:id/submit", validateParams(quotationIdParamSchema), validateBody(
     // The rule the agent asked for: never let the same vehicle, or (for an
     // address-based/Property product) the same risk address, carry an
     // application still pending approval, or an active policy whose own
-    // effectivity period overlaps this quotation's coverage period.
+    // effectivity period overlaps this quotation's coverage period. Recomputed
+    // fresh here (enforce: true) rather than trusting the quotation's own
+    // renewed_policy_id (set softly, non-enforced, at quotation-creation
+    // time) — real-world state (a new pending application, a policy that's
+    // since become active) may have changed since this quotation was drafted,
+    // and this is the moment it actually becomes a binding application.
+    let renewedPolicyId = null;
     if (className === "Motor") {
-      await assertVehiclesFree(vehicleIds, quotation.coverage_start_at, quotation.coverage_end_at);
+      const resolved = await resolveVehicleRenewal(vehicleIds, quotation.coverage_start_at, quotation.coverage_end_at);
+      renewedPolicyId = resolved.renewedPolicyId;
     }
     if (className === "Property" && riskAddress) {
-      await assertRiskAddressFree(riskAddress.address_id, quotation.coverage_start_at, quotation.coverage_end_at);
+      const resolved = await resolveRiskAddressRenewal(riskAddress.address_id, quotation.coverage_start_at, quotation.coverage_end_at);
+      renewedPolicyId = resolved.renewedPolicyId;
     }
+    const policyType = renewedPolicyId ? "RENEWAL" : "NEW_POLICY";
 
     const result = await prisma.$transaction(async (tx) => {
       const application = await tx.policyApplication.create({
@@ -1009,6 +1204,8 @@ router.post("/:id/submit", validateParams(quotationIdParamSchema), validateBody(
           bethel_payment_method_id: bethelPaymentMethod ? bethelPaymentMethod.id : null,
           remarks: quotation.remarks,
           source_quotation_id: quotation.id,
+          policy_type: policyType,
+          renewed_policy_id: renewedPolicyId,
         },
       });
 
@@ -1126,27 +1323,14 @@ router.post("/:id/resend-email", validateParams(quotationIdParamSchema), async (
 
     // The full quotation detail now lives in the attached PDF (same layout
     // as the on-screen/print preview) rather than duplicated inline — the
-    // email body is just a short cover note pointing at it.
-    const html = `
-      <div style="font-family:Arial,sans-serif;color:#111">
-        <p>Dear ${detail.insured_name},</p>
-        <p>Please find your quotation from Bethel General Insurance and Surety Corp. attached as a PDF (Quotation No. ${detail.quotation_number}).</p>
-        <p>This quotation is not a policy and does not bind coverage. Please contact your agent (${detail.agent_name || detail.agent_code}) with any questions.</p>
-      </div>
-    `;
-    const text = [
-      `Dear ${detail.insured_name},`,
-      "",
-      `Please find your quotation from Bethel General Insurance and Surety Corp. attached as a PDF (Quotation No. ${detail.quotation_number}).`,
-      "",
-      `This quotation is not a policy and does not bind coverage. Please contact your agent (${detail.agent_name || detail.agent_code}) with any questions.`,
-    ].join("\n");
-
+    // email body is just a short cover note pointing at it. Same wording
+    // POST / sends on initial delivery — see buildQuotationEmailContent.
+    const { subject, html, text } = buildQuotationEmailContent(detail);
     const pdfBuffer = await buildQuotationPdf(toPreviewProps(detail));
 
     await sendMail({
       to: detail.insured_email,
-      subject: `Your Bethel Insurance Quotation ${detail.quotation_number}`,
+      subject,
       html,
       text,
       attachments: [

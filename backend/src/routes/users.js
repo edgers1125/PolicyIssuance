@@ -86,7 +86,7 @@ router.get("/", requirePermission("MANAGE_USERS"), async (req, res, next) => {
         status: true,
         created_at: true,
         customer_id: true,
-        agent: { select: { id: true, agent_code: true, agent_name: true, status: true } },
+        agent: { select: { id: true, agent_code: true, agent_name: true, agent_type: true, status: true } },
         user_roles: {
           select: {
             role: {
@@ -201,6 +201,47 @@ router.get("/permissions", async (req, res, next) => {
   }
 });
 
+// The Add/Edit User dialogs' "Agent" picker — deliberately its own minimal
+// route rather than reusing GET /agents (routes/agents.js), which needs
+// MANAGE_AGENTS (a different permission someone managing users may not
+// hold) and returns premium/rate data this picker has no business seeing.
+// Lists both agent types now: an INDIVIDUAL is still a strictly 1:1 login
+// (has_user flags/excludes one already taken, enforced again on write below),
+// but a CORPORATE agent — a company/agency — can have many different Users
+// share the same agent_id, each logging in separately but all filing/pricing
+// under that one company record (see Agent.agent_type's own schema comment;
+// a plain individual agent has no equivalent sharing). user_count lets the
+// picker show how many logins already share a given company.
+router.get("/agents", requirePermission("MANAGE_USERS"), async (req, res, next) => {
+  try {
+    const agents = await prisma.agent.findMany({
+      where: { status: "ACTIVE" },
+      orderBy: { agent_name: "asc" },
+      select: {
+        id: true,
+        agent_code: true,
+        agent_name: true,
+        agent_type: true,
+        company: { select: { agent_name: true } },
+        users: { select: { id: true } },
+      },
+    });
+    res.json(
+      agents.map((a) => ({
+        id: a.id,
+        agent_code: a.agent_code,
+        agent_name: a.agent_name,
+        agent_type: a.agent_type,
+        company_name: a.company?.agent_name || null,
+        has_user: a.agent_type === "INDIVIDUAL" && a.users.length > 0,
+        user_count: a.users.length,
+      }))
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post(
   "/roles",
   requirePermission("MANAGE_SETTINGS.CREATE_ROLE"),
@@ -240,7 +281,7 @@ router.post("/", requirePermission("MANAGE_USERS"), validateBody(createUserSchem
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
     if (!ensurePermission(res, actingPermissions, "MANAGE_USERS.ADD_USER")) return;
 
-    const { email, first_name, last_name, role_id, permission_ids, make_agent, agent_code } = req.body;
+    const { email, first_name, last_name, role_id, permission_ids, agent_id } = req.body;
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
@@ -252,14 +293,23 @@ router.post("/", requirePermission("MANAGE_USERS"), validateBody(createUserSchem
       return res.status(400).json({ error: "role_id does not match an existing role" });
     }
 
-    if (make_agent) {
-      const existingAgentCode = await prisma.agent.findUnique({ where: { agent_code } });
-      if (existingAgentCode) {
-        return res.status(409).json({ error: "An agent with this agent code already exists" });
+    if (agent_id) {
+      // Agents are created separately (My Agents' "Add Agent"/"Add Company"
+      // action, POST /agents) — this only ever links to one already on file.
+      // An INDIVIDUAL agent is still a strictly 1:1 login (an agent already
+      // linked to a different user would silently misattribute whichever one
+      // logs in next); a CORPORATE agent (a company) can be shared across
+      // many different Users, each with their own separate login, all filing
+      // under — and priced at — that one company's own rates.
+      const agent = await prisma.agent.findUnique({ where: { id: agent_id } });
+      if (!agent) {
+        return res.status(400).json({ error: "agent_id does not match an existing agent" });
       }
-      const existingAgentEmail = await prisma.agent.findUnique({ where: { work_email: email } });
-      if (existingAgentEmail) {
-        return res.status(409).json({ error: "An agent with this work email already exists" });
+      if (agent.agent_type === "INDIVIDUAL") {
+        const alreadyLinked = await prisma.user.findFirst({ where: { agent_id } });
+        if (alreadyLinked) {
+          return res.status(409).json({ error: "This agent is already linked to another user" });
+        }
       }
     }
 
@@ -283,15 +333,6 @@ router.post("/", requirePermission("MANAGE_USERS"), validateBody(createUserSchem
         customerId = customer.id;
       }
 
-      let agentId;
-      if (make_agent) {
-        const agent = await tx.agent.create({
-          data: { agent_code, agent_name: full_name, work_email: email, status: "ACTIVE" },
-          select: { id: true },
-        });
-        agentId = agent.id;
-      }
-
       return tx.user.create({
         data: {
           email,
@@ -300,7 +341,7 @@ router.post("/", requirePermission("MANAGE_USERS"), validateBody(createUserSchem
           invite_token: inviteToken,
           invite_token_expires_at: new Date(Date.now() + INVITE_TOKEN_TTL_MS),
           customer_id: customerId,
-          agent_id: agentId,
+          agent_id: agent_id || null,
           user_roles: { create: { role_id } },
           user_permissions: expandedPermissionIds.length > 0
             ? { create: expandedPermissionIds.map((permission_id) => ({ permission_id })) }
@@ -334,7 +375,7 @@ router.post("/", requirePermission("MANAGE_USERS"), validateBody(createUserSchem
 router.patch("/:id", requirePermission("MANAGE_USERS"), validateBody(updateUserSchema), async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { full_name, email, status, role_id, permission_ids, reset_password, make_agent, agent_code } = req.body;
+    const { full_name, email, status, role_id, permission_ids, reset_password, agent_id } = req.body;
 
     const targetUser = await prisma.user.findUnique({ where: { id } });
     if (!targetUser) {
@@ -344,7 +385,7 @@ router.patch("/:id", requirePermission("MANAGE_USERS"), validateBody(updateUserS
     const actingPermissions = await getUserPermissionCodes(req.user.userId);
 
     const wantsDetailsChange =
-      full_name !== undefined || email !== undefined || status !== undefined || reset_password || make_agent;
+      full_name !== undefined || email !== undefined || status !== undefined || reset_password || agent_id !== undefined;
     if (wantsDetailsChange && !ensurePermission(res, actingPermissions, "MANAGE_USERS.EDIT_USER_DETAILS")) return;
     if (role_id !== undefined && !ensurePermission(res, actingPermissions, "MANAGE_USERS.EDIT_ROLE")) return;
     if (
@@ -353,25 +394,25 @@ router.patch("/:id", requirePermission("MANAGE_USERS"), validateBody(updateUserS
     )
       return;
 
-    if (make_agent && targetUser.agent_id) {
-      return res.status(409).json({ error: "This user is already an agent" });
-    }
-    if (make_agent && !agent_code) {
-      return res.status(400).json({ error: "agent_code is required to make this user an agent" });
-    }
-    if (make_agent) {
-      const existingAgentCode = await prisma.agent.findUnique({ where: { agent_code } });
-      if (existingAgentCode) {
-        return res.status(409).json({ error: "An agent with this agent code already exists" });
+    // agent_id === null explicitly clears the link; undefined leaves it
+    // untouched; a real id re-links (or first-links) it — same "link to an
+    // already-existing agent, never create one here" rule as POST /. Same
+    // INDIVIDUAL-exclusive/CORPORATE-shared split as POST / above.
+    if (agent_id) {
+      const agent = await prisma.agent.findUnique({ where: { id: agent_id } });
+      if (!agent) {
+        return res.status(400).json({ error: "agent_id does not match an existing agent" });
       }
-      const workEmail = email !== undefined ? email : targetUser.email;
-      const existingAgentEmail = await prisma.agent.findUnique({ where: { work_email: workEmail } });
-      if (existingAgentEmail) {
-        return res.status(409).json({ error: "An agent with this work email already exists" });
+      if (agent.agent_type === "INDIVIDUAL") {
+        const alreadyLinked = await prisma.user.findFirst({ where: { agent_id, id: { not: id } } });
+        if (alreadyLinked) {
+          return res.status(409).json({ error: "This agent is already linked to another user" });
+        }
       }
     }
 
     const data = {};
+    if (agent_id !== undefined) data.agent_id = agent_id || null;
     if (full_name !== undefined) data.full_name = full_name;
     if (status !== undefined) data.status = status;
 
@@ -395,19 +436,6 @@ router.patch("/:id", requirePermission("MANAGE_USERS"), validateBody(updateUserS
       data.invite_token = inviteToken;
       data.invite_token_expires_at = new Date(Date.now() + INVITE_TOKEN_TTL_MS);
       inviteLink = `${process.env.FRONTEND_URL}/set-password?token=${inviteToken}`;
-    }
-
-    if (make_agent) {
-      const agent = await prisma.agent.create({
-        data: {
-          agent_code,
-          agent_name: data.full_name || targetUser.full_name,
-          work_email: data.email || targetUser.email,
-          status: "ACTIVE",
-        },
-        select: { id: true },
-      });
-      data.agent_id = agent.id;
     }
 
     await prisma.user.update({ where: { id }, data });

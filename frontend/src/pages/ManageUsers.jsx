@@ -24,11 +24,18 @@ import {
   Stack,
   FormControlLabel,
   Checkbox,
+  Autocomplete,
+  ToggleButton,
+  ToggleButtonGroup,
+  Accordion,
+  AccordionSummary,
+  AccordionDetails,
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import EditIcon from "@mui/icons-material/Edit";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import { useAuth } from "../context/AuthContext";
-import { listUsers, listRoles, listPermissions, createUser, updateUser } from "../api/client";
+import { listUsers, listRoles, listPermissions, createUser, updateUser, listAgentsForUserLink } from "../api/client";
 import { PermissionChecklist } from "../components/PermissionChecklist";
 
 const STATUS_COLOR = {
@@ -50,6 +57,11 @@ function availableSpecialPermissions(permissions, roles, roleId) {
 
 function RoleAndPermissionsFields({ roles, permissions, roleId, onRoleChange, permissionIds, onPermissionIdsChange }) {
   const selectable = availableSpecialPermissions(permissions, roles, roleId);
+  // Collapsed by default — a long checklist of every sub-permission in the
+  // app was pushing the rest of this dialog's fields out of view for the
+  // common case (no special grants at all). Starts open when this user
+  // already has some checked, so editing an existing grant doesn't hide it.
+  const [expanded, setExpanded] = useState(permissionIds.length > 0);
 
   function togglePermission(id) {
     onPermissionIdsChange(
@@ -67,25 +79,109 @@ function RoleAndPermissionsFields({ roles, permissions, roleId, onRoleChange, pe
         ))}
       </TextField>
 
-      <Typography variant="body2" sx={{ fontWeight: 600 }}>
-        Special permissions (optional)
-      </Typography>
-      <Typography variant="caption" color="text.secondary">
-        Permissions already granted by the selected role aren't shown here.
-      </Typography>
-      <PermissionChecklist permissions={selectable} checkedIds={permissionIds} onToggle={togglePermission} />
+      <Accordion expanded={expanded} onChange={(e, isExpanded) => setExpanded(isExpanded)} disableGutters variant="outlined">
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Stack>
+            <Typography variant="body2" sx={{ fontWeight: 600 }}>
+              Special permissions {permissionIds.length > 0 ? `(${permissionIds.length} selected)` : "(optional)"}
+            </Typography>
+            <Typography variant="caption" color="text.secondary">
+              Permissions already granted by the selected role aren't shown here.
+            </Typography>
+          </Stack>
+        </AccordionSummary>
+        <AccordionDetails>
+          <PermissionChecklist permissions={selectable} checkedIds={permissionIds} onToggle={togglePermission} />
+        </AccordionDetails>
+      </Accordion>
     </>
   );
 }
 
-function AddUserDialog({ open, onClose, roles, permissions, token, onCreated }) {
+// Every agent's own display label — an INDIVIDUAL includes agent_code (the
+// thing that actually uniquely identifies it to whoever's picking) and, for
+// one already under a company, that company's name; a CORPORATE one instead
+// shows how many logins already share it, since — unlike an individual —
+// more than one User can point at the same company agent.
+function agentOptionLabel(a) {
+  if (a.agent_type === "CORPORATE") {
+    const count = a.user_count ? ` — ${a.user_count} existing login${a.user_count === 1 ? "" : "s"}` : "";
+    return `${a.agent_name} (${a.agent_code})${count}`;
+  }
+  const suffix = a.company_name ? ` — under ${a.company_name}` : "";
+  return `${a.agent_name} (${a.agent_code})${suffix}`;
+}
+
+// Shared by AddUserDialog/EditUserDialog — links a user to an already-
+// existing agent (see routes/users.js's GET /agents) rather than creating one
+// inline; agents are only ever created via My Agents' own "Add Agent"/"Add
+// Company" action now. Strictly one or the other, never both at once:
+//  - Individual Agent: a real person, 1:1 with a login — every agent already
+//    linked to a *different* user (has_user) is left out of the list, except
+//    the one currently linked to the user being edited (currentAgentId),
+//    which has_user is also true for but must still show up so editing a
+//    user without changing their agent doesn't look like the field is empty.
+//  - Company Agent: the company/agency's own Agent record — many different
+//    Users may share the same one, each logging in separately but all
+//    filing/pricing under that one company's own rates (see
+//    routes/users.js's own note on this split).
+function AgentPickerField({ agents, value, onChange, currentAgentId }) {
+  const [linkMode, setLinkMode] = useState(value?.agent_type === "CORPORATE" ? "CORPORATE" : "INDIVIDUAL");
+
+  useEffect(() => {
+    if (value) setLinkMode(value.agent_type === "CORPORATE" ? "CORPORATE" : "INDIVIDUAL");
+  }, [value]);
+
+  const options = agents.filter((a) => {
+    if (a.agent_type !== linkMode) return false;
+    return linkMode === "CORPORATE" || !a.has_user || a.id === currentAgentId;
+  });
+
+  return (
+    <Stack spacing={1}>
+      <ToggleButtonGroup
+        size="small"
+        exclusive
+        color="primary"
+        value={linkMode}
+        onChange={(e, v) => {
+          if (!v || v === linkMode) return;
+          setLinkMode(v);
+          onChange(null);
+        }}
+      >
+        <ToggleButton value="INDIVIDUAL">Individual Agent</ToggleButton>
+        <ToggleButton value="CORPORATE">Company Agent</ToggleButton>
+      </ToggleButtonGroup>
+      <Autocomplete
+        options={options}
+        getOptionLabel={agentOptionLabel}
+        value={value}
+        onChange={(e, newValue) => onChange(newValue)}
+        isOptionEqualToValue={(o, v) => o.id === v.id}
+        renderInput={(params) => (
+          <TextField
+            {...params}
+            label="Agent (optional)"
+            helperText={
+              linkMode === "CORPORATE"
+                ? "Shares this company's own rates — multiple logins may share the same company agent."
+                : "Connects this login to an existing individual agent, priced at their own or inherited rates."
+            }
+          />
+        )}
+      />
+    </Stack>
+  );
+}
+
+function AddUserDialog({ open, onClose, roles, permissions, agents, token, onCreated }) {
   const [email, setEmail] = useState("");
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
   const [roleId, setRoleId] = useState("");
   const [permissionIds, setPermissionIds] = useState([]);
-  const [makeAgent, setMakeAgent] = useState(false);
-  const [agentCode, setAgentCode] = useState("");
+  const [agent, setAgent] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [inviteLink, setInviteLink] = useState("");
@@ -96,8 +192,7 @@ function AddUserDialog({ open, onClose, roles, permissions, token, onCreated }) 
     setLastName("");
     setRoleId("");
     setPermissionIds([]);
-    setMakeAgent(false);
-    setAgentCode("");
+    setAgent(null);
     setError("");
     setInviteLink("");
   }
@@ -113,8 +208,7 @@ function AddUserDialog({ open, onClose, roles, permissions, token, onCreated }) 
         last_name: lastName,
         role_id: roleId,
         permission_ids: permissionIds,
-        make_agent: makeAgent,
-        agent_code: makeAgent ? agentCode : undefined,
+        agent_id: agent?.id,
       });
       setInviteLink(result.inviteLink);
       onCreated();
@@ -188,19 +282,7 @@ function AddUserDialog({ open, onClose, roles, permissions, token, onCreated }) 
                 onPermissionIdsChange={setPermissionIds}
               />
 
-              <FormControlLabel
-                control={<Checkbox checked={makeAgent} onChange={(e) => setMakeAgent(e.target.checked)} />}
-                label="Also register this person as an agent"
-              />
-              {makeAgent && (
-                <TextField
-                  label="Agent code"
-                  value={agentCode}
-                  onChange={(e) => setAgentCode(e.target.value)}
-                  required
-                  fullWidth
-                />
-              )}
+              <AgentPickerField agents={agents} value={agent} onChange={setAgent} />
 
               {error && <Alert severity="error">{error}</Alert>}
             </Stack>
@@ -217,15 +299,14 @@ function AddUserDialog({ open, onClose, roles, permissions, token, onCreated }) 
   );
 }
 
-function EditUserDialog({ open, onClose, user, roles, permissions, token, onSaved }) {
+function EditUserDialog({ open, onClose, user, roles, permissions, agents, token, onSaved }) {
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [status, setStatus] = useState("ACTIVE");
   const [roleId, setRoleId] = useState("");
   const [permissionIds, setPermissionIds] = useState([]);
   const [resetPassword, setResetPassword] = useState(false);
-  const [makeAgent, setMakeAgent] = useState(false);
-  const [agentCode, setAgentCode] = useState("");
+  const [agent, setAgent] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [inviteLink, setInviteLink] = useState("");
@@ -242,8 +323,15 @@ function EditUserDialog({ open, onClose, user, roles, permissions, token, onSave
       const selectableIds = new Set(permissions.map((p) => p.id));
       setPermissionIds(user.specialPermissions.map((p) => p.id).filter((id) => selectableIds.has(id)));
       setResetPassword(false);
-      setMakeAgent(false);
-      setAgentCode("");
+      // Prefer the matching row from `agents` (it may carry a company_name
+      // suffix the label wants) — fall back to a minimal option built from
+      // the user's own embedded agent if it's missing there (e.g. an
+      // INACTIVE agent, which GET /users/agents excludes).
+      setAgent(
+        user.agent
+          ? agents.find((a) => a.id === user.agent.id) || { ...user.agent, has_user: true, company_name: null }
+          : null
+      );
       setError("");
       setInviteLink("");
     }
@@ -262,8 +350,7 @@ function EditUserDialog({ open, onClose, user, roles, permissions, token, onSave
         role_id: roleId,
         permission_ids: permissionIds,
         reset_password: resetPassword,
-        make_agent: makeAgent,
-        agent_code: makeAgent ? agentCode : undefined,
+        agent_id: agent ? agent.id : null,
       });
       if (result.inviteLink) {
         setInviteLink(result.inviteLink);
@@ -343,27 +430,12 @@ function EditUserDialog({ open, onClose, user, roles, permissions, token, onSave
                 label="Force password reset (invalidates current password, sends a new invite link)"
               />
 
-              {user.agent ? (
-                <Alert severity="info">
-                  Already an agent — code <strong>{user.agent.agent_code}</strong>
-                </Alert>
-              ) : (
-                <>
-                  <FormControlLabel
-                    control={<Checkbox checked={makeAgent} onChange={(e) => setMakeAgent(e.target.checked)} />}
-                    label="Make this person an agent"
-                  />
-                  {makeAgent && (
-                    <TextField
-                      label="Agent code"
-                      value={agentCode}
-                      onChange={(e) => setAgentCode(e.target.value)}
-                      required
-                      fullWidth
-                    />
-                  )}
-                </>
-              )}
+              <AgentPickerField
+                agents={agents}
+                value={agent}
+                onChange={setAgent}
+                currentAgentId={user.agent?.id}
+              />
 
               {error && <Alert severity="error">{error}</Alert>}
             </Stack>
@@ -385,6 +457,7 @@ export function ManageUsers() {
   const [users, setUsers] = useState([]);
   const [roles, setRoles] = useState([]);
   const [permissions, setPermissions] = useState([]);
+  const [agents, setAgents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [addOpen, setAddOpen] = useState(false);
@@ -396,7 +469,12 @@ export function ManageUsers() {
 
   useEffect(() => {
     setLoading(true);
-    Promise.all([loadUsers(), listRoles(token).then(setRoles), listPermissions(token).then(setPermissions)])
+    Promise.all([
+      loadUsers(),
+      listRoles(token).then(setRoles),
+      listPermissions(token).then(setPermissions),
+      listAgentsForUserLink(token).then(setAgents),
+    ])
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -450,14 +528,14 @@ export function ManageUsers() {
                     />
                   </TableCell>
                   <TableCell>
-                    <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                    <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: "wrap" }}>
                       {u.roles.map((r) => (
                         <Chip key={r.id} label={r.role_name} size="small" />
                       ))}
                     </Stack>
                   </TableCell>
                   <TableCell>
-                    <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                    <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: "wrap" }}>
                       {u.specialPermissions.map((p) => (
                         <Chip
                           key={p.id}
@@ -493,8 +571,12 @@ export function ManageUsers() {
         onClose={() => setAddOpen(false)}
         roles={roles}
         permissions={permissions}
+        agents={agents}
         token={token}
-        onCreated={loadUsers}
+        onCreated={() => {
+          loadUsers();
+          listAgentsForUserLink(token).then(setAgents);
+        }}
       />
 
       <EditUserDialog
@@ -502,9 +584,13 @@ export function ManageUsers() {
         onClose={() => setEditingUser(null)}
         user={editingUser}
         roles={roles}
+        agents={agents}
         permissions={permissions}
         token={token}
-        onSaved={loadUsers}
+        onSaved={() => {
+          loadUsers();
+          listAgentsForUserLink(token).then(setAgents);
+        }}
       />
     </Container>
   );

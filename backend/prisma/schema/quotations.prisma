@@ -26,6 +26,17 @@ model PolicyQuotation {
   lgt                   Decimal     @db.Decimal(18, 2)
   misc                  Decimal     @db.Decimal(18, 2)
   send_policy_to_email  Boolean     @default(false)
+  // Auto-detected server-side (never client-supplied — see
+  // routes/policyQuotations.js's POST /) whenever any vehicle on this
+  // quotation (or, for Property, its risk address) already has policy
+  // history on file, regardless of which agent issued it. Unlike
+  // PolicyApplication, there's no policy_type column here to surface a
+  // visible "renewal" label on the quotation itself — a quotation is a
+  // non-binding preview, so this is carried silently and only becomes
+  // visible once the quotation is submitted (POST /:id/submit), where it's
+  // re-resolved fresh and actually enforced/carried onto the resulting
+  // PolicyApplication's own policy_type/renewed_policy_id.
+  renewed_policy_id     String?     @db.Uuid
   remarks               String?
   created_at            DateTime    @default(now())
   updated_at            DateTime    @updatedAt
@@ -34,6 +45,7 @@ model PolicyQuotation {
   company         Company?       @relation(fields: [company_id], references: [id])
   agent           Agent          @relation(fields: [agent_id], references: [id])
   product_variant ProductVariant @relation(fields: [product_variant_id], references: [id])
+  renewed_policy  Policy?        @relation("QuotationRenewals", fields: [renewed_policy_id], references: [id])
 
   vehicles  PolicyQuotationVehicle[]
   addresses PolicyQuotationAddress[]

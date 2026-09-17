@@ -1,0 +1,145 @@
+// One agent-filed request to amend an already-issued Policy without ever
+// writing onto the Policy row (or its PolicyVehicle/PolicyAddress/
+// PolicyCoverage snapshot columns) itself — see EndorsementChange below.
+// Mirrors PolicyApplicationChange's "never mutate the parent" contract, but
+// unlike that one (approver-only — an agent never submits a change against
+// their own application), an agent files a whole batch of proposed changes
+// here in one request (routes/endorsements.js's POST /), which an approver
+// can then add to / edit / remove from before deciding (POST, PATCH, DELETE
+// /:id/changes...) — the same edit capability ApplicationChangeType already
+// gives an approver, just now also reachable from the agent's own initial
+// submission. Numbered sequentially per policy
+// (endorsement_number = "<policy_number>-E<sequence_no>"), matching how a
+// real insurance endorsement schedule numbers its own amendments, rather
+// than a global ENDT-... code the way application/quotation numbers are.
+model EndorsementRequest {
+  id                 String            @id @default(uuid()) @db.Uuid
+  policy_id          String            @db.Uuid
+  endorsement_number String            @unique @db.VarChar(60)
+  sequence_no        Int
+  status             EndorsementStatus @default(SUBMITTED)
+  // CORRECTION (the default — one or more ordinary EndorsementChange lines)
+  // or CANCELLATION (exactly one CANCEL_POLICY line, no others) — see
+  // EndorsementRequestType.
+  request_type       EndorsementRequestType @default(CORRECTION)
+  // When this particular amendment itself takes effect — agent-entered,
+  // defaults to today. The "...and expires..." half of the endorsement
+  // template's effective line is never stored here at all: it's just
+  // whatever the policy's own (possibly already POLICY_EFFECTIVE_DATE-
+  // shifted) expiry_date happens to be at render time.
+  effective_date     DateTime          @db.Date
+  remarks            String?
+  // Same two-flag "started"/"approved" email pair as
+  // PolicyApplication.send_policy_to_email/send_policy_to_email_on_approval —
+  // see routes/endorsements.js's POST / and POST /:id/approve.
+  send_policy_to_email             Boolean @default(false)
+  send_policy_to_email_on_approval Boolean @default(false)
+  created_by_agent_id String          @db.Uuid
+  created_by_user_id  String          @db.Uuid
+  created_at          DateTime        @default(now())
+  updated_at          DateTime        @updatedAt
+
+  policy           Policy @relation(fields: [policy_id], references: [id])
+  created_by_agent Agent  @relation(fields: [created_by_agent_id], references: [id])
+  created_by_user  User   @relation(fields: [created_by_user_id], references: [id])
+
+  changes          EndorsementChange[]
+  approval_history EndorsementApprovalHistory[]
+  // The FOR_ENDORSEMENT InLeaseBacklog row created against this request's own
+  // policy once it's approved (routes/endorsements.js's POST /:id/approve) —
+  // see InLeaseBacklog.endorsement_request_id.
+  in_lease_backlogs InLeaseBacklog[]
+  // Reserved for a future AgentPayableTransaction row once an endorsement can
+  // actually change a premium/coverage amount — see that model's own note.
+  // Nothing creates one against this relation yet.
+  payable_transactions AgentPayableTransaction[]
+
+  @@unique([policy_id, sequence_no])
+  @@index([policy_id])
+  @@index([status])
+}
+
+// One amendment line within an EndorsementRequest — same change_from/
+// change_to-computed-server-side contract as PolicyApplicationChange, just
+// targeting a Policy's own PolicyVehicle/PolicyCoverage (policy_vehicle_id/
+// policy_coverage_id — which of the policy's vehicles/coverage lines, for a
+// Motor policy with more than one) rather than an application's. Freely
+// addable/editable/removable by an approver (routes/endorsements.js's POST/
+// PATCH/DELETE /:id/changes/...) while the parent request is still
+// SUBMITTED; frozen once it's APPROVED/REJECTED. Never written onto the
+// underlying Policy/PolicyVehicle/PolicyCoverage row at all, even on
+// approval — see EndorsementRequest's own note and routes/policies.js's
+// applyEndorsementsToPolicyDetail(), which folds every approved
+// EndorsementChange back in wherever a Policy's own detail/PDF is read,
+// the same way PolicyApplicationChange is folded into an application's.
+model EndorsementChange {
+  id                     String                @id @default(uuid()) @db.Uuid
+  endorsement_request_id String                @db.Uuid
+  policy_vehicle_id      String?               @db.Uuid
+  // Which existing coverage line this targets — EDIT_CLAUSE (fine-print
+  // text) and REMOVE_CLAUSE (remove the whole line) both use this; ADD_COVERAGE
+  // has no existing line to target and uses product_coverage_id instead.
+  policy_coverage_id     String?               @db.Uuid
+  change_type            EndorsementChangeType
+  change_from            String?               @db.Text
+  change_to              String?               @db.Text
+  remarks                String?               @db.Text
+  // The rest of these columns are only ever populated for the two financial
+  // change types (see EndorsementChangeType's own comment) — null for every
+  // other change_type:
+  //
+  // ADD_COVERAGE: which catalog coverage to add (product_coverage_id), and
+  // the full lib/coveragePricing.js-resolved row for it — coverage_amount/
+  // premium_amount/payable_to_bethel/applied_rate/is_misc — computed and
+  // frozen at filing time (same "applied_rate freezes at submission"
+  // convention as ApplicationCoverage/QuotationCoverage), not re-priced at
+  // approval. policy_vehicle_id above doubles as this coverage's own target
+  // vehicle (null = not vehicle-scoped, e.g. Property or a PERCENTAGE/
+  // FLAT_TIER coverage that doesn't need one).
+  //
+  // REMOVE_CLAUSE: a frozen copy of the *removed* PolicyCoverage's own
+  // premium_amount/payable_to_bethel at the moment this change was filed —
+  // policy_coverage_id above names which row; these columns are what
+  // POST /:id/approve debits the agent's payable ledger by, so the debit
+  // can't drift even if a broken concurrent edit changed the underlying row
+  // between filing and approval (it can't today — PolicyCoverage has no
+  // other write path — but the freeze keeps the two decoupled either way).
+  //
+  // created_policy_coverage_id: set only after approval, once ADD_COVERAGE
+  // actually materializes its own PolicyCoverage row — an audit pointer only,
+  // not a relation Prisma needs to traverse.
+  product_coverage_id     String?  @db.Uuid
+  coverage_amount         Decimal? @db.Decimal(18, 2)
+  premium_amount          Decimal? @db.Decimal(18, 2)
+  payable_to_bethel       Decimal? @db.Decimal(18, 2)
+  applied_rate            Decimal? @db.Decimal(10, 6)
+  is_misc                 Boolean?
+  created_policy_coverage_id String? @db.Uuid
+  created_at             DateTime              @default(now())
+  updated_at             DateTime              @updatedAt
+
+  endorsement_request EndorsementRequest @relation(fields: [endorsement_request_id], references: [id], onDelete: Cascade)
+  policy_vehicle      PolicyVehicle?     @relation(fields: [policy_vehicle_id], references: [id])
+  policy_coverage     PolicyCoverage?    @relation(fields: [policy_coverage_id], references: [id])
+  product_coverage    ProductCoverage?   @relation(fields: [product_coverage_id], references: [id])
+
+  @@index([endorsement_request_id])
+}
+
+// Append-only decision log for one EndorsementRequest — same shape as
+// ApprovalHistory, kept as its own table since that one's own FK is
+// policy_application_id-shaped and shouldn't be widened to mean two things.
+model EndorsementApprovalHistory {
+  id                     String           @id @default(uuid()) @db.Uuid
+  endorsement_request_id String           @db.Uuid
+  approver_id            String           @db.Uuid
+  decision               ApprovalDecision
+  comments               String?
+  decision_date          DateTime
+  created_at             DateTime         @default(now())
+
+  endorsement_request EndorsementRequest @relation(fields: [endorsement_request_id], references: [id])
+  approver            User               @relation(fields: [approver_id], references: [id])
+
+  @@index([endorsement_request_id])
+}

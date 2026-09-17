@@ -87,6 +87,17 @@ function ensurePermission(res, permissionCodes, permissionCode) {
   return false;
 }
 
+// Same as ensurePermission above, but for a field a caller may unlock via
+// more than one permission — e.g. catalog.js's PATCH /coverages/:id
+// maximum_coverage and PATCH /product-variants/:id's rate fields, editable by
+// either MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING or MANAGE_SETTINGS.MANAGE_PRODUCTS
+// (an admin who can create/delete whole products can reasonably price them too).
+function ensureAnyPermission(res, permissionCodes, codes) {
+  if (codes.some((c) => permissionCodes.has(c))) return true;
+  res.status(403).json({ error: `Missing required permission: one of ${codes.join(", ")}` });
+  return false;
+}
+
 // Every permission that unlocks the shared intake building blocks (product
 // catalog, customer/company/vehicle/address lookup+create) used while
 // filling out either a policy application or a quotation — kept in one
@@ -98,4 +109,11 @@ const INTAKE_PERMISSIONS = [
   "QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION",
 ];
 
-module.exports = { requirePermission, requireAnyPermission, ensurePermission, getUserPermissionCodes, INTAKE_PERMISSIONS };
+module.exports = {
+  requirePermission,
+  requireAnyPermission,
+  ensurePermission,
+  ensureAnyPermission,
+  getUserPermissionCodes,
+  INTAKE_PERMISSIONS,
+};

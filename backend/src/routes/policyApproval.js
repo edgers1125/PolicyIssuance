@@ -4,7 +4,13 @@ const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
 const { requirePermission } = require("../middleware/permissions");
 const { validateBody, validateQuery, validateParams } = require("../middleware/validate");
-const { listAllApplicationsQuerySchema, approveApplicationSchema } = require("../schemas/policyApproval");
+const {
+  listAllApplicationsQuerySchema,
+  approveApplicationSchema,
+  rejectApplicationSchema,
+} = require("../schemas/policyApproval");
+const { resolveVehicleRenewal, resolveRiskAddressRenewal } = require("../lib/policyConflicts");
+const { fetchByPriority } = require("../lib/priorityPagination");
 const { applicationIdParamSchema } = require("../schemas/policyApplications");
 const {
   VEHICLE_CHANGE_TYPES,
@@ -40,6 +46,25 @@ const VEHICLE_FIELD_BY_CHANGE_TYPE = {
   VEHICLE_CHASSIS_NO: "chassis_number",
 };
 
+// Rejects a change whose new value is identical (case/whitespace aside) to
+// what's already on file — recording a "correction" that doesn't actually
+// correct anything would still show up in the change history and, for
+// VEHICLE_*/INSURED_ADDRESS_DETAILS, still fire a real (no-op) write against
+// the shared Vehicle/Address row. Skipped for ADD_CLAUSE/REMOVE_CLAUSE, whose
+// change_to is always an already-different derived string (appending/
+// removing non-empty text can't reproduce the original verbatim) rather than
+// a like-for-like replacement. changeFrom of null/undefined means there was
+// nothing on file to compare against (e.g. an unset vehicle field) — always
+// allowed through.
+function assertActuallyChanged(changeFrom, changeTo) {
+  if (changeFrom === null || changeFrom === undefined) return;
+  const fromStr = String(changeFrom).trim();
+  const toStr = changeTo === null || changeTo === undefined ? "" : String(changeTo).trim();
+  if (fromStr === toStr) {
+    throw new HttpError(400, "The new value is the same as the current value on file — nothing to change");
+  }
+}
+
 function generatePolicyNumber() {
   const datePart = new Date().toISOString().slice(0, 10).replaceAll("-", "");
   const randomPart = crypto.randomBytes(3).toString("hex").toUpperCase();
@@ -52,35 +77,69 @@ function generatePolicyNumber() {
 // rather than a query flag bolted onto that one.
 router.use(requireAuth, requirePermission("APPROVE_APPLICATION"));
 
-// Every application in the system, from every agent — latest first. The
+// Every application in the system, from every agent. Priority-sorted, not a
+// plain date sort: a still-undecided application (anything short of
+// APPROVED/REJECTED — in practice, always SUBMITTED, since this app never
+// actually walks an application through FOR_EDIT_*/PENDING_*_APPROVAL today)
+// always ranks above a decided one, so the queue always surfaces what still
+// needs a decision first. Within the undecided bucket, oldest `submission_date`
+// first (the one that's been waiting longest gets handled first); within the
+// decided bucket, newest `created_at` first (a recent decision is more likely
+// to still be relevant/referenced than an old one) — see lib/priorityPagination.js
+// for why this needs two queries rather than one declarative `orderBy`. The
 // Policy Approval page's table.
+const DECIDED_APPLICATION_STATUSES = ["APPROVED", "REJECTED"];
+
 router.get("/", validateQuery(listAllApplicationsQuerySchema), async (req, res, next) => {
   try {
-    const { page, page_size: pageSize } = req.query;
+    const { page, page_size: pageSize, search, status, policy_type, class_id, agent_id } = req.query;
+    const where = {
+      ...(status ? { status } : {}),
+      ...(policy_type ? { policy_type } : {}),
+      ...(class_id ? { product_variant: { insurance_class_id: class_id } } : {}),
+      ...(agent_id ? { agent_id } : {}),
+      ...(search
+        ? {
+            OR: [
+              { application_number: { contains: search, mode: "insensitive" } },
+              { company_name_snapshot: { contains: search, mode: "insensitive" } },
+              { customer: { first_name: { contains: search, mode: "insensitive" } } },
+              { customer: { last_name: { contains: search, mode: "insensitive" } } },
+              { agent: { agent_code: { contains: search, mode: "insensitive" } } },
+              { agent: { agent_name: { contains: search, mode: "insensitive" } } },
+            ],
+          }
+        : {}),
+    };
+    const applicationSelect = {
+      id: true,
+      application_number: true,
+      insured_type: true,
+      status: true,
+      policy_type: true,
+      coverage_start_at: true,
+      coverage_end_at: true,
+      total_premium: true,
+      created_at: true,
+      customer: { select: { first_name: true, last_name: true } },
+      company_name_snapshot: true,
+      agent: { select: { agent_code: true, agent_name: true } },
+      product_variant: {
+        select: { variant_name: true, insurance_class: { select: { class_name: true } } },
+      },
+    };
 
     const [total, applications] = await Promise.all([
-      prisma.policyApplication.count(),
-      prisma.policyApplication.findMany({
-        orderBy: { created_at: "desc" },
+      prisma.policyApplication.count({ where }),
+      fetchByPriority({
+        delegate: prisma.policyApplication,
+        pendingWhere: { AND: [where, { status: { notIn: DECIDED_APPLICATION_STATUSES } }] },
+        decidedWhere: { AND: [where, { status: { in: DECIDED_APPLICATION_STATUSES } }] },
+        pendingOrderBy: { submission_date: "asc" },
+        decidedOrderBy: { created_at: "desc" },
+        select: applicationSelect,
         skip: (page - 1) * pageSize,
         take: pageSize,
-        select: {
-          id: true,
-          application_number: true,
-          insured_type: true,
-          status: true,
-          policy_type: true,
-          coverage_start_at: true,
-          coverage_end_at: true,
-          total_premium: true,
-          created_at: true,
-          customer: { select: { first_name: true, last_name: true } },
-          company_name_snapshot: true,
-          agent: { select: { agent_code: true, agent_name: true } },
-          product_variant: {
-            select: { variant_name: true, insurance_class: { select: { class_name: true } } },
-          },
-        },
       }),
     ]);
 
@@ -249,6 +308,9 @@ router.post(
       if (application.status === "APPROVED") {
         return res.status(409).json({ error: "This application has already been approved — no further changes can be recorded" });
       }
+      if (application.status === "REJECTED") {
+        return res.status(409).json({ error: "This application has been rejected — no further changes can be recorded" });
+      }
 
       const { change_type, application_vehicle_id, application_coverage_id, new_value, new_address, effective_date, remarks } =
         req.body;
@@ -267,6 +329,7 @@ router.post(
           }
           const field = VEHICLE_FIELD_BY_CHANGE_TYPE[change_type];
           changeFrom = appVehicle.vehicle[field] ?? null;
+          assertActuallyChanged(changeFrom, changeTo);
           await tx.vehicle.update({ where: { id: appVehicle.vehicle_id }, data: { [field]: new_value } });
         } else if (change_type === "INSURED_ADDRESS_DETAILS") {
           const appAddress = await tx.policyApplicationAddress.findFirst({
@@ -298,15 +361,18 @@ router.post(
           // permanently-mutating change types (VEHICLE_*).
           changeFrom = formatAddress(appAddress.address);
           changeTo = formatAddress(new_address);
+          assertActuallyChanged(changeFrom, changeTo);
           await tx.address.update({ where: { id: appAddress.address_id }, data: { ...new_address } });
         } else if (change_type === "INSURED_FROM_DATE") {
           changeFrom = application.coverage_start_at.toISOString();
           changeTo = new Date(new_value).toISOString();
+          assertActuallyChanged(changeFrom, changeTo);
         } else if (change_type === "INSURED_NAME_DETAILS") {
           changeFrom =
             application.insured_type === "INDIVIDUAL"
               ? formatInsuredName(application.customer || {})
               : application.company_name_snapshot;
+          assertActuallyChanged(changeFrom, changeTo);
         } else if (CLAUSE_CHANGE_TYPES.has(change_type)) {
           const appCoverage = await tx.applicationCoverage.findFirst({
             where: { id: application_coverage_id, application_id: application.id },
@@ -392,12 +458,16 @@ router.post(
         lgt: true,
         misc: true,
         remarks: true,
+        // Own policy_number of whatever this application renews/replaces, if
+        // any — frozen onto the issued Policy's own renewed_policy_number_snapshot
+        // (see schema/policies.prisma) so the printed "Renewing/Replacing:"
+        // line never needs a live join back to that other Policy row.
+        renewed_policy: { select: { policy_number: true } },
         agent: { select: { agent_code: true } },
         product_variant: {
           select: {
             variant_name: true,
             deductible_rate: true,
-            authorized_repair_limit_rate: true,
             insurance_class: { select: { class_name: true } },
           },
         },
@@ -444,6 +514,11 @@ router.post(
             coverage_id: true,
             coverage_amount: true,
             premium_amount: true,
+            // The agent's own margin on this coverage line — premium_amount
+            // minus what's actually owed to Bethel (see ApplicationCoverage's
+            // own comment) — summed below into the AgentPayableTransaction
+            // credited to the filing agent once this application is approved.
+            payable_to_bethel: true,
             coverage: { select: { coverage_code: true, coverage_name: true, clause: true, pricing_mode: true } },
           },
         },
@@ -454,6 +529,9 @@ router.post(
     }
     if (application.status === "APPROVED") {
       return res.status(409).json({ error: "This application has already been approved" });
+    }
+    if (application.status === "REJECTED") {
+      return res.status(409).json({ error: "This application has been rejected and can no longer be approved" });
     }
 
     const changes = await prisma.policyApplicationChange.findMany({
@@ -475,6 +553,31 @@ router.post(
       expiryDate = new Date(effectiveDate.getTime() + originalDurationMs);
     }
 
+    // Re-runs the same "no double-insuring the same asset" rule enforced at
+    // submission time (see lib/policyConflicts.js) — an application can sit
+    // pending for a while, so this closes the gap where a conflicting policy
+    // for one of its vehicles/its risk address got issued (or its own dates
+    // moved via an INSURED_FROM_DATE change) sometime between submission and
+    // this approval. excludeApplicationId keeps this same application's own
+    // still-pending PolicyApplicationVehicle/PolicyApplicationAddress rows
+    // from flagging themselves as a conflict — it's still in a pre-APPROVED
+    // status at the moment this runs. Throws (409, with a structured
+    // `conflict` body) via sendIfHttpError in the outer catch below.
+    const vehicleIdsForApproval = application.vehicles.map((v) => v.vehicle_id);
+    if (vehicleIdsForApproval.length) {
+      await resolveVehicleRenewal(vehicleIdsForApproval, effectiveDate, expiryDate, {
+        enforce: true,
+        excludeApplicationId: application.id,
+      });
+    }
+    const riskAddressForApproval = application.addresses.find((a) => a.role === "RISK");
+    if (riskAddressForApproval) {
+      await resolveRiskAddressRenewal(riskAddressForApproval.address_id, effectiveDate, expiryDate, {
+        enforce: true,
+        excludeApplicationId: application.id,
+      });
+    }
+
     let customerNameSnapshot =
       application.insured_type === "INDIVIDUAL" ? formatInsuredName(application.customer || {}) : null;
     let companyNameSnapshot = application.insured_type === "CORPORATE" ? application.company_name_snapshot : null;
@@ -490,6 +593,17 @@ router.post(
         clauseOverrideByCoverageId.set(c.application_coverage_id, c.change_to);
       }
     }
+
+    // The agent's own commission on this policy — summed across every
+    // coverage line's own margin (premium_amount minus what's actually owed
+    // to Bethel) — credited to their payable ledger the moment this
+    // application becomes an issued Policy. See AgentPayableTransaction
+    // (agentPayables.prisma) for why this is a signed-amount ledger entry
+    // rather than a running balance column on Agent.
+    const agentCommission = application.coverages.reduce(
+      (sum, c) => sum + (Number(c.premium_amount) - Number(c.payable_to_bethel)),
+      0
+    );
 
     const policy = await prisma.$transaction(async (tx) => {
       const createdPolicy = await tx.policy.create({
@@ -509,7 +623,7 @@ router.post(
           class_name_snapshot: application.product_variant.insurance_class.class_name,
           variant_name_snapshot: application.product_variant.variant_name,
           deductible_rate_snapshot: application.product_variant.deductible_rate,
-          authorized_repair_limit_rate_snapshot: application.product_variant.authorized_repair_limit_rate,
+          renewed_policy_number_snapshot: application.renewed_policy?.policy_number ?? null,
           issue_date: new Date(),
           effective_date: effectiveDate,
           expiry_date: expiryDate,
@@ -521,6 +635,17 @@ router.post(
           misc: application.misc,
           remarks: application.remarks,
         },
+      });
+
+      // Every issued policy needs to be uploaded into Bethel's in-lease
+      // system — this is what actually populates the In-Lease Backlogs page
+      // (routes/inLeaseBacklog.js), replacing the old flat
+      // Policy.added_to_inlease boolean. Created unaccomplished; who
+      // eventually uploads it isn't necessarily this approver, so
+      // accomplished_by_user_id is deliberately left null here rather than
+      // set to req.user.userId.
+      await tx.inLeaseBacklog.create({
+        data: { policy_id: createdPolicy.id, type: "FOR_UPLOAD" },
       });
 
       if (application.vehicles.length) {
@@ -565,6 +690,27 @@ router.post(
           })),
         });
       }
+
+      // Credits the filing agent's payable ledger with their commission on
+      // this policy — see AgentPayableTransaction's own note. Recorded even
+      // when it's 0 (a coverage priced at exactly Bethel's own floor rate),
+      // so the ledger's own row-per-policy history stays complete rather than
+      // silently skipping some approvals. Agent.payable (the denormalized
+      // running-balance cache the Accounting Overview page reads) is
+      // incremented in the same transaction so it can never drift from the
+      // ledger it's summarizing.
+      await tx.agentPayableTransaction.create({
+        data: {
+          agent_id: application.agent_id,
+          policy_id: createdPolicy.id,
+          transaction_type: "ISSUANCE",
+          amount: agentCommission,
+        },
+      });
+      await tx.agent.update({
+        where: { id: application.agent_id },
+        data: { payable: { increment: agentCommission } },
+      });
 
       await tx.policyApplication.update({ where: { id: application.id }, data: { status: "APPROVED" } });
 
@@ -624,5 +770,52 @@ router.post(
     next(err);
   }
 });
+
+// Rejects the application — the approval dialog's "Reject" action. Never
+// issues a Policy; just marks the application REJECTED and logs an
+// ApprovalHistory row (decision: REJECTED, comments: the required remarks).
+// There's no "un-reject" — a rejected application is a dead end, same as an
+// approved one is immutable in the other direction (both are terminal
+// ApplicationStatus values with no route that writes over them).
+router.post(
+  "/:id/reject",
+  validateParams(applicationIdParamSchema),
+  validateBody(rejectApplicationSchema),
+  async (req, res, next) => {
+    try {
+      const application = await prisma.policyApplication.findUnique({
+        where: { id: req.params.id },
+        select: { id: true, status: true },
+      });
+      if (!application) {
+        return res.status(404).json({ error: "Application not found" });
+      }
+      if (application.status === "APPROVED") {
+        return res.status(409).json({ error: "This application has already been approved and can no longer be rejected" });
+      }
+      if (application.status === "REJECTED") {
+        return res.status(409).json({ error: "This application has already been rejected" });
+      }
+
+      await prisma.$transaction([
+        prisma.policyApplication.update({ where: { id: application.id }, data: { status: "REJECTED" } }),
+        prisma.approvalHistory.create({
+          data: {
+            application_id: application.id,
+            approver_id: req.user.userId,
+            decision: "REJECTED",
+            comments: req.body.remarks,
+            decision_date: new Date(),
+          },
+        }),
+      ]);
+
+      res.json({ id: application.id, status: "REJECTED" });
+    } catch (err) {
+      if (sendIfHttpError(err, res)) return;
+      next(err);
+    }
+  }
+);
 
 module.exports = router;

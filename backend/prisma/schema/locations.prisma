@@ -58,6 +58,23 @@ model Vehicle {
   year_model              Int?
   vehicle_type            String?   @db.VarChar(50)
   color                   String?   @db.VarChar(50)
+  // Which Motor ProductVariant this vehicle is currently insured under — a
+  // real person's car is always a specific Motor sub-product (e.g. "Private
+  // Car" vs. "Commercial Vehicle"), never a bare "Motor" class, so this lives
+  // on the vehicle itself rather than being picked as its own step on every
+  // application/quotation that reuses it. Nullable only because a vehicle
+  // could in principle exist with no Motor history yet to derive it from
+  // (schemas/policyIntakeShared.js's vehicleInputSchema requires it on every
+  // create, so this is never actually null for a vehicle created going
+  // forward) — enforced to reference a Motor-class variant at the
+  // application layer (routes/policyApplications.js/policyQuotations.js),
+  // not a DB constraint, same as this app's other cross-table invariants.
+  // Freely editable later (PATCH /vehicles/:id) — e.g. a vehicle insured as
+  // "Private Car" one year can be corrected/switched to "Commercial Vehicle"
+  // on a later renewal; each already-issued Policy's own variant_name_snapshot
+  // still freezes whichever variant actually applied to *that* policy, so
+  // this change never rewrites history, only what a *future* filing defaults to.
+  product_variant_id      String?   @db.Uuid
   // Required going forward (see schemas/policyIntakeShared.js's
   // vehicleInputSchema) — feeds the policy schedule's "1 DRIVER AND N
   // OCCUPANTS OR PASSENGERS" endorsement line (N = no_of_seats - 1). Defaults
@@ -72,10 +89,13 @@ model Vehicle {
   created_at              DateTime  @default(now())
   updated_at              DateTime  @updatedAt
 
+  product_variant             ProductVariant?             @relation(fields: [product_variant_id], references: [id])
   party_vehicles              PartyVehicle[]
   policy_application_vehicles PolicyApplicationVehicle[]
   policy_quotation_vehicles   PolicyQuotationVehicle[]
   policy_vehicles             PolicyVehicle[]
+
+  @@index([product_variant_id])
 }
 
 // One party (a customer OR a company, never both) linked to one vehicle, for

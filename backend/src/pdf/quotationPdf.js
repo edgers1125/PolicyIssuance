@@ -14,7 +14,9 @@ const {
   SIGNATURE_BLOCK_HEIGHT,
   labelValue,
   computeDeductibleFigures,
+  TOWING_AMOUNT,
 } = require("./theme");
+const { drawLetterhead } = require("./letterhead");
 
 const WATERMARK_TEXT = "POLICY NOT IN EFFECT\nQUOTATION ONLY";
 
@@ -56,10 +58,12 @@ function buildQuotationPdf(props) {
 
     drawWatermark(doc);
 
+    const titleTop = drawLetterhead(doc, left, doc.page.margins.top, pageWidth);
+
     // Title block — bold then the class/variant line at the base
     // size/weight, matching the HTML's two centered header lines.
     doc.font(FONT_BODY_BOLD).fontSize(13).fillColor("#111111");
-    doc.text("QUOTATION", left, doc.page.margins.top, { width: pageWidth, align: "center" });
+    doc.text("QUOTATION", left, titleTop, { width: pageWidth, align: "center" });
     doc.fontSize(BASE_FONT_SIZE);
     const classLine = `${(props.classNameLabel || "").toUpperCase()}${
       props.variantName ? ` — ${props.variantName.toUpperCase()}` : ""
@@ -126,6 +130,15 @@ function buildQuotationPdf(props) {
     }
 
     sectionRule();
+    // Printed above Period of Insurance whenever this quotation was
+    // auto-detected as continuing an already-issued policy (see
+    // lib/policyConflicts.js, enforce:false — never client-supplied).
+    if (props.renewingPolicyNumber) {
+      doc.font(FONT_BODY_BOLD).fontSize(BASE_FONT_SIZE).fillColor("#111111");
+      doc.text("Renewing/Replacing : ", left, doc.y, { continued: true, width: pageWidth });
+      doc.font(FONT_BODY).text(props.renewingPolicyNumber);
+      doc.moveDown(0.3);
+    }
     const from = fmtDateTime(props.coverageStartAt);
     const to = fmtDateTime(props.coverageEndAt);
     doc.font(FONT_BODY_BOLD).fontSize(BASE_FONT_SIZE).fillColor("#111111");
@@ -160,7 +173,7 @@ function buildQuotationPdf(props) {
         labelValue(doc, "Body:", v.vehicle_type || "—", left, rowY2, half);
         labelValue(doc, "Serial No.:", v.chassis_number, left + half, rowY2, half);
         const rowY3 = doc.y + 5;
-        labelValue(doc, "Make:", v.make || "—", left, rowY3, half);
+        labelValue(doc, "Make:", [v.make, v.model].filter(Boolean).join(" ") || "—", left, rowY3, half);
         labelValue(doc, "Authentication No.:", v.engine_number, left + half, rowY3, half);
         const rowY4 = doc.y + 5;
         labelValue(doc, "Plate No.:", v.plate_number, left, rowY4, half);
@@ -246,11 +259,11 @@ function buildQuotationPdf(props) {
           .stroke();
         doc.moveDown(0.3);
 
-        const { deductible, authorizedRepairLimit } = computeDeductibleFigures(c.amount, props.deductibleRate, props.authorizedRepairLimitRate);
+        const { deductible, authorizedRepairLimit } = computeDeductibleFigures(c.amount, props.deductibleRate);
         doc.font(FONT_BODY_BOLD).fontSize(BASE_FONT_SIZE).text("Deductible: ", left, doc.y, { continued: true });
         drawCurrencyInline(doc, deductible, { bold: true });
-        // Towing is deliberately left blank — filled in by hand, not computed.
-        doc.text("   |   Towing:  ", { continued: true });
+        doc.text("   |   Towing: ", { continued: true });
+        drawCurrencyInline(doc, TOWING_AMOUNT, { bold: true });
         doc.text("   |   Authorized Repair Limit: ", { continued: true });
         drawCurrencyInline(doc, authorizedRepairLimit, { bold: true, continued: false });
         // Tight trailing gap — sectionRule() (below, before SECTION IVA)

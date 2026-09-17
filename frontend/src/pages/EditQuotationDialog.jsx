@@ -113,6 +113,31 @@ function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
       }
       coverageAmount = Number(tier.coverage_amount);
       payablePerVehicle = Number(tier.coverage_price);
+    } else if (cov.pricing_mode === "VEHICLE_SEATS_BASED") {
+      // Property has no vehicles at all — seat-based pricing has nothing to
+      // key off in that case.
+      if (idx === null) {
+        return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
+      }
+      const seats = Number(vehicles[idx]?.no_of_seats);
+      if (!Number.isFinite(seats) || seats <= 0) {
+        return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
+      }
+      if (cov.seats_threshold === null || cov.seats_threshold === undefined) {
+        return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true, noTier: true };
+      }
+      // selection.coverage_amount is the agent's chosen "insured amount for
+      // each occupant" — the tier key, same convention as FLAT_TIER's own
+      // coverage_amount — not the final total insured value.
+      const tier = (cov.seats_tier_prices || []).find(
+        (t) => String(t.insured_amount_per_occupant) === String(selection.coverage_amount)
+      );
+      if (!tier) {
+        return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
+      }
+      const excessSeats = Math.max(0, seats - Number(cov.seats_threshold));
+      coverageAmount = seats * Number(tier.insured_amount_per_occupant);
+      payablePerVehicle = excessSeats * Number(tier.rate_per_excess_seat);
     } else {
       coverageAmount = Number(selection.coverage_amount) || 0;
       payablePerVehicle = coverageAmount * Number(cov.rate);
@@ -250,6 +275,8 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
           is_custom_rate: period.is_custom_rate,
           value_percentage_tiers: period.value_percentage_tiers,
           tier_based_prices: period.tier_based_prices,
+          seats_threshold: period.seats_threshold,
+          seats_tier_prices: period.seats_tier_prices,
           has_custom_tiers: period.has_custom_tiers,
           has_pricing: period.has_pricing,
         }
@@ -364,7 +391,6 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
         };
       }),
       deductibleRate: detail.deductible_rate,
-      authorizedRepairLimitRate: detail.authorized_repair_limit_rate,
       totalPremium,
       docStamps,
       vat,
@@ -372,6 +398,7 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
       misc: miscAmount,
       totalAmount,
       remarks: detail.remarks || "",
+      renewingPolicyNumber: detail.renewed_policy_number || undefined,
     };
   }
 
@@ -439,11 +466,12 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
           const cov = coverages.find((c) => c.id === coverage_id);
           return {
             coverage_id,
-            // VALUE_PERCENTAGE never collects a coverage_amount from the agent
-            // (the server computes its own from the vehicle/address value) —
-            // coverage_amount is only required by the schema to reject an
-            // unfilled-in PERCENTAGE/FLAT_TIER selection, so send a harmless
-            // positive placeholder here instead of the unset 0.
+            // VALUE_PERCENTAGE never collects a coverage_amount from the
+            // agent (the server computes its own from the vehicle/address
+            // value) — coverage_amount is only required by the schema to
+            // reject an unfilled-in PERCENTAGE/FLAT_TIER/VEHICLE_SEATS_BASED
+            // selection, so send a harmless positive placeholder here
+            // instead of the unset 0.
             coverage_amount: cov?.pricing_mode === "VALUE_PERCENTAGE" ? 1 : Number(v.coverage_amount) || 0,
             premium_amount: Number(v.premium_amount) || 0,
             vehicle_indices: v.vehicle_indices ?? null,
@@ -590,6 +618,33 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
                             {(cov.tier_based_prices || []).map((tier) => (
                               <MenuItem key={tier.id} value={String(tier.coverage_amount)}>
                                 {formatPHP(tier.coverage_amount)} — {formatPHP(tier.coverage_price)}
+                              </MenuItem>
+                            ))}
+                          </TextField>
+                        )}
+                        {cov.pricing_mode === "VEHICLE_SEATS_BASED" && (
+                          <TextField
+                            select
+                            label="Insured amount for each occupant"
+                            value={
+                              (cov.seats_tier_prices || []).some(
+                                (t) => String(t.insured_amount_per_occupant) === String(selection.coverage_amount)
+                              )
+                                ? String(selection.coverage_amount)
+                                : ""
+                            }
+                            onChange={(e) => updateCoverageField(cov.id, "coverage_amount", e.target.value)}
+                            required
+                            fullWidth
+                            size="small"
+                            sx={{ mb: 1 }}
+                          >
+                            {(cov.seats_tier_prices || []).map((tier) => (
+                              <MenuItem
+                                key={tier.insured_amount_per_occupant}
+                                value={String(tier.insured_amount_per_occupant)}
+                              >
+                                {formatPHP(tier.insured_amount_per_occupant)}/occupant — {formatPHP(tier.rate_per_excess_seat)}/excess seat
                               </MenuItem>
                             ))}
                           </TextField>

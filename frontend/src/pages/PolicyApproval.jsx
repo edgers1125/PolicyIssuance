@@ -1,7 +1,5 @@
 import { useEffect, useState } from "react";
 import {
-  Container,
-  Typography,
   Paper,
   Table,
   TableHead,
@@ -14,11 +12,18 @@ import {
   Alert,
   CircularProgress,
   Chip,
+  TextField,
+  MenuItem,
+  InputAdornment,
+  Stack,
+  Button,
+  Typography,
 } from "@mui/material";
+import SearchIcon from "@mui/icons-material/Search";
 import { useAuth } from "../context/AuthContext";
 import { listApplicationsForApproval } from "../api/client";
 import { formatPHP } from "../utils/currency";
-import { StatusChip } from "../components/StatusChip";
+import { StatusChip, STATUS_LABELS } from "../components/StatusChip";
 import { ApplicationReviewDialog } from "../components/ApplicationReviewDialog";
 
 function fmtDate(value) {
@@ -39,7 +44,10 @@ const POLICY_TYPE_COLORS = { NEW_POLICY: "default", RENEWAL: "info" };
 // it). Row click opens ApplicationReviewDialog — one wide popup with the
 // PDF on the left and the change-history/"Create Change"/"Approve" panel on
 // the right, side by side, rather than a separate Actions-column button
-// opening its own dialog.
+// opening its own dialog. The "Policy Approval" tab of pages/Approvals.jsx —
+// no outer Container/heading of its own, since that page supplies the
+// shared page chrome + horizontal Tabs above both it and EndorsementApproval.jsx
+// (same relationship as MyClients.jsx's own two tabs).
 export function PolicyApproval() {
   const { token } = useAuth();
   const [rows, setRows] = useState([]);
@@ -50,10 +58,49 @@ export function PolicyApproval() {
   const [error, setError] = useState("");
   const [reviewing, setReviewing] = useState(null);
 
+  // Search/filter bar — server-side (see listAllApplicationsQuerySchema),
+  // search debounced so it doesn't re-fetch on every keystroke. Search also
+  // matches the filing agent's own code/name, unique to this cross-agent view.
+  const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [policyTypeFilter, setPolicyTypeFilter] = useState("");
+  const hasActiveFilters = Boolean(search || statusFilter || policyTypeFilter);
+
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      setDebouncedSearch(search.trim());
+      setPage(0);
+    }, 300);
+    return () => clearTimeout(timeout);
+  }, [search]);
+
+  function handleStatusFilterChange(value) {
+    setStatusFilter(value);
+    setPage(0);
+  }
+
+  function handlePolicyTypeFilterChange(value) {
+    setPolicyTypeFilter(value);
+    setPage(0);
+  }
+
+  function clearFilters() {
+    setSearch("");
+    setDebouncedSearch("");
+    setStatusFilter("");
+    setPolicyTypeFilter("");
+    setPage(0);
+  }
+
   function loadApplications() {
     setLoading(true);
     setError("");
-    return listApplicationsForApproval(token, page + 1, rowsPerPage)
+    return listApplicationsForApproval(token, page + 1, rowsPerPage, {
+      search: debouncedSearch,
+      status: statusFilter,
+      policy_type: policyTypeFilter,
+    })
       .then((data) => {
         setRows(data.data);
         setTotal(data.total);
@@ -65,15 +112,57 @@ export function PolicyApproval() {
   useEffect(() => {
     loadApplications();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, page, rowsPerPage]);
+  }, [token, page, rowsPerPage, debouncedSearch, statusFilter, policyTypeFilter]);
 
   return (
-    <Container maxWidth="xl" sx={{ py: { xs: 3, sm: 6 } }}>
-      <Box sx={{ mb: 3 }}>
-        <Typography variant="h5" sx={{ fontWeight: 700 }}>
-          Policy Approval
-        </Typography>
-      </Box>
+    <>
+      <Paper sx={{ p: 2, borderRadius: 3, mb: 2 }}>
+        <Stack direction={{ xs: "column", sm: "row" }} spacing={2} sx={{ alignItems: { xs: "stretch", sm: "center" } }}>
+          <TextField
+            placeholder="Search by application #, insured name, or agent"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            size="small"
+            fullWidth
+            slotProps={{ input: { startAdornment: <InputAdornment position="start"><SearchIcon fontSize="small" /></InputAdornment> } }}
+          />
+          <TextField
+            select
+            label="Status"
+            value={statusFilter}
+            onChange={(e) => handleStatusFilterChange(e.target.value)}
+            size="small"
+            sx={{ minWidth: 200 }}
+          >
+            <MenuItem value="">All statuses</MenuItem>
+            {Object.entries(STATUS_LABELS).map(([value, label]) => (
+              <MenuItem key={value} value={value}>
+                {label}
+              </MenuItem>
+            ))}
+          </TextField>
+          <TextField
+            select
+            label="Type"
+            value={policyTypeFilter}
+            onChange={(e) => handlePolicyTypeFilterChange(e.target.value)}
+            size="small"
+            sx={{ minWidth: 160 }}
+          >
+            <MenuItem value="">All types</MenuItem>
+            {Object.entries(POLICY_TYPE_LABELS).map(([value, label]) => (
+              <MenuItem key={value} value={value}>
+                {label}
+              </MenuItem>
+            ))}
+          </TextField>
+          {hasActiveFilters && (
+            <Button onClick={clearFilters} size="small">
+              Clear filters
+            </Button>
+          )}
+        </Stack>
+      </Paper>
 
       {error && (
         <Alert severity="error" sx={{ mb: 2 }}>
@@ -94,12 +183,10 @@ export function PolicyApproval() {
                   <TableCell>Application #</TableCell>
                   <TableCell>Agent</TableCell>
                   <TableCell>Insured</TableCell>
-                  <TableCell>Class</TableCell>
-                  <TableCell>Product Variant</TableCell>
+                  <TableCell>Class / Variant</TableCell>
                   <TableCell>Status</TableCell>
                   <TableCell>Type</TableCell>
-                  <TableCell>Insured From</TableCell>
-                  <TableCell>Insured To</TableCell>
+                  <TableCell>Coverage Period</TableCell>
                   <TableCell align="right">Total Premium</TableCell>
                   <TableCell>Created</TableCell>
                 </TableRow>
@@ -107,8 +194,8 @@ export function PolicyApproval() {
               <TableBody>
                 {rows.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={11} align="center" sx={{ py: 4, color: "text.secondary" }}>
-                      No policy applications yet.
+                    <TableCell colSpan={9} align="center" sx={{ py: 4, color: "text.secondary" }}>
+                      {hasActiveFilters ? "No applications match your search/filters." : "No policy applications yet."}
                     </TableCell>
                   </TableRow>
                 ) : (
@@ -119,11 +206,15 @@ export function PolicyApproval() {
                       onClick={() => setReviewing({ id: a.id, applicationNumber: a.application_number })}
                       sx={{ cursor: "pointer" }}
                     >
-                      <TableCell>{a.application_number}</TableCell>
+                      <TableCell sx={{ fontFamily: "monospace", whiteSpace: "nowrap" }}>{a.application_number}</TableCell>
                       <TableCell>{a.agent_name || a.agent_code}</TableCell>
                       <TableCell>{a.insured_name || "—"}</TableCell>
-                      <TableCell>{a.class_name}</TableCell>
-                      <TableCell>{a.variant_name}</TableCell>
+                      <TableCell>
+                        <Typography variant="body2">{a.class_name}</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {a.variant_name}
+                        </Typography>
+                      </TableCell>
                       <TableCell>
                         <StatusChip status={a.status} />
                       </TableCell>
@@ -134,8 +225,9 @@ export function PolicyApproval() {
                           color={POLICY_TYPE_COLORS[a.policy_type] || "default"}
                         />
                       </TableCell>
-                      <TableCell>{fmtDate(a.coverage_start_at)}</TableCell>
-                      <TableCell>{fmtDate(a.coverage_end_at)}</TableCell>
+                      <TableCell sx={{ whiteSpace: "nowrap" }}>
+                        {fmtDate(a.coverage_start_at)} – {fmtDate(a.coverage_end_at)}
+                      </TableCell>
                       <TableCell align="right">{formatPHP(a.total_premium)}</TableCell>
                       <TableCell>{fmtDate(a.created_at)}</TableCell>
                     </TableRow>
@@ -168,6 +260,6 @@ export function PolicyApproval() {
           onApproved={loadApplications}
         />
       )}
-    </Container>
+    </>
   );
 }

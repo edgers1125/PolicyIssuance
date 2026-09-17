@@ -1,0 +1,58 @@
+// One entry in an agent's running payable ledger — a single signed-amount
+// table rather than a separate "amount owed" table and "payments" table.
+// An ISSUANCE row (auto-created by POST /policy-approval/:id/approve)
+// credits the balance with a positive amount — the agent's own margin on
+// that policy, SUM(premium_amount - payable_to_bethel) across its
+// PolicyCoverage rows; CANCELLED_POLICY/PAYMENT rows debit it with a negative
+// amount. An agent's current balance is always just
+// `SUM(amount) WHERE agent_id = ...` — mirrored, for read efficiency, onto
+// Agent.payable (a denormalized running total kept in sync by every write
+// here; see that column's own comment) — and the full history reads
+// chronologically off this one table in one query, rather than needing a
+// UNION across two. Append-only, same "never edited in place" contract as
+// ApprovalHistory/CancellationHistory elsewhere in this schema — correct a
+// mistake with an offsetting entry, not a mutation.
+//
+// `amount`'s sign is tied to `transaction_type` and enforced twice: a zod
+// refinement in schemas/agentPayables.js (createPayableTransactionSchema)
+// for anything entered through the API, and a DB-level CHECK constraint
+// (added by hand in this table's own migration, since Prisma has no
+// `@@check` schema syntax) for every other writer, present or future.
+// ISSUANCE requires amount >= 0; CANCELLED_POLICY/PAYMENT require amount <=
+// 0; ENDORSEMENT can be either sign — positive when routes/endorsements.js's
+// POST /:id/approve is crediting an ADD_COVERAGE line's own margin, negative
+// when it's debiting a REMOVE_CLAUSE line's own margin (see
+// AgentPayableTransactionType's own comment) — so the DB CHECK for
+// ENDORSEMENT only requires it be present/finite, not signed one way.
+model AgentPayableTransaction {
+  id               String                      @id @default(uuid()) @db.Uuid
+  agent_id         String                      @db.Uuid
+  transaction_type AgentPayableTransactionType
+  // Positive credits the agent's balance (ISSUANCE/ENDORSEMENT); negative
+  // debits it (CANCELLED_POLICY/PAYMENT) — see the CHECK constraint note
+  // above for where the sign itself is actually enforced.
+  amount           Decimal                     @db.Decimal(18, 2)
+  // Set on an ISSUANCE/CANCELLED_POLICY row (which policy it's against);
+  // left null on a PAYMENT row that settles the agent's overall running
+  // balance rather than crediting/debiting one specific policy.
+  policy_id        String?                     @db.Uuid
+  // Set on an ENDORSEMENT row once that entry type is actually created —
+  // reserved for now, since EndorsementChangeType is deliberately
+  // "corrections only" today (see that enum's own comment).
+  endorsement_request_id String?               @db.Uuid
+  remarks          String?
+  // Who recorded this entry — always set on a manually-recorded PAYMENT;
+  // null on a system-computed ISSUANCE/ENDORSEMENT/CANCELLED_POLICY row (not
+  // meaningfully attributable to whoever happened to click the triggering
+  // action).
+  created_by_user_id String?                   @db.Uuid
+  created_at       DateTime                    @default(now())
+
+  agent               Agent               @relation(fields: [agent_id], references: [id])
+  policy              Policy?             @relation(fields: [policy_id], references: [id])
+  endorsement_request EndorsementRequest? @relation(fields: [endorsement_request_id], references: [id])
+  created_by_user     User?               @relation(fields: [created_by_user_id], references: [id])
+
+  @@index([agent_id])
+  @@index([policy_id])
+}

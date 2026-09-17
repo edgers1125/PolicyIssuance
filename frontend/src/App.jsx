@@ -7,19 +7,18 @@ import { ManageUsers } from "./pages/ManageUsers";
 import { Settings } from "./pages/Settings";
 import { RoleDefaultPermissions } from "./pages/RoleDefaultPermissions";
 import { CreateRole } from "./pages/CreateRole";
-import { EditClauses } from "./pages/EditClauses";
-import { ManageCoveragePricing } from "./pages/ManageCoveragePricing";
-import { ManageVehicleRates } from "./pages/ManageVehicleRates";
+import { ManageProducts } from "./pages/ManageProducts";
 import { AuthorizedPaymentMethods } from "./pages/AuthorizedPaymentMethods";
 import { PolicyApplications } from "./pages/PolicyApplications";
 import { Quotations } from "./pages/Quotations";
-import { PolicyApproval } from "./pages/PolicyApproval";
-import { ClientPolicies } from "./pages/ClientPolicies";
+import { Approvals } from "./pages/Approvals";
+import { MyClients } from "./pages/MyClients";
 import { MyAgents } from "./pages/MyAgents";
+import { Accounting } from "./pages/Accounting";
+import { InLeaseBacklogs } from "./pages/InLeaseBacklogs";
 import { AppLayout } from "./layouts/AppLayout";
 import { ProtectedRoute } from "./components/ProtectedRoute";
 import { RequirePermission } from "./components/RequirePermission";
-import { PlaceholderPage } from "./components/PlaceholderPage";
 
 function App() {
   return (
@@ -56,7 +55,7 @@ function App() {
           path="/my-policies"
           element={
             <RequirePermission permission="VIEW_POLICIES">
-              <ClientPolicies />
+              <MyClients />
             </RequirePermission>
           }
         />
@@ -64,15 +63,15 @@ function App() {
           path="/inlease-backlogs"
           element={
             <RequirePermission permission="MANAGE_INLEASE">
-              <PlaceholderPage title="In-Lease Backlogs" />
+              <InLeaseBacklogs />
             </RequirePermission>
           }
         />
         <Route
-          path="/policy-approval"
+          path="/approvals"
           element={
-            <RequirePermission permission="APPROVE_APPLICATION">
-              <PolicyApproval />
+            <RequirePermission permission={["APPROVE_APPLICATION", "APPROVE_ENDORSEMENT"]}>
+              <Approvals />
             </RequirePermission>
           }
         />
@@ -89,6 +88,14 @@ function App() {
           element={
             <RequirePermission permission="MANAGE_AGENTS">
               <MyAgents />
+            </RequirePermission>
+          }
+        />
+        <Route
+          path="/accounting"
+          element={
+            <RequirePermission permission="MANAGE_ACCOUNTING">
+              <Accounting />
             </RequirePermission>
           }
         />
@@ -117,14 +124,6 @@ function App() {
           }
         />
         <Route
-          path="/settings/edit-clauses"
-          element={
-            <RequirePermission permission="MANAGE_SETTINGS.EDIT_CLAUSES">
-              <EditClauses />
-            </RequirePermission>
-          }
-        />
-        <Route
           path="/settings/payment-methods"
           element={
             <RequirePermission permission="MANAGE_SETTINGS.MANAGE_PAYMENT_METHODS">
@@ -133,18 +132,10 @@ function App() {
           }
         />
         <Route
-          path="/settings/coverage-pricing"
+          path="/settings/manage-products"
           element={
-            <RequirePermission permission="MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING">
-              <ManageCoveragePricing />
-            </RequirePermission>
-          }
-        />
-        <Route
-          path="/settings/vehicle-rates"
-          element={
-            <RequirePermission permission="MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING">
-              <ManageVehicleRates />
+            <RequirePermission permission="MANAGE_SETTINGS.MANAGE_PRODUCTS">
+              <ManageProducts />
             </RequirePermission>
           }
         />
