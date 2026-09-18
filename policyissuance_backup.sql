@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict zp3MhIWp4HqTVpPNaALCkbmeEvJ4TH8eERTDcb0VSfvgbdjd2b7TSdMx0K0mwCn
+\restrict 4Uibl9sHBm8Pl2K48mTnIElMdgKRd1duzS3PmrgrlpbP3ghLkuSUfBZ1bmXkWTF
 
 -- Dumped from database version 16.15 (Debian 16.15-1.pgdg13+2)
 -- Dumped by pg_dump version 16.15 (Debian 16.15-1.pgdg13+2)
@@ -1628,9 +1628,6 @@ ALTER TABLE public._prisma_migrations OWNER TO policyapp;
 --
 
 COPY public."Address" (id, address_line_1, address_line_2, barangay, city, province, postal_code, country, latitude, longitude, google_place_id, formatted_address, address_type, created_at, updated_at, estimated_value) FROM stdin;
-c24bec24-5520-4346-91b3-3a7f205bfe02	209	\N	123	123	123	123	Philippines	\N	\N	\N	\N	RESIDENTIAL	2026-09-18 05:23:18.405	2026-09-18 05:23:18.405	\N
-9872c713-b3ee-407a-bd88-8ff1387c3a4b	123 Test St	\N	Test Brgy	Marikina	Metro Manila	1800	Philippines	\N	\N	\N	\N	RESIDENTIAL	2026-09-18 06:40:40.283	2026-09-18 06:40:40.283	\N
-7e561c7e-9fd8-4756-bb37-2eaaab8859cb	123 Test St	\N	Test Brgy	Marikina	Metro Manila	1800	Philippines	\N	\N	\N	\N	RESIDENTIAL	2026-09-18 07:00:48.547	2026-09-18 07:00:48.547	\N
 \.
 
 
@@ -1664,7 +1661,6 @@ COPY public."AgentNetrate" (id, agent_id, netrate, maximum_coverage, created_at,
 --
 
 COPY public."AgentPayableTransaction" (id, agent_id, transaction_type, amount, policy_id, endorsement_request_id, remarks, created_by_user_id, created_at, applies_to_transaction_id, due_date, remaining_amount) FROM stdin;
-425d0c3e-cfc2-4d58-aa00-b78ec3533f02	f3c382ae-fb35-49b2-9076-3dd56e20ca48	ISSUANCE	0.00	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	\N	\N	\N	2026-09-18 05:52:04.138	\N	2026-09-18 00:00:00	0.00
 \.
 
 
@@ -1699,16 +1695,6 @@ ba33dfe5-badb-4d63-9d40-812da7782699	f3c382ae-fb35-49b2-9076-3dd56e20ca48	0.00	1
 --
 
 COPY public."ApplicationCoverage" (id, application_id, coverage_id, coverage_amount, premium_amount, created_at, updated_at, applied_rate, payable_to_bethel, policy_application_vehicle_id) FROM stdin;
-da8c0dc7-b12a-4984-af02-e4f0a968b9a5	f3d392d0-c28e-40dc-b0a8-e77adcd42ebd	67c89b3f-f1c7-42d3-bf3c-f8ee6a320f2a	150000.00	345.00	2026-09-18 05:48:21.754	2026-09-18 05:48:21.754	0.000000	345.00	ec714bc9-2e96-4634-9af2-a3d78f8cdd9d
-0742fbb1-7bd9-4f68-9668-0ae96c9758f8	f3d392d0-c28e-40dc-b0a8-e77adcd42ebd	0d79c8d1-c10b-448d-8a98-e135a8b9ea87	100000.00	0.00	2026-09-18 05:48:21.754	2026-09-18 05:48:21.754	50.000000	0.00	ec714bc9-2e96-4634-9af2-a3d78f8cdd9d
-23a68bc3-32f9-4979-a88b-9e5c16cefb6e	f3d392d0-c28e-40dc-b0a8-e77adcd42ebd	4fc358ff-fb46-4923-b1b7-dfd34e759f92	150000.00	1170.00	2026-09-18 05:48:21.754	2026-09-18 05:48:21.754	0.000000	1170.00	ec714bc9-2e96-4634-9af2-a3d78f8cdd9d
-d7b7b308-4068-46cc-8d4f-51c1b74edb6e	f3d392d0-c28e-40dc-b0a8-e77adcd42ebd	cad84277-605a-4fa6-afb5-c65b138d0aaf	405000.00	1417.50	2026-09-18 05:48:21.754	2026-09-18 05:48:21.754	0.003500	1417.50	ec714bc9-2e96-4634-9af2-a3d78f8cdd9d
-3da1da04-1fd1-4333-b3e3-049f6bf56545	f3d392d0-c28e-40dc-b0a8-e77adcd42ebd	1e966b25-61ef-4a63-9652-d7d1dd64b013	405000.00	4333.50	2026-09-18 05:48:21.754	2026-09-18 05:48:21.754	0.010700	4333.50	ec714bc9-2e96-4634-9af2-a3d78f8cdd9d
-8169179a-373b-4970-b916-ab3636ee7aa3	aa53e378-3619-41da-a644-2d8937f9e111	67c89b3f-f1c7-42d3-bf3c-f8ee6a320f2a	200000.00	420.00	2026-09-18 06:21:02.438	2026-09-18 06:21:02.438	0.000000	420.00	6f2b4226-ec40-4b01-ab94-aa86e42414b4
-bc793654-a8af-472d-b38c-a4abefa90962	aa53e378-3619-41da-a644-2d8937f9e111	0d79c8d1-c10b-448d-8a98-e135a8b9ea87	250000.00	0.00	2026-09-18 06:21:02.438	2026-09-18 06:21:02.438	50.000000	0.00	6f2b4226-ec40-4b01-ab94-aa86e42414b4
-c505f732-85bc-4787-9c0c-769d7460f272	aa53e378-3619-41da-a644-2d8937f9e111	4fc358ff-fb46-4923-b1b7-dfd34e759f92	200000.00	1245.00	2026-09-18 06:21:02.438	2026-09-18 06:21:02.438	0.000000	1245.00	6f2b4226-ec40-4b01-ab94-aa86e42414b4
-4d75e9c1-19a2-4b85-8a8a-4443539ed017	aa53e378-3619-41da-a644-2d8937f9e111	cad84277-605a-4fa6-afb5-c65b138d0aaf	405000.00	1417.50	2026-09-18 06:21:02.438	2026-09-18 06:21:02.438	0.003500	1417.50	6f2b4226-ec40-4b01-ab94-aa86e42414b4
-b5014769-1c37-42ae-a0bc-165b845af862	aa53e378-3619-41da-a644-2d8937f9e111	1e966b25-61ef-4a63-9652-d7d1dd64b013	405000.00	4333.50	2026-09-18 06:21:02.438	2026-09-18 06:21:02.438	0.010700	4333.50	6f2b4226-ec40-4b01-ab94-aa86e42414b4
 \.
 
 
@@ -1717,7 +1703,6 @@ b5014769-1c37-42ae-a0bc-165b845af862	aa53e378-3619-41da-a644-2d8937f9e111	1e966b
 --
 
 COPY public."ApprovalHistory" (id, application_id, approver_id, decision, comments, decision_date, created_at) FROM stdin;
-6cc25026-8f85-45b7-887a-1848d7504f37	f3d392d0-c28e-40dc-b0a8-e77adcd42ebd	833638f3-1aa5-459c-9d22-9dbc83495744	APPROVED	\N	2026-09-18 05:52:04.143	2026-09-18 05:52:04.144
 \.
 
 
@@ -1849,8 +1834,6 @@ aafe0230-0926-425b-b131-366635fe4471	0.00	1.2000	2026-09-18 01:28:37.613	ab2a866
 --
 
 COPY public."Customer" (id, first_name, last_name, middle_name, birthday, gender, email, mobile_number, company_id, status, created_at, updated_at) FROM stdin;
-2518f950-c43b-43c1-b1ab-3a22e964e925	Emmanuel John	Navarro	\N	\N	\N	ejnavarro555@gmail.com	\N	\N	ACTIVE	2026-09-18 04:29:22.209	2026-09-18 04:29:22.209
-51308991-92e9-482e-96d6-cea9a28d74f0	Bethel	Agent	\N	\N	\N	ejnavarro0117@gmail.com	\N	\N	ACTIVE	2026-09-18 05:50:16.312	2026-09-18 05:50:16.312
 \.
 
 
@@ -1859,7 +1842,6 @@ COPY public."Customer" (id, first_name, last_name, middle_name, birthday, gender
 --
 
 COPY public."CustomerAgent" (id, customer_id, agent_id, created_at) FROM stdin;
-847f4c9e-60f6-4107-a8d3-c96bd4e8953a	2518f950-c43b-43c1-b1ab-3a22e964e925	f3c382ae-fb35-49b2-9076-3dd56e20ca48	2026-09-18 04:29:22.209
 \.
 
 
@@ -1868,7 +1850,6 @@ COPY public."CustomerAgent" (id, customer_id, agent_id, created_at) FROM stdin;
 --
 
 COPY public."EndorsementApprovalHistory" (id, endorsement_request_id, approver_id, decision, comments, decision_date, created_at) FROM stdin;
-d2ef4441-36ff-42d3-820d-b3378540c645	1375608d-6bef-4960-a93a-762ba6ccf58d	833638f3-1aa5-459c-9d22-9dbc83495744	APPROVED	\N	2026-09-18 06:46:27.629	2026-09-18 06:46:27.63
 \.
 
 
@@ -1877,7 +1858,6 @@ d2ef4441-36ff-42d3-820d-b3378540c645	1375608d-6bef-4960-a93a-762ba6ccf58d	833638
 --
 
 COPY public."EndorsementChange" (id, endorsement_request_id, policy_vehicle_id, policy_coverage_id, change_type, change_from, change_to, remarks, created_at, updated_at, product_coverage_id, coverage_amount, premium_amount, payable_to_bethel, applied_rate, is_misc, created_policy_coverage_id) FROM stdin;
-26611218-6015-4727-8215-49419c9f2bd8	1375608d-6bef-4960-a93a-762ba6ccf58d	\N	\N	CANCEL_POLICY	ACTIVE	CANCELLED	Wala lang	2026-09-18 06:46:27.613	2026-09-18 06:46:27.613	\N	\N	\N	\N	\N	\N	\N
 \.
 
 
@@ -1886,7 +1866,6 @@ COPY public."EndorsementChange" (id, endorsement_request_id, policy_vehicle_id, 
 --
 
 COPY public."EndorsementRequest" (id, policy_id, endorsement_number, sequence_no, status, effective_date, remarks, send_policy_to_email, send_policy_to_email_on_approval, created_by_agent_id, created_by_user_id, created_at, updated_at, request_type) FROM stdin;
-1375608d-6bef-4960-a93a-762ba6ccf58d	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	POL-20260918-42C235-E1	1	APPROVED	2026-09-18	Wala lang	t	t	f3c382ae-fb35-49b2-9076-3dd56e20ca48	833638f3-1aa5-459c-9d22-9dbc83495744	2026-09-18 06:46:27.61	2026-09-18 06:46:27.629	CANCELLATION
 \.
 
 
@@ -1895,9 +1874,6 @@ COPY public."EndorsementRequest" (id, policy_id, endorsement_number, sequence_no
 --
 
 COPY public."InLeaseBacklog" (id, policy_id, type, accomplished_by_user_id, accomplished_at, created_at, updated_at, endorsement_request_id) FROM stdin;
-1c16edfb-b03b-4504-adff-ac347a51e493	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	FOR_UPLOAD	\N	\N	2026-09-18 05:52:04.13	2026-09-18 05:52:04.13	\N
-31bd6876-7181-4b2e-802d-f0f19b3c764d	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	FOR_ENDORSEMENT	\N	\N	2026-09-18 06:07:08.754	2026-09-18 06:07:08.754	\N
-de7f2af9-8181-41bd-a500-23f26658b64b	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	FOR_ENDORSEMENT	\N	\N	2026-09-18 06:46:27.632	2026-09-18 06:46:27.632	1375608d-6bef-4960-a93a-762ba6ccf58d
 \.
 
 
@@ -1917,9 +1893,6 @@ f42aa308-1b8a-439f-9164-685f997bea2f	Property	Property insurance	ACTIVE	2026-08-
 --
 
 COPY public."PartyAddress" (id, customer_id, company_id, address_id, is_primary, created_at) FROM stdin;
-19293f08-6e7e-4dd1-869e-9660c518cae0	2518f950-c43b-43c1-b1ab-3a22e964e925	\N	c24bec24-5520-4346-91b3-3a7f205bfe02	f	2026-09-18 05:23:18.407
-b137bba8-3084-4891-88ec-0de45208d5aa	2518f950-c43b-43c1-b1ab-3a22e964e925	\N	9872c713-b3ee-407a-bd88-8ff1387c3a4b	f	2026-09-18 06:40:40.284
-cb6308d9-dd2b-479a-a689-0248851a8469	2518f950-c43b-43c1-b1ab-3a22e964e925	\N	7e561c7e-9fd8-4756-bb37-2eaaab8859cb	f	2026-09-18 07:00:48.548
 \.
 
 
@@ -1928,7 +1901,6 @@ cb6308d9-dd2b-479a-a689-0248851a8469	2518f950-c43b-43c1-b1ab-3a22e964e925	\N	7e5
 --
 
 COPY public."PartyVehicle" (id, customer_id, company_id, vehicle_id, ownership_start_date, ownership_end_date, created_at) FROM stdin;
-832402c9-7258-4d70-bca8-06530161cbdb	2518f950-c43b-43c1-b1ab-3a22e964e925	\N	c3ad4520-7ede-49d5-aa57-193402f40303	2026-09-18	\N	2026-09-18 05:23:18.392
 \.
 
 
@@ -1984,7 +1956,6 @@ a365f4dc-9f82-4e2a-9ff2-5bcf48ac570e	VIEW_POLICIES	My Policies	View issued polic
 --
 
 COPY public."Policy" (id, policy_number, application_id, customer_id, company_id, agent_id, agent_name_snapshot, product_variant_id, issue_date, effective_date, expiry_date, policy_status, created_at, updated_at, company_name_snapshot, customer_name_snapshot, agent_code_snapshot, class_name_snapshot, deductible_rate_snapshot, doc_stamps, lgt, misc, remarks, total_premium, variant_name_snapshot, vat, coc_number, sa_number, renewed_policy_number_snapshot, cancelled_at, minimum_deductible_amount_snapshot) FROM stdin;
-2a1eee0e-6d0b-4110-947a-6ae744ec16a7	POL-20260918-42C235	f3d392d0-c28e-40dc-b0a8-e77adcd42ebd	2518f950-c43b-43c1-b1ab-3a22e964e925	\N	f3c382ae-fb35-49b2-9076-3dd56e20ca48	Bethel Life and General Insurance (Marikina)	045eb956-0e90-4ea8-b88b-ec7f0bc3d854	2026-09-18	2026-09-18	2027-09-18	CANCELLED	2026-09-18 05:52:04.126	2026-09-18 06:46:27.627	\N	Navarro, Emmanuel John	BETHL-MRKNA	Motor	0.0050	865.13	13.84	150.00	\N	6921.00	Private Car	830.52	\N	\N	\N	2026-09-18	2000.00
 \.
 
 
@@ -1993,7 +1964,6 @@ COPY public."Policy" (id, policy_number, application_id, customer_id, company_id
 --
 
 COPY public."PolicyAddress" (id, policy_id, address_id, created_at, role, formatted_address_snapshot) FROM stdin;
-683d3334-4a5a-4f75-bb9f-e4ef9a826f44	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	c24bec24-5520-4346-91b3-3a7f205bfe02	2026-09-18 05:52:04.134	INSURED	209, 123, 123, 123, 123, Philippines
 \.
 
 
@@ -2002,8 +1972,6 @@ COPY public."PolicyAddress" (id, policy_id, address_id, created_at, role, format
 --
 
 COPY public."PolicyApplication" (id, insured_type, application_number, customer_id, company_id, company_name_snapshot, agent_id, agent_name_snapshot, product_variant_id, application_date, submission_date, status, remarks, document_folder_name, created_at, updated_at, coverage_start_at, coverage_end_at, total_premium, doc_stamps, vat, lgt, misc, send_policy_to_email, payment_method, payment_remittance, bethel_payment_method_id, source_quotation_id, send_policy_to_email_on_approval, policy_type, renewed_policy_id) FROM stdin;
-f3d392d0-c28e-40dc-b0a8-e77adcd42ebd	INDIVIDUAL	APP-20260918-79D219	2518f950-c43b-43c1-b1ab-3a22e964e925	\N	\N	f3c382ae-fb35-49b2-9076-3dd56e20ca48	Bethel Life and General Insurance (Marikina)	045eb956-0e90-4ea8-b88b-ec7f0bc3d854	2026-09-18	2026-09-18	APPROVED	\N	\N	2026-09-18 05:48:21.75	2026-09-18 05:52:04.142	2026-09-18 13:18:00	2027-09-18 13:18:00	7266.00	908.25	871.92	14.53	150.00	t	CASH	DIRECT_TO_BETHEL	130838e4-3643-4397-9c3b-874e3584816a	52ed02e6-b1d7-41ef-80bd-277b0c6a890d	t	NEW_POLICY	\N
-aa53e378-3619-41da-a644-2d8937f9e111	INDIVIDUAL	APP-20260918-F88ED2	2518f950-c43b-43c1-b1ab-3a22e964e925	\N	\N	f3c382ae-fb35-49b2-9076-3dd56e20ca48	Bethel Life and General Insurance (Marikina)	045eb956-0e90-4ea8-b88b-ec7f0bc3d854	2026-09-18	2026-09-18	UNDER_REVIEW	\N	\N	2026-09-18 06:21:02.428	2026-09-18 06:21:15.857	2027-09-18 14:02:00	2028-09-17 14:02:00	7416.00	927.00	889.92	14.83	150.00	t	CASH	DIRECT_TO_BETHEL	130838e4-3643-4397-9c3b-874e3584816a	beae68ef-7647-4fa3-97d5-21e9ed0681b1	t	RENEWAL	2a1eee0e-6d0b-4110-947a-6ae744ec16a7
 \.
 
 
@@ -2012,8 +1980,6 @@ aa53e378-3619-41da-a644-2d8937f9e111	INDIVIDUAL	APP-20260918-F88ED2	2518f950-c43
 --
 
 COPY public."PolicyApplicationAddress" (id, policy_application_id, address_id, created_at, role) FROM stdin;
-77c1feea-470f-423e-bc72-48e57b366db8	f3d392d0-c28e-40dc-b0a8-e77adcd42ebd	c24bec24-5520-4346-91b3-3a7f205bfe02	2026-09-18 05:48:21.757	INSURED
-bb81830a-e3a9-4746-b5bb-2dbcbe48fe12	aa53e378-3619-41da-a644-2d8937f9e111	c24bec24-5520-4346-91b3-3a7f205bfe02	2026-09-18 06:21:02.44	INSURED
 \.
 
 
@@ -2030,8 +1996,6 @@ COPY public."PolicyApplicationChange" (id, policy_application_id, application_ve
 --
 
 COPY public."PolicyApplicationVehicle" (id, policy_application_id, vehicle_id, created_at) FROM stdin;
-ec714bc9-2e96-4634-9af2-a3d78f8cdd9d	f3d392d0-c28e-40dc-b0a8-e77adcd42ebd	c3ad4520-7ede-49d5-aa57-193402f40303	2026-09-18 05:48:21.753
-6f2b4226-ec40-4b01-ab94-aa86e42414b4	aa53e378-3619-41da-a644-2d8937f9e111	c3ad4520-7ede-49d5-aa57-193402f40303	2026-09-18 06:21:02.434
 \.
 
 
@@ -2040,11 +2004,6 @@ ec714bc9-2e96-4634-9af2-a3d78f8cdd9d	f3d392d0-c28e-40dc-b0a8-e77adcd42ebd	c3ad45
 --
 
 COPY public."PolicyCoverage" (id, policy_id, coverage_id, coverage_amount, premium_amount, created_at, updated_at, clause_snapshot, coverage_code_snapshot, coverage_name_snapshot, pricing_mode_snapshot, payable_to_bethel, applied_rate, is_misc_snapshot, policy_vehicle_id, added_by_endorsement_id, removed_at, removed_by_endorsement_id) FROM stdin;
-de43c06a-edb1-407b-a663-1820ec70e435	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	0d79c8d1-c10b-448d-8a98-e135a8b9ea87	100000.00	0.00	2026-09-18 05:52:04.136	2026-09-18 05:52:04.136	This Company shall pay the Insured the benefits stated herein in the event of accidental bodily injury to any authorized passenger, including the driver, arising directly from an accident involving the insured vehicle, resulting in death or disablement within ninety (90) days from the date of the accident.	PC_PA	Personal Accident	VEHICLE_SEATS_BASED	\N	\N	f	\N	\N	\N	\N
-baa4ed9b-6d8f-46ca-8720-05ceea38a389	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	4fc358ff-fb46-4923-b1b7-dfd34e759f92	150000.00	1170.00	2026-09-18 05:52:04.136	2026-09-18 05:52:04.136	You are woopers	PC_PD	Property Damage	FLAT_TIER	\N	\N	f	\N	\N	\N	\N
-5a353ed6-cf97-4380-add9-dc6782cbc96e	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	cad84277-605a-4fa6-afb5-c65b138d0aaf	405000.00	1417.50	2026-09-18 05:52:04.136	2026-09-18 05:52:04.136	This Company shall indemnify the Insured against loss of or damage to the insured vehicle caused by earthquake, flood, typhoon, volcanic eruption, and other fortuitous events commonly classified as Acts of God, subject to the terms, conditions, and exclusions of this Policy.	PC_AOG	Acts of God	VALUE_PERCENTAGE	\N	\N	f	\N	\N	\N	\N
-0fc94372-2153-4bd0-972c-01c7399bd44e	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	1e966b25-61ef-4a63-9652-d7d1dd64b013	405000.00	4333.50	2026-09-18 05:52:04.136	2026-09-18 05:52:04.136	This Company shall indemnify the Insured against accidental loss of or damage to the insured vehicle and its accessories, including the reasonable cost of towing to the nearest repair shop, subject to the excess/deductible stated in the Policy Schedule.	PC_OD	Own Damage	VALUE_PERCENTAGE	\N	\N	f	\N	\N	\N	\N
-d7afb31c-ff0c-444a-82b9-e43ed621d717	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	67c89b3f-f1c7-42d3-bf3c-f8ee6a320f2a	150000.00	345.00	2026-09-18 05:52:04.136	2026-09-18 06:07:08.74	you are a pc body outch	PC_BI	Bodily Injury	FLAT_TIER	\N	\N	f	\N	\N	\N	\N
 \.
 
 
@@ -2053,8 +2012,6 @@ d7afb31c-ff0c-444a-82b9-e43ed621d717	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	67c89b
 --
 
 COPY public."PolicyQuotation" (id, insured_type, quotation_number, customer_id, company_id, company_name_snapshot, agent_id, agent_name_snapshot, product_variant_id, coverage_start_at, coverage_end_at, quotation_date, total_premium, doc_stamps, vat, lgt, misc, send_policy_to_email, remarks, created_at, updated_at, renewed_policy_id) FROM stdin;
-52ed02e6-b1d7-41ef-80bd-277b0c6a890d	INDIVIDUAL	QUO-20260918-71E38C	2518f950-c43b-43c1-b1ab-3a22e964e925	\N	\N	f3c382ae-fb35-49b2-9076-3dd56e20ca48	Bethel Life and General Insurance (Marikina)	045eb956-0e90-4ea8-b88b-ec7f0bc3d854	2026-09-18 13:18:00	2027-09-18 13:18:00	2026-09-18	7266.00	908.25	871.92	14.53	150.00	t	\N	2026-09-18 05:23:18.382	2026-09-18 05:23:18.382	\N
-beae68ef-7647-4fa3-97d5-21e9ed0681b1	INDIVIDUAL	QUO-20260918-D165E6	2518f950-c43b-43c1-b1ab-3a22e964e925	\N	\N	f3c382ae-fb35-49b2-9076-3dd56e20ca48	Bethel Life and General Insurance (Marikina)	045eb956-0e90-4ea8-b88b-ec7f0bc3d854	2027-09-18 14:02:00	2028-09-17 14:02:00	2026-09-18	7416.00	927.00	889.92	14.83	150.00	t	\N	2026-09-18 06:06:51.154	2026-09-18 06:06:51.154	2a1eee0e-6d0b-4110-947a-6ae744ec16a7
 \.
 
 
@@ -2063,8 +2020,6 @@ beae68ef-7647-4fa3-97d5-21e9ed0681b1	INDIVIDUAL	QUO-20260918-D165E6	2518f950-c43
 --
 
 COPY public."PolicyQuotationAddress" (id, policy_quotation_id, address_id, role, created_at) FROM stdin;
-26e44574-47d2-4ad2-8b48-6486889e0147	52ed02e6-b1d7-41ef-80bd-277b0c6a890d	c24bec24-5520-4346-91b3-3a7f205bfe02	INSURED	2026-09-18 05:23:18.41
-f2be4c25-8612-4f46-a3f4-39c3be11f8cd	beae68ef-7647-4fa3-97d5-21e9ed0681b1	c24bec24-5520-4346-91b3-3a7f205bfe02	INSURED	2026-09-18 06:06:51.166
 \.
 
 
@@ -2073,8 +2028,6 @@ f2be4c25-8612-4f46-a3f4-39c3be11f8cd	beae68ef-7647-4fa3-97d5-21e9ed0681b1	c24bec
 --
 
 COPY public."PolicyQuotationVehicle" (id, policy_quotation_id, vehicle_id, created_at) FROM stdin;
-aeebfe97-50d7-4b4a-a9d4-968eca35e039	52ed02e6-b1d7-41ef-80bd-277b0c6a890d	c3ad4520-7ede-49d5-aa57-193402f40303	2026-09-18 05:23:18.395
-12918d08-3f60-493c-9b31-e2790ecf002c	beae68ef-7647-4fa3-97d5-21e9ed0681b1	c3ad4520-7ede-49d5-aa57-193402f40303	2026-09-18 06:06:51.158
 \.
 
 
@@ -2083,7 +2036,6 @@ aeebfe97-50d7-4b4a-a9d4-968eca35e039	52ed02e6-b1d7-41ef-80bd-277b0c6a890d	c3ad45
 --
 
 COPY public."PolicyVehicle" (id, policy_id, vehicle_id, created_at, chassis_number_snapshot, color_snapshot, engine_number_snapshot, make_snapshot, model_snapshot, mv_file_no_snapshot, no_of_seats_snapshot, plate_number_snapshot, vehicle_type_snapshot, year_model_snapshot) FROM stdin;
-bf064d35-72e2-40ba-96fb-adbdc49f4cb9	2a1eee0e-6d0b-4110-947a-6ae744ec16a7	c3ad4520-7ede-49d5-aa57-193402f40303	2026-09-18 05:52:04.131	123	123	\N	123	123	123	2	NCV5516	123	123
 \.
 
 
@@ -2117,16 +2069,6 @@ a062553d-fe59-4dd8-ad12-63cd4c218e22	a5500c82-af8a-4d9d-ab49-8788ba2cac20	CV_LM	
 --
 
 COPY public."QuotationCoverage" (id, quotation_id, coverage_id, policy_quotation_vehicle_id, coverage_amount, premium_amount, payable_to_bethel, applied_rate, created_at, updated_at) FROM stdin;
-81241abf-699d-4af2-a5ce-8deb6d469cad	52ed02e6-b1d7-41ef-80bd-277b0c6a890d	67c89b3f-f1c7-42d3-bf3c-f8ee6a320f2a	aeebfe97-50d7-4b4a-a9d4-968eca35e039	150000.00	345.00	345.00	0.000000	2026-09-18 05:23:18.399	2026-09-18 05:23:18.399
-4319f290-bb1b-4980-b93e-3cceb0c06ef5	52ed02e6-b1d7-41ef-80bd-277b0c6a890d	0d79c8d1-c10b-448d-8a98-e135a8b9ea87	aeebfe97-50d7-4b4a-a9d4-968eca35e039	100000.00	0.00	0.00	50.000000	2026-09-18 05:23:18.399	2026-09-18 05:23:18.399
-9f169769-5a3d-40a5-9230-c7e8b97bde07	52ed02e6-b1d7-41ef-80bd-277b0c6a890d	4fc358ff-fb46-4923-b1b7-dfd34e759f92	aeebfe97-50d7-4b4a-a9d4-968eca35e039	150000.00	1170.00	1170.00	0.000000	2026-09-18 05:23:18.399	2026-09-18 05:23:18.399
-7fc2a8ea-6b25-40c9-a9d7-12dd1b37bc6b	52ed02e6-b1d7-41ef-80bd-277b0c6a890d	cad84277-605a-4fa6-afb5-c65b138d0aaf	aeebfe97-50d7-4b4a-a9d4-968eca35e039	405000.00	1417.50	1417.50	0.003500	2026-09-18 05:23:18.399	2026-09-18 05:23:18.399
-04e125bb-41c9-4e96-b975-b8f8cbda91ce	52ed02e6-b1d7-41ef-80bd-277b0c6a890d	1e966b25-61ef-4a63-9652-d7d1dd64b013	aeebfe97-50d7-4b4a-a9d4-968eca35e039	405000.00	4333.50	4333.50	0.010700	2026-09-18 05:23:18.399	2026-09-18 05:23:18.399
-51d64b1c-b7e8-469e-b961-b6d8e964db2f	beae68ef-7647-4fa3-97d5-21e9ed0681b1	67c89b3f-f1c7-42d3-bf3c-f8ee6a320f2a	12918d08-3f60-493c-9b31-e2790ecf002c	200000.00	420.00	420.00	0.000000	2026-09-18 06:06:51.162	2026-09-18 06:06:51.162
-b4712f2b-6ff1-48df-be3d-7bc9440e0c56	beae68ef-7647-4fa3-97d5-21e9ed0681b1	0d79c8d1-c10b-448d-8a98-e135a8b9ea87	12918d08-3f60-493c-9b31-e2790ecf002c	250000.00	0.00	0.00	50.000000	2026-09-18 06:06:51.162	2026-09-18 06:06:51.162
-9c52c6a8-0381-4404-8a80-6cf79c36dd5b	beae68ef-7647-4fa3-97d5-21e9ed0681b1	4fc358ff-fb46-4923-b1b7-dfd34e759f92	12918d08-3f60-493c-9b31-e2790ecf002c	200000.00	1245.00	1245.00	0.000000	2026-09-18 06:06:51.162	2026-09-18 06:06:51.162
-2eccac2f-883e-4927-9765-a28ccdfb73a6	beae68ef-7647-4fa3-97d5-21e9ed0681b1	cad84277-605a-4fa6-afb5-c65b138d0aaf	12918d08-3f60-493c-9b31-e2790ecf002c	405000.00	1417.50	1417.50	0.003500	2026-09-18 06:06:51.162	2026-09-18 06:06:51.162
-4180095a-a155-421f-82df-01ca1be86c25	beae68ef-7647-4fa3-97d5-21e9ed0681b1	1e966b25-61ef-4a63-9652-d7d1dd64b013	12918d08-3f60-493c-9b31-e2790ecf002c	405000.00	4333.50	4333.50	0.010700	2026-09-18 06:06:51.162	2026-09-18 06:06:51.162
 \.
 
 
@@ -2220,7 +2162,7 @@ aa50f9d6-0974-4684-9712-921836765952	2fd4d42e-ca6e-4ece-8f86-24cd4c281904	d3723d
 
 COPY public."User" (id, email, password_hash, full_name, status, agent_id, customer_id, created_at, updated_at, email_verified_at, invite_token, invite_token_expires_at) FROM stdin;
 833638f3-1aa5-459c-9d22-9dbc83495744	ejnavarro555@gmail.com	$2b$12$4xP5RAlPiJ6.CTySJExgwObuUdgQ1ZMrt/CR32j7h0X0lYINjVaeK	System Admin	ACTIVE	f3c382ae-fb35-49b2-9076-3dd56e20ca48	\N	2026-09-18 01:10:35.468	2026-09-18 01:20:21.223	\N	\N	\N
-b155f59d-7472-4e33-99e7-0fc4b77b7c8e	ejnavarro0117@gmail.com	$2b$12$Z2qHq06e2W/SfSCZWkm/d.4YER5OYFo9z/0.MIWVDWPMNDBiTEnGm	Bethel Agent	ACTIVE	f3c382ae-fb35-49b2-9076-3dd56e20ca48	51308991-92e9-482e-96d6-cea9a28d74f0	2026-09-18 05:50:16.315	2026-09-18 05:50:47.755	2026-09-18 05:50:47.754	\N	\N
+b155f59d-7472-4e33-99e7-0fc4b77b7c8e	ejnavarro0117@gmail.com	$2b$12$Z2qHq06e2W/SfSCZWkm/d.4YER5OYFo9z/0.MIWVDWPMNDBiTEnGm	Bethel Agent	ACTIVE	f3c382ae-fb35-49b2-9076-3dd56e20ca48	\N	2026-09-18 05:50:16.315	2026-09-18 05:50:47.755	2026-09-18 05:50:47.754	\N	\N
 \.
 
 
@@ -2247,7 +2189,6 @@ ff3f63f4-5f1a-4d2b-a5ec-510cac93a862	b155f59d-7472-4e33-99e7-0fc4b77b7c8e	2fd4d4
 --
 
 COPY public."Vehicle" (id, plate_number, engine_number, chassis_number, make, model, year_model, vehicle_type, color, created_at, updated_at, mv_file_no, estimated_value, initial_assessment_date, no_of_seats, product_variant_id) FROM stdin;
-c3ad4520-7ede-49d5-aa57-193402f40303	NCV5516	123	123	123	123	123	123	123	2026-09-18 05:23:18.388	2026-09-18 06:03:33.731	123	405000.00	2026-09-18	5	045eb956-0e90-4ea8-b88b-ec7f0bc3d854
 \.
 
 
@@ -4260,5 +4201,5 @@ ALTER TABLE ONLY public."Vehicle"
 -- PostgreSQL database dump complete
 --
 
-\unrestrict zp3MhIWp4HqTVpPNaALCkbmeEvJ4TH8eERTDcb0VSfvgbdjd2b7TSdMx0K0mwCn
+\unrestrict 4Uibl9sHBm8Pl2K48mTnIElMdgKRd1duzS3PmrgrlpbP3ghLkuSUfBZ1bmXkWTF
 
