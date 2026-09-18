@@ -30,6 +30,7 @@ import DeleteIcon from "@mui/icons-material/Delete";
 import EditIcon from "@mui/icons-material/Edit";
 import CloseIcon from "@mui/icons-material/Close";
 import { useAuth } from "../context/AuthContext";
+import { useUnsavedChanges } from "../context/UnsavedChangesContext";
 import {
   getProductCatalog,
   listMyCustomers,
@@ -121,6 +122,19 @@ const emptyAddress = {
 const DOC_STAMPS_RATE = 0.125;
 const VAT_RATE = 0.12;
 const LGT_RATE = 0.002;
+
+// Mirrors PolicyApplication.jsx's own toLocalDateTimeInput — reads UTC
+// getters deliberately, since the value round-trips into a datetime-local
+// input and gets sent back to the server as a naive string the server parses
+// in its own (UTC) timezone; using local (browser) getters would silently
+// shift it by the browser/server offset.
+function toLocalDateTimeInput(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
 
 // Resolves a single vehicle's current (depreciated) value the same way the
 // server does for a brand-new one: "now" is its assessment date, since it's
@@ -225,7 +239,7 @@ function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
       if (!Number.isFinite(seats) || seats <= 0) {
         return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
       }
-      if (cov.seats_threshold === null || cov.seats_threshold === undefined) {
+      if (cov.seats_threshold_amount === null || cov.seats_threshold_amount === undefined) {
         return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true, noTier: true };
       }
       // selection.coverage_amount is the agent's chosen "insured amount for
@@ -237,9 +251,13 @@ function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
       if (!tier) {
         return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
       }
-      const excessSeats = Math.max(0, seats - Number(cov.seats_threshold));
+      // No charge up to seats_threshold_amount — the excess above it is
+      // split into seats_exceed_threshold_amount-sized brackets, each
+      // charged seats_exceed_threshold_price.
       coverageAmount = seats * Number(tier.insured_amount_per_occupant);
-      payablePerVehicle = excessSeats * Number(tier.rate_per_excess_seat);
+      const excessValue = Math.max(0, coverageAmount - Number(cov.seats_threshold_amount));
+      const brackets = Number(cov.seats_exceed_threshold_amount) > 0 ? excessValue / Number(cov.seats_exceed_threshold_amount) : 0;
+      payablePerVehicle = brackets * Number(cov.seats_exceed_threshold_price);
     } else {
       coverageAmount = Number(selection.coverage_amount) || 0;
       payablePerVehicle = coverageAmount * Number(cov.rate);
@@ -250,25 +268,44 @@ function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
     maxPayablePerVehicle = Math.max(maxPayablePerVehicle, payablePerVehicle);
   }
 
+  // FLAT_TIER is "no computation, no agent margin" — the tier's own price IS
+  // the premium, always (see backend's lib/coveragePricing.js), so there's
+  // no agent-entered figure to fall back on or floor-check here at all.
+  const isNoMarginMode = cov.pricing_mode === "FLAT_TIER";
+
   return {
     coverage_amount: totalCoverageAmount,
     payable_to_bethel: totalPayable,
-    premium_amount: enteredPremium * count,
+    premium_amount: isNoMarginMode ? totalPayable : enteredPremium * count,
     pending: false,
     minPremiumPerVehicle: maxPayablePerVehicle,
     belowMinimum:
+      !isNoMarginMode &&
       Boolean(selection.premium_amount) &&
       Math.round(enteredPremium * 100) < Math.round(maxPayablePerVehicle * 100),
     exceedsMax:
       cov.pricing_mode === "PERCENTAGE" &&
       (Number(selection.coverage_amount) || 0) > Number(cov.effective_maximum_coverage),
-    agentEarnings: enteredPremium * count - totalPayable,
-    hasPremium: Boolean(selection.premium_amount),
+    agentEarnings: isNoMarginMode ? 0 : enteredPremium * count - totalPayable,
+    hasPremium: isNoMarginMode || Boolean(selection.premium_amount),
     // A single "rate" only makes sense to show when every targeted vehicle
     // landed on the same tier — otherwise this is the blended (weighted
     // average) rate instead of picking one vehicle's tier arbitrarily.
     effectiveRate: totalCoverageAmount > 0 ? totalPayable / totalCoverageAmount : 0,
   };
+}
+
+// How many rows one coverage selection actually resolves to — mirrors the
+// targetIndices computation inside resolveCoverageSelection above, needed on
+// its own by the gross-target-total solve below (which has to split its
+// aggregate premium evenly across however many rows the target coverage
+// itself resolves to).
+function countTargetedVehicles(selection, vehicles) {
+  if (!selection) return 0;
+  if (vehicles.length === 0) return 1;
+  return selection.vehicle_indices === null || selection.vehicle_indices === undefined
+    ? vehicles.length
+    : selection.vehicle_indices.length;
 }
 
 function isCustomerComplete(c) {
@@ -280,7 +317,21 @@ function isCompanyComplete(c) {
 }
 
 function isVehicleComplete(v) {
-  return Boolean(v.plate_number && v.mv_file_no && v.engine_number && v.chassis_number && v.no_of_seats);
+  // engine_number is deliberately not required — see vehicleInputSchema's
+  // own comment (often illegible/unavailable off a Philippine OR/CR). Every
+  // other identifying field is, including make/model/vehicle_type/color/
+  // year_model now.
+  return Boolean(
+    v.plate_number &&
+      v.mv_file_no &&
+      v.chassis_number &&
+      v.make &&
+      v.model &&
+      v.vehicle_type &&
+      v.color &&
+      (v.year_model || v.year_model === 0) &&
+      v.no_of_seats
+  );
 }
 
 function isAddressComplete(a) {
@@ -329,7 +380,7 @@ function CustomerEditDialog({ open, onClose, customer, token, onSaved }) {
   }
 
   return (
-    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm" keepMounted>
       <DialogTitle>Edit Customer</DialogTitle>
       <DialogContent>
         <Stack spacing={2} sx={{ mt: 1 }}>
@@ -446,7 +497,7 @@ function CompanyEditDialog({ open, onClose, company, token, onSaved }) {
   }
 
   return (
-    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm" keepMounted>
       <DialogTitle>Edit Company</DialogTitle>
       <DialogContent>
         <Stack spacing={2} sx={{ mt: 1 }}>
@@ -537,7 +588,7 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly, 
   }
 
   return (
-    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm" keepMounted>
       <DialogTitle>Edit Vehicle</DialogTitle>
       <DialogContent>
         <Stack spacing={2} sx={{ mt: 1 }}>
@@ -575,7 +626,6 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly, 
                 label="Engine number"
                 value={form.engine_number}
                 onChange={(e) => setForm({ ...form, engine_number: e.target.value })}
-                required
                 fullWidth
               />
             </Grid>
@@ -610,6 +660,7 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly, 
                 label="Vehicle type"
                 value={form.vehicle_type}
                 onChange={(e) => setForm({ ...form, vehicle_type: e.target.value })}
+                required
                 fullWidth
               />
             </Grid>
@@ -618,6 +669,7 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly, 
                 label="Make"
                 value={form.make}
                 onChange={(e) => setForm({ ...form, make: e.target.value })}
+                required
                 fullWidth
               />
             </Grid>
@@ -626,6 +678,7 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly, 
                 label="Model"
                 value={form.model}
                 onChange={(e) => setForm({ ...form, model: e.target.value })}
+                required
                 fullWidth
               />
             </Grid>
@@ -635,6 +688,7 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly, 
                 type="number"
                 value={form.year_model}
                 onChange={(e) => setForm({ ...form, year_model: e.target.value })}
+                required
                 fullWidth
               />
             </Grid>
@@ -643,6 +697,7 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly, 
                 label="Color"
                 value={form.color}
                 onChange={(e) => setForm({ ...form, color: e.target.value })}
+                required
                 fullWidth
               />
             </Grid>
@@ -719,7 +774,7 @@ function AddressEditDialog({ open, onClose, address, token, onSaved, showEstimat
   }
 
   return (
-    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm" keepMounted>
       <DialogTitle>Edit Address</DialogTitle>
       <DialogContent>
         <Stack spacing={2} sx={{ mt: 1 }}>
@@ -865,6 +920,18 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
   // Which plate number was last checked per vehicle row, so blurring an
   // unchanged field doesn't keep re-triggering the lookup.
   const lastCheckedPlateRef = useRef({});
+  // { [vehicleRowIndex]: latest_policy-or-null } — populated the moment a
+  // plate lookup resolves a vehicle with policy history (GET /vehicles/lookup
+  // already includes latest_policy), so a row can proactively show "this
+  // vehicle already has policy history" before the agent even finishes the
+  // form — mirrors PolicyApplication.jsx's own vehiclePolicyHistory. Unlike
+  // that page, there's no "Renew This Policy" quick-action here (no
+  // renewal-prefill infrastructure for quotations) — this is purely a
+  // warning + a hard floor on coverageStartAt, since POST /policy-quotations
+  // now actually enforces (409s) the same "no double-insuring an already
+  // actively-insured vehicle" rule applications do, rather than silently
+  // letting it through as a non-binding preview.
+  const [vehiclePolicyHistory, setVehiclePolicyHistory] = useState({});
 
   const [classId, setClassId] = useState("");
   const [variantId, setVariantId] = useState("");
@@ -873,6 +940,10 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
   // Which allowable period (in days) the agent picked — coverage_end_at is
   // always derived from this plus coverageStartAt, never entered directly.
   const [coveragePeriodDays, setCoveragePeriodDays] = useState("");
+  // "Solve from Gross Total" pricing mode — see the gross-solve block below,
+  // right after coverageVehicles/riskAddressValue are resolved.
+  const [pricingInputMode, setPricingInputMode] = useState("PER_COVERAGE");
+  const [targetGrossAmount, setTargetGrossAmount] = useState("");
 
   const [vehicles, setVehicles] = useState([emptyVehicle]);
   const [riskAddress, setRiskAddress] = useState(emptyAddress);
@@ -883,6 +954,24 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
   const [confirmChecked, setConfirmChecked] = useState(false);
   const [previewPdfUrl, setPreviewPdfUrl] = useState(null);
   const [previewPdfLoading, setPreviewPdfLoading] = useState(false);
+
+  // Registered with the app-wide unsaved-changes guard (see AppLayout's
+  // sidebar navigation) so switching pages while this wizard has any
+  // meaningful input warns first, same as a browser refresh/close-tab would
+  // — a coarse heuristic over the wizard's own biggest state, not every one
+  // of its dozens of fields, since any of these being non-default means the
+  // agent has genuinely started this filing (see PolicyApplication.jsx's
+  // own identical wizardIsDirty for the sibling wizard).
+  const wizardIsDirty =
+    JSON.stringify(newCustomer) !== JSON.stringify(emptyCustomer) ||
+    JSON.stringify(newCompany) !== JSON.stringify(emptyCompany) ||
+    vehicles.some((v) => JSON.stringify(v) !== JSON.stringify(emptyVehicle)) ||
+    JSON.stringify(riskAddress) !== JSON.stringify(emptyAddress) ||
+    JSON.stringify(insuredAddress) !== JSON.stringify(emptyAddress) ||
+    Object.keys(coverageSelections).length > 0 ||
+    Boolean(coverageStartAt) ||
+    Boolean(remarks.trim());
+  useUnsavedChanges("quotation-creator-wizard", wizardIsDirty);
   const [previewPdfError, setPreviewPdfError] = useState("");
 
   // agentIdOverride defaults to filingAgentId (state may not have committed
@@ -958,7 +1047,9 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
           is_custom_rate: period.is_custom_rate,
           value_percentage_tiers: period.value_percentage_tiers,
           tier_based_prices: period.tier_based_prices,
-          seats_threshold: period.seats_threshold,
+          seats_threshold_amount: period.seats_threshold_amount,
+          seats_exceed_threshold_amount: period.seats_exceed_threshold_amount,
+          seats_exceed_threshold_price: period.seats_exceed_threshold_price,
           seats_tier_prices: period.seats_tier_prices,
           has_custom_tiers: period.has_custom_tiers,
           // Whether this coverage actually has a rate/tier configured for
@@ -989,11 +1080,61 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
     return cov.has_pricing !== false;
   }
 
+  // FLAT_TIER and VEHICLE_SEATS_BASED coverages are both mandatory on every
+  // quotation — shown first, under their own "Required Coverages"
+  // subheading below, with no checkbox at all rather than the
+  // optional-checkbox list every other pricing mode still uses. FLAT_TIER
+  // carries no agent margin at all (see lib/coveragePricing.js's own
+  // resolveCoverageRows); VEHICLE_SEATS_BASED still lets the agent type/mark
+  // up their own premium. Scoped to the chosen period and only once
+  // actually priced — a coverage with nothing configured yet isn't
+  // selectable at all, same has_pricing gate as everything else.
+  const requiredCoverages = coverages.filter(
+    (cov) =>
+      ["FLAT_TIER", "VEHICLE_SEATS_BASED"].includes(cov.pricing_mode) &&
+      coverageAllowsPeriod(cov, coveragePeriodDays) &&
+      coverageIsPriced(cov)
+  );
+  const requiredCoverageIds = new Set(requiredCoverages.map((c) => c.id));
+  const optionalCoverages = coverages.filter((cov) => !requiredCoverageIds.has(cov.id));
+
+  // Auto-selects every required coverage the moment it becomes available
+  // (a fresh variant/period pick) — the agent never has to (and can't)
+  // check it in manually; toggleCoverage below refuses to ever remove one.
+  useEffect(() => {
+    if (requiredCoverages.length === 0) return;
+    setCoverageSelections((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const cov of requiredCoverages) {
+        if (!next[cov.id]) {
+          next[cov.id] = { coverage_amount: "", premium_amount: "", vehicle_indices: null };
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requiredCoverages.map((c) => c.id).join(",")]);
+
   // coverage_end_at is never entered directly — it's always coverage_start_at
   // plus the chosen period, computed the same way the server re-derives it.
   const coverageEndAt = coverageStartAt && coveragePeriodDays
     ? addDaysToLocalDateTime(coverageStartAt, Number(coveragePeriodDays))
     : "";
+
+  // The latest expiry date among every vehicle row's own still-ACTIVE
+  // existing policy (if more than one vehicle has one) — coverage can't
+  // start before whichever of them expires last, since POST /policy-quotations
+  // now enforces this the same way an application does (see that route's own
+  // comment). null when no current vehicle row has an active conflict.
+  const blockingPolicy = Object.entries(vehiclePolicyHistory).reduce((latest, [index, policy]) => {
+    if (!policy || policy.status !== "ACTIVE") return latest;
+    if (!vehicles[index]) return latest;
+    if (!latest || new Date(policy.expiry_date) > new Date(latest.expiry_date)) return policy;
+    return latest;
+  }, null);
+  const minCoverageStartAt = blockingPolicy ? toLocalDateTimeInput(blockingPolicy.expiry_date) : "";
 
   const isMotor = selectedClass?.class_name === "Motor";
   const isProperty = selectedClass?.class_name === "Property";
@@ -1032,10 +1173,76 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
   // resolveCoverageSelection.
   const riskAddressValue = isProperty ? Number(riskAddress.estimated_value) || null : null;
 
+  // --- "Solve from Gross Total" pricing mode ------------------------------
+  // Instead of entering a premium for the product variant's own designated
+  // Gross Target Coverage (ProductVariant.gross_target_coverage_id, set
+  // under Settings -> Manage Products), the agent enters one target GRAND
+  // TOTAL for the whole filing and that one coverage's premium is solved
+  // backward so Premium + Doc. Stamps + V.A.T. + L.G.T. + Miscellaneous
+  // comes out to it — mirrors (non-authoritatively) the same solve
+  // lib/coveragePricing.js's resolveCoverageRows runs server-side. Every
+  // other selected coverage still prices/enters exactly as normal.
+  const grossTargetCoverageId = selectedVariant?.gross_target_coverage_id || null;
+  const grossTargetCoverage = grossTargetCoverageId ? coverages.find((c) => c.id === grossTargetCoverageId) : null;
+  const isGrossMode = pricingInputMode === "TARGET_GROSS" && Boolean(grossTargetCoverage);
+
+  // Sum of every OTHER selected coverage's resolved premium — what's left
+  // over from the target gross total is entirely the gross target
+  // coverage's own to make up.
+  const fixedPremiumSum = Object.entries(coverageSelections).reduce((sum, [coverageId, selection]) => {
+    if (coverageId === grossTargetCoverageId) return sum;
+    const cov = coverages.find((c) => c.id === coverageId);
+    if (!cov) return sum;
+    const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue);
+    return sum + (resolved?.premium_amount || 0);
+  }, 0);
+
+  const targetSelection = grossTargetCoverageId ? coverageSelections[grossTargetCoverageId] : null;
+  // premium_amount on this selection is irrelevant here — only used to reach
+  // minPremiumPerVehicle/pending/noTier; the real premium is solved below.
+  const targetFloorResolved =
+    isGrossMode && targetSelection
+      ? resolveCoverageSelection(grossTargetCoverage, targetSelection, coverageVehicles, riskAddressValue)
+      : null;
+  const targetVehicleCount = countTargetedVehicles(targetSelection, coverageVehicles);
+
+  const grossSolve =
+    isGrossMode && targetSelection && targetFloorResolved && !targetFloorResolved.pending && targetVehicleCount > 0
+      ? (() => {
+          const combinedRate = 1 + DOC_STAMPS_RATE + VAT_RATE + LGT_RATE;
+          const miscFee = Number(selectedVariant?.misc_fee) || 0;
+          const targetGross = Number(targetGrossAmount) || 0;
+          const requiredGrossPremiumSum = (targetGross - miscFee) / combinedRate;
+          const requiredTargetAggregate = requiredGrossPremiumSum - fixedPremiumSum;
+          const premiumPerVehicle = requiredTargetAggregate / targetVehicleCount;
+          const maxFloorPerVehicle = targetFloorResolved.minPremiumPerVehicle || 0;
+          return {
+            premiumPerVehicle,
+            belowFloor: premiumPerVehicle < maxFloorPerVehicle - 0.005,
+            maxFloorPerVehicle,
+          };
+        })()
+      : null;
+
+  // What every downstream calculation (Charges, preview, submit payload)
+  // actually reads — coverageSelections with the gross target coverage's own
+  // premium_amount overridden by the solved value, so nothing else has to
+  // keep it in sync by hand.
+  const effectiveCoverageSelections =
+    grossSolve && targetSelection
+      ? {
+          ...coverageSelections,
+          [grossTargetCoverageId]: {
+            ...targetSelection,
+            premium_amount: Math.round(grossSolve.premiumPerVehicle * 100) / 100,
+          },
+        }
+      : coverageSelections;
+
   // Total premium is the sum of every selected coverage's resolved premium —
   // the statutory charges below are derived from it, mirroring what the
   // server will compute and store once this application is actually submitted.
-  const totalPremium = Object.entries(coverageSelections).reduce((sum, [coverageId, selection]) => {
+  const totalPremium = Object.entries(effectiveCoverageSelections).reduce((sum, [coverageId, selection]) => {
     const cov = coverages.find((c) => c.id === coverageId);
     if (!cov) return sum;
     const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue);
@@ -1112,12 +1319,36 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
     setVariantId("");
     setCoverageSelections({});
     setCoveragePeriodDays("");
+    setPricingInputMode("PER_COVERAGE");
+    setTargetGrossAmount("");
   }
 
   function handleVariantChange(id) {
     setVariantId(id);
     setCoverageSelections({});
     setCoveragePeriodDays("");
+    // A different variant may have no Gross Target Coverage configured at
+    // all, or a different one — start the pricing mode over rather than
+    // carrying a mode/amount that might no longer make sense.
+    setPricingInputMode("PER_COVERAGE");
+    setTargetGrossAmount("");
+  }
+
+  // Switches between entering every coverage's premium by hand and solving
+  // the product variant's own Gross Target Coverage backward from one
+  // target grand total — see the gross-solve block above. Turning the
+  // latter on auto-selects that coverage (required for the solve to have
+  // anything to compute); turning it off leaves whatever premium was last
+  // solved for it in place, editable again like any other coverage.
+  function handlePricingModeChange(mode) {
+    if (!mode) return;
+    setPricingInputMode(mode);
+    if (mode === "TARGET_GROSS" && grossTargetCoverageId && !coverageSelections[grossTargetCoverageId]) {
+      setCoverageSelections((prev) => ({
+        ...prev,
+        [grossTargetCoverageId]: { coverage_amount: "", premium_amount: "", vehicle_indices: null },
+      }));
+    }
   }
 
   // Exactly one period can be chosen at a time — checking a different one
@@ -1136,6 +1367,15 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
           filtered[coverageId] = sel;
         }
       }
+      // The gross target coverage has to stay selected while in that
+      // pricing mode — re-add it if this period change just dropped it
+      // (not offered at the previous period, or never selected yet).
+      if (isGrossMode && grossTargetCoverageId) {
+        const targetCov = coverages.find((c) => c.id === grossTargetCoverageId);
+        if (targetCov && coverageAllowsPeriod(targetCov, next) && !filtered[grossTargetCoverageId]) {
+          filtered[grossTargetCoverageId] = { coverage_amount: "", premium_amount: "", vehicle_indices: null };
+        }
+      }
       return filtered;
     });
   }
@@ -1143,6 +1383,12 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
   function toggleCoverage(coverageId) {
     const cov = coverages.find((c) => c.id === coverageId);
     if (!cov || !coverageAllowsPeriod(cov, coveragePeriodDays)) return;
+    // Required for the gross-total solve to have anything to compute —
+    // can't be unchecked while that pricing mode is active.
+    if (isGrossMode && coverageId === grossTargetCoverageId) return;
+    // FLAT_TIER coverages are mandatory — never toggled off (see the
+    // "Required Coverages" subheading below).
+    if (requiredCoverageIds.has(coverageId)) return;
     setCoverageSelections((prev) => {
       const next = { ...prev };
       if (next[coverageId]) {
@@ -1168,6 +1414,220 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
       ...prev,
       [coverageId]: { ...prev[coverageId], [field]: value },
     }));
+  }
+
+  // Everything below a coverage's own checkbox/label (or, for a required
+  // FLAT_TIER coverage, its plain name heading) — the vehicle-scope picker,
+  // the pricing-mode-specific fields, and the resolved payable/premium
+  // summary. Shared by both the "Required Coverages" and the ordinary
+  // optional-checkbox lists below so the two can never drift apart.
+  // FLAT_TIER never shows an editable premium field at all (no agent margin
+  // — see lib/coveragePricing.js) or a Profit line, since its premium is
+  // always exactly what's payable to Bethel.
+  function renderCoverageDetails(cov, selection, resolved, isGrossTargetRow) {
+    if (!selection) return null;
+    return (
+      <>
+        {isMotor && vehicles.length > 1 && (
+          <Box sx={{ pl: 4, pb: 1 }}>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  size="small"
+                  checked={selection.vehicle_indices === null || selection.vehicle_indices === undefined}
+                  onChange={(e) => updateCoverageField(cov.id, "vehicle_indices", e.target.checked ? null : [])}
+                />
+              }
+              label="Applies to the whole policy (every vehicle)"
+            />
+            {selection.vehicle_indices !== null && selection.vehicle_indices !== undefined && (
+              <Box sx={{ pl: 3 }}>
+                <Typography variant="caption" color="text.secondary" component="div">
+                  Or choose specific vehicles:
+                </Typography>
+                <FormGroup row>
+                  {vehicles.map((v, i) => (
+                    <FormControlLabel
+                      key={i}
+                      control={
+                        <Checkbox
+                          size="small"
+                          checked={selection.vehicle_indices.includes(i)}
+                          onChange={(e) => {
+                            const current = selection.vehicle_indices;
+                            const next = e.target.checked ? [...current, i] : current.filter((x) => x !== i);
+                            updateCoverageField(cov.id, "vehicle_indices", next);
+                          }}
+                        />
+                      }
+                      label={v.plate_number ? `Vehicle ${i + 1} (${v.plate_number})` : `Vehicle ${i + 1}`}
+                    />
+                  ))}
+                </FormGroup>
+              </Box>
+            )}
+          </Box>
+        )}
+        <Box sx={{ pl: 4, pb: 1 }}>
+          {cov.pricing_mode === "PERCENTAGE" && (
+            <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 1 }}>
+              Your net rate: <strong>{formatRate(cov.rate)}</strong>
+              {cov.is_custom_rate ? " (your rate)" : " (standard rate)"}
+            </Typography>
+          )}
+          <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 1 }}>
+            {cov.clause}
+          </Typography>
+
+          {cov.pricing_mode === "PERCENTAGE" && (
+            <Grid container spacing={2} sx={{ mb: 1 }}>
+              <Grid size={6}>
+                <NumberField
+                  label="Coverage amount"
+                  value={selection.coverage_amount}
+                  onChange={(v) => updateCoverageField(cov.id, "coverage_amount", v)}
+                  required
+                  fullWidth
+                  size="small"
+                  error={resolved.exceedsMax}
+                  helperText={resolved.exceedsMax ? "Exceeds the maximum for this coverage" : ""}
+                  slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                />
+              </Grid>
+            </Grid>
+          )}
+
+          {cov.pricing_mode === "FLAT_TIER" && (
+            <TextField
+              select
+              label="Insured value"
+              value={resolved.pending ? "" : String(selection.coverage_amount)}
+              onChange={(e) => updateCoverageField(cov.id, "coverage_amount", e.target.value)}
+              required
+              fullWidth
+              size="small"
+              sx={{ mb: 1 }}
+            >
+              {(cov.tier_based_prices || []).map((tier) => (
+                <MenuItem key={tier.id} value={String(tier.coverage_amount)}>
+                  {formatPHP(tier.coverage_amount)} — {formatPHP(tier.coverage_price)}
+                </MenuItem>
+              ))}
+            </TextField>
+          )}
+
+          {cov.pricing_mode === "VEHICLE_SEATS_BASED" && (
+            <TextField
+              select
+              label="Insured amount for each occupant"
+              value={
+                (cov.seats_tier_prices || []).some(
+                  (t) => String(t.insured_amount_per_occupant) === String(selection.coverage_amount)
+                )
+                  ? String(selection.coverage_amount)
+                  : ""
+              }
+              onChange={(e) => updateCoverageField(cov.id, "coverage_amount", e.target.value)}
+              required
+              fullWidth
+              size="small"
+              sx={{ mb: 1 }}
+            >
+              {(cov.seats_tier_prices || []).map((tier) => (
+                <MenuItem key={tier.insured_amount_per_occupant} value={String(tier.insured_amount_per_occupant)}>
+                  {formatPHP(tier.insured_amount_per_occupant)}/occupant
+                </MenuItem>
+              ))}
+            </TextField>
+          )}
+
+          {cov.pricing_mode === "VALUE_PERCENTAGE" && resolved.pending && (
+            <Alert severity="info" sx={{ mb: 1 }}>
+              {resolved.noTier
+                ? "No pricing tier is set up yet for this coverage — contact Settings."
+                : "Priced automatically once the vehicle's estimated value is assessed."}
+            </Alert>
+          )}
+
+          {!resolved.pending && (
+            <>
+              {cov.pricing_mode !== "FLAT_TIER" && (
+                <Grid container spacing={2}>
+                  <Grid size={6}>
+                    {isGrossTargetRow ? (
+                      <NumberField
+                        label="Premium amount (computed from target gross total)"
+                        value={selection.premium_amount}
+                        onChange={() => {}}
+                        disabled
+                        fullWidth
+                        size="small"
+                        error={grossSolve?.belowFloor}
+                        helperText={
+                          grossSolve?.belowFloor
+                            ? `Target gross total is too low — this coverage alone needs at least ${formatPHP(grossSolve.maxFloorPerVehicle)} per vehicle to stay above what's payable to Bethel`
+                            : "Computed automatically so the filing's total comes out to your target gross total"
+                        }
+                        slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                      />
+                    ) : (
+                      <NumberField
+                        label="Premium amount (your price)"
+                        value={selection.premium_amount}
+                        onChange={(v) => updateCoverageField(cov.id, "premium_amount", v)}
+                        required
+                        fullWidth
+                        size="small"
+                        error={resolved.belowMinimum}
+                        helperText={
+                          resolved.belowMinimum
+                            ? `Below the amount payable to Bethel of ${formatPHP(resolved.minPremiumPerVehicle)}`
+                            : ""
+                        }
+                        slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                      />
+                    )}
+                  </Grid>
+                </Grid>
+              )}
+              <Alert severity="success" sx={{ mt: 1 }}>
+                <Stack spacing={0.25}>
+                  {cov.pricing_mode === "VALUE_PERCENTAGE" && (
+                    <>
+                      <span>
+                        Insured value: <strong>{formatPHP(resolved.coverage_amount)}</strong>
+                      </span>
+                      <span>
+                        Rate: <strong>{formatRate(resolved.effectiveRate)}</strong>
+                      </span>
+                    </>
+                  )}
+                  {cov.pricing_mode === "VEHICLE_SEATS_BASED" && (
+                    <span>
+                      Insured amount: <strong>{formatPHP(resolved.coverage_amount)}</strong>{" "}
+                      (threshold {formatPHP(cov.seats_threshold_amount)})
+                    </span>
+                  )}
+                  {cov.pricing_mode === "FLAT_TIER" && (
+                    <span>
+                      Premium: <strong>{formatPHP(resolved.premium_amount)}</strong> (fixed — no agent margin)
+                    </span>
+                  )}
+                  <span>
+                    Payable to Bethel: <strong>{formatPHP(resolved.payable_to_bethel)}</strong>
+                  </span>
+                  {resolved.hasPremium && !resolved.belowMinimum && cov.pricing_mode !== "FLAT_TIER" && (
+                    <span>
+                      Your Profit: <strong>{formatPHP(resolved.agentEarnings)}</strong>
+                    </span>
+                  )}
+                </Stack>
+              </Alert>
+            </>
+          )}
+        </Box>
+      </>
+    );
   }
 
   function updateVehicleField(index, field, value) {
@@ -1243,6 +1703,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
             : vv
         )
       );
+      setVehiclePolicyHistory((prev) => ({ ...prev, [index]: found.latest_policy || null }));
       return;
     }
 
@@ -1274,11 +1735,17 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
           : v
       )
     );
+    setVehiclePolicyHistory((prev) => ({ ...prev, [index]: vehicle.latest_policy || null }));
     setPlateConflict(null);
   }
 
   function resetVehicleRow(index) {
     setVehicles((prev) => prev.map((v, i) => (i === index ? { ...emptyVehicle } : v)));
+    setVehiclePolicyHistory((prev) => {
+      const next = { ...prev };
+      delete next[index];
+      return next;
+    });
     delete lastCheckedPlateRef.current[index];
   }
 
@@ -1287,13 +1754,35 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
     setError("");
     setSuccess(null);
 
-    const coverageEntries = Object.entries(coverageSelections);
+    const coverageEntries = Object.entries(effectiveCoverageSelections);
     if (coverageEntries.length === 0) {
       setError("Select at least one coverage.");
       return;
     }
+    // Safety net — requiredCoverages are auto-selected and can't be toggled
+    // off, so this should never actually trip, but confirms it here rather
+    // than only discovering a stripped-out required coverage at the server.
+    const missingRequired = requiredCoverages.filter((c) => !effectiveCoverageSelections[c.id]);
+    if (missingRequired.length > 0) {
+      setError(`Missing required coverage: ${missingRequired.map((c) => c.coverage_name).join(", ")}.`);
+      return;
+    }
+    // The required ones alone (FLAT_TIER/VEHICLE_SEATS_BASED, auto-selected)
+    // aren't enough on their own — at least one coverage outside that set
+    // must actually be chosen too, same rule the server enforces.
+    const hasOptionalCoverage = coverageEntries.some(([id]) => !requiredCoverageIds.has(id));
+    if (!hasOptionalCoverage) {
+      setError("Select at least one coverage in addition to the required ones.");
+      return;
+    }
     if (!coverageStartAt) {
       setError("Set the insured from date.");
+      return;
+    }
+    if (blockingPolicy && minCoverageStartAt && coverageStartAt < minCoverageStartAt) {
+      setError(
+        `This vehicle already has an active policy (${blockingPolicy.policy_number}) — coverage cannot start before it expires on ${minCoverageStartAt.replace("T", " ")}.`
+      );
       return;
     }
     if (!coveragePeriodDays) {
@@ -1317,6 +1806,20 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
     if (!insuredAddressComplete) {
       setError("Fill out the insured address.");
       return;
+    }
+    if (pricingInputMode === "TARGET_GROSS") {
+      if (!grossTargetCoverageId) {
+        setError("This product variant has no Gross Target Coverage configured — enter premiums manually instead.");
+        return;
+      }
+      if (!Number(targetGrossAmount) || Number(targetGrossAmount) <= 0) {
+        setError("Enter the target gross total.");
+        return;
+      }
+      if (!targetSelection) {
+        setError(`Select ${grossTargetCoverage?.coverage_name || "the gross target coverage"} to solve from a target gross total.`);
+        return;
+      }
     }
     for (const [coverageId, selection] of coverageEntries) {
       const cov = coverages.find((c) => c.id === coverageId);
@@ -1359,25 +1862,34 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
 
   async function handleConfirmSubmit() {
     setError("");
-    const coverageEntries = Object.entries(coverageSelections);
+    const coverageEntries = Object.entries(effectiveCoverageSelections);
 
     setSubmitting(true);
     try {
       let customerId;
       let companyId;
 
+      // canFileForOtherAgent: a brand-new customer/company has to be linked
+      // to the agent this quotation is being filed under, not the caller's
+      // own — see POST /customers'/POST /companies' own agent_id override.
       if (insuredType === "INDIVIDUAL") {
         if (newCustomer.existing_customer_id) {
           customerId = newCustomer.existing_customer_id;
         } else {
-          const created = await createCustomer(token, newCustomer);
+          const created = await createCustomer(
+            token,
+            canFileForOtherAgent ? { ...newCustomer, agent_id: filingAgentId } : newCustomer
+          );
           customerId = created.id;
         }
       } else {
         if (newCompany.existing_company_id) {
           companyId = newCompany.existing_company_id;
         } else {
-          const created = await createCompany(token, newCompany);
+          const created = await createCompany(
+            token,
+            canFileForOtherAgent ? { ...newCompany, agent_id: filingAgentId } : newCompany
+          );
           companyId = created.id;
         }
       }
@@ -1401,6 +1913,15 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
         // server can look it up among the coverage's actual tiers.
         coverages: coverageEntries.map(([coverage_id, v]) => {
           const cov = coverages.find((c) => c.id === coverage_id);
+          // FLAT_TIER never collects a premium from the agent either (no
+          // margin — see resolveCoverageSelection/lib/coveragePricing.js) —
+          // send the resolved tier price itself so the schema's own
+          // .positive() shape check has something real to validate; the
+          // server ignores whatever's sent here anyway and recomputes it.
+          const resolvedPremium =
+            cov?.pricing_mode === "FLAT_TIER"
+              ? resolveCoverageSelection(cov, v, coverageVehicles, riskAddressValue)?.premium_amount
+              : null;
           return {
             coverage_id,
             // VALUE_PERCENTAGE never collects a coverage_amount from the agent
@@ -1410,7 +1931,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
             // so send a harmless positive placeholder here instead of the
             // unset 0.
             coverage_amount: cov?.pricing_mode === "VALUE_PERCENTAGE" ? 1 : Number(v.coverage_amount) || 0,
-            premium_amount: Number(v.premium_amount) || 0,
+            premium_amount: resolvedPremium || Number(v.premium_amount) || 0,
             vehicle_indices: v.vehicle_indices ?? null,
           };
         }),
@@ -1429,6 +1950,10 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
         // before this field existed — only sent when the picker above
         // actually chose someone else's.
         agent_id: canFileForOtherAgent && filingAgentId && filingAgentId !== agent?.id ? filingAgentId : undefined,
+        // See the gross-solve block above — omitted (the default), every
+        // coverage's premium above is exactly what the agent entered.
+        pricing_input_mode: pricingInputMode,
+        target_gross_amount: pricingInputMode === "TARGET_GROSS" ? Number(targetGrossAmount) : undefined,
       };
 
       const quotation = await createPolicyQuotation(token, payload);
@@ -1446,6 +1971,8 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
       }
       setVariantId("");
       setCoverageSelections({});
+      setPricingInputMode("PER_COVERAGE");
+      setTargetGrossAmount("");
       setCoverageStartAt("");
       setCoveragePeriodDays("");
       setVehicles([emptyVehicle]);
@@ -1453,7 +1980,6 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
       setRiskAddress(emptyAddress);
       setInsuredAddress(emptyAddress);
       setRemarks("");
-      setMisc("");
       setSendPolicyToEmail(true);
       setPreviewOpen(false);
       setConfirmChecked(false);
@@ -1497,7 +2023,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
     coverageStartAt,
     coverageEndAt,
     vehicles: isMotor ? vehicles : [],
-    coverages: Object.entries(coverageSelections).map(([id, sel]) => {
+    coverages: Object.entries(effectiveCoverageSelections).map(([id, sel]) => {
       const cov = coverages.find((c) => c.id === id);
       const resolved = cov ? resolveCoverageSelection(cov, sel, coverageVehicles, riskAddressValue) : null;
       // Only worth spelling out which vehicle(s) a coverage applies to when
@@ -1520,6 +2046,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
       };
     }),
     deductibleRate: selectedVariant?.deductible_rate,
+    minimumDeductibleAmount: selectedVariant?.minimum_deductible_amount,
     totalPremium,
     docStamps,
     vat,
@@ -2176,6 +2703,18 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                         {insuredType === "INDIVIDUAL" ? "customer" : "company"} once this policy is approved.
                       </Alert>
                     )}
+                    {vehiclePolicyHistory[index] && (() => {
+                      const policy = vehiclePolicyHistory[index];
+                      const isActive = policy.status === "ACTIVE";
+                      const dateLabel = new Date(policy.expiry_date).toLocaleDateString();
+                      return (
+                        <Alert severity={isActive ? "warning" : "info"} sx={{ mb: 1.5 }}>
+                          {isActive
+                            ? `This vehicle already has an active policy (${policy.policy_number}) until ${dateLabel} — coverage on this quotation must start on or after that date, or it will be rejected on submission.`
+                            : `This vehicle's last policy (${policy.policy_number}) expired ${dateLabel} — this filing will be recorded as a renewal of it.`}
+                        </Alert>
+                      );
+                    })()}
                     <Grid container spacing={2}>
                       <Grid size={{ xs: 12, sm: 6 }}>
                         <Autocomplete
@@ -2290,7 +2829,6 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                           label="Engine number"
                           value={v.engine_number}
                           onChange={(e) => updateVehicleField(index, "engine_number", e.target.value)}
-                          required
                           fullWidth
                           disabled={Boolean(v.existing_vehicle_id)}
                         />
@@ -2310,6 +2848,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                           label="Vehicle type"
                           value={v.vehicle_type}
                           onChange={(e) => updateVehicleField(index, "vehicle_type", e.target.value)}
+                          required
                           fullWidth
                           disabled={Boolean(v.existing_vehicle_id)}
                         />
@@ -2319,6 +2858,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                           label="Make"
                           value={v.make}
                           onChange={(e) => updateVehicleField(index, "make", e.target.value)}
+                          required
                           fullWidth
                           disabled={Boolean(v.existing_vehicle_id)}
                         />
@@ -2328,6 +2868,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                           label="Model"
                           value={v.model}
                           onChange={(e) => updateVehicleField(index, "model", e.target.value)}
+                          required
                           fullWidth
                           disabled={Boolean(v.existing_vehicle_id)}
                         />
@@ -2338,6 +2879,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                           type="number"
                           value={v.year_model}
                           onChange={(e) => updateVehicleField(index, "year_model", e.target.value)}
+                          required
                           fullWidth
                           disabled={Boolean(v.existing_vehicle_id)}
                         />
@@ -2347,6 +2889,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                           label="Color"
                           value={v.color}
                           onChange={(e) => updateVehicleField(index, "color", e.target.value)}
+                          required
                           fullWidth
                           disabled={Boolean(v.existing_vehicle_id)}
                         />
@@ -2596,9 +3139,15 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                     type="datetime-local"
                     value={coverageStartAt}
                     onChange={(e) => setCoverageStartAt(e.target.value)}
-                    slotProps={{ inputLabel: { shrink: true } }}
+                    slotProps={{ inputLabel: { shrink: true }, htmlInput: { min: minCoverageStartAt || undefined } }}
                     required
                     fullWidth
+                    error={Boolean(blockingPolicy && minCoverageStartAt && coverageStartAt && coverageStartAt < minCoverageStartAt)}
+                    helperText={
+                      blockingPolicy
+                        ? `Must be on or after ${minCoverageStartAt.replace("T", " ")} — when ${blockingPolicy.policy_number} expires.`
+                        : ""
+                    }
                   />
                 </Grid>
                 <Grid size={{ xs: 12, sm: 6 }}>
@@ -2633,16 +3182,73 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                 )}
               </Box>
 
+              {grossTargetCoverageId && (
+                <Box>
+                  <Typography variant="body2" sx={{ mb: 1 }}>
+                    Premium entry
+                  </Typography>
+                  <ToggleButtonGroup
+                    exclusive
+                    size="small"
+                    value={pricingInputMode}
+                    onChange={(e, value) => handlePricingModeChange(value)}
+                  >
+                    <ToggleButton value="PER_COVERAGE">Enter premiums manually</ToggleButton>
+                    <ToggleButton value="TARGET_GROSS">Solve from target gross total</ToggleButton>
+                  </ToggleButtonGroup>
+                  {pricingInputMode === "TARGET_GROSS" && (
+                    <NumberField
+                      label="Target gross total"
+                      value={targetGrossAmount}
+                      onChange={setTargetGrossAmount}
+                      fullWidth
+                      sx={{ mt: 1.5 }}
+                      helperText={`${grossTargetCoverage?.coverage_name || "The gross target coverage"}'s premium is computed automatically so Premium + Doc. Stamps + V.A.T. + L.G.T. + Miscellaneous comes out to this amount — every other selected coverage still prices as entered.`}
+                      slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                    />
+                  )}
+                </Box>
+              )}
+
+              {requiredCoverages.length > 0 && (
+                <Box>
+                  <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                    Required Coverages
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                    These are included on every filing and can't be removed. Tier-based coverages price
+                    automatically with no agent margin — just pick the insured value; seat-based ones still let you
+                    set your own premium.
+                  </Typography>
+                  <Stack spacing={1.5} divider={<Divider />}>
+                    {requiredCoverages.map((cov) => {
+                      const selection = coverageSelections[cov.id];
+                      const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue) : null;
+                      return (
+                        <Box key={cov.id}>
+                          <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                            {cov.coverage_name}
+                          </Typography>
+                          {renderCoverageDetails(cov, selection, resolved, false)}
+                        </Box>
+                      );
+                    })}
+                  </Stack>
+                </Box>
+              )}
+
               {coverages.length > 0 && (
                 <Box>
                   <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
                     {coveragePeriodDays
-                      ? "Select coverages, then enter the premium you want to charge for each:"
+                      ? "Select any other coverages, then enter the premium you want to charge for each:"
                       : "Select a coverage period above to see which coverages are available."}
                   </Typography>
                   <Stack spacing={1.5} divider={<Divider />}>
-                    {coverages.map((cov) => {
-                      const selection = coverageSelections[cov.id];
+                    {optionalCoverages.map((cov) => {
+                      const rawSelection = coverageSelections[cov.id];
+                      const isGrossTargetRow = isGrossMode && cov.id === grossTargetCoverageId;
+                      const selection = effectiveCoverageSelections[cov.id];
                       const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue) : null;
                       const periodAllowed = coverageAllowsPeriod(cov, coveragePeriodDays);
                       const isPriced = !periodAllowed || coverageIsPriced(cov);
@@ -2651,9 +3257,9 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                           <FormControlLabel
                             control={
                               <Checkbox
-                                checked={Boolean(selection)}
+                                checked={Boolean(rawSelection)}
                                 onChange={() => toggleCoverage(cov.id)}
-                                disabled={!periodAllowed || !isPriced}
+                                disabled={!periodAllowed || !isPriced || isGrossTargetRow}
                               />
                             }
                             label={
@@ -2667,190 +3273,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                                   : "")
                             }
                           />
-                          {selection && isMotor && vehicles.length > 1 && (
-                            <Box sx={{ pl: 4, pb: 1 }}>
-                              <FormControlLabel
-                                control={
-                                  <Checkbox
-                                    size="small"
-                                    checked={
-                                      selection.vehicle_indices === null || selection.vehicle_indices === undefined
-                                    }
-                                    onChange={(e) =>
-                                      updateCoverageField(cov.id, "vehicle_indices", e.target.checked ? null : [])
-                                    }
-                                  />
-                                }
-                                label="Applies to the whole policy (every vehicle)"
-                              />
-                              {selection.vehicle_indices !== null && selection.vehicle_indices !== undefined && (
-                                <Box sx={{ pl: 3 }}>
-                                  <Typography variant="caption" color="text.secondary" component="div">
-                                    Or choose specific vehicles:
-                                  </Typography>
-                                  <FormGroup row>
-                                    {vehicles.map((v, i) => (
-                                      <FormControlLabel
-                                        key={i}
-                                        control={
-                                          <Checkbox
-                                            size="small"
-                                            checked={selection.vehicle_indices.includes(i)}
-                                            onChange={(e) => {
-                                              const current = selection.vehicle_indices;
-                                              const next = e.target.checked
-                                                ? [...current, i]
-                                                : current.filter((x) => x !== i);
-                                              updateCoverageField(cov.id, "vehicle_indices", next);
-                                            }}
-                                          />
-                                        }
-                                        label={v.plate_number ? `Vehicle ${i + 1} (${v.plate_number})` : `Vehicle ${i + 1}`}
-                                      />
-                                    ))}
-                                  </FormGroup>
-                                </Box>
-                              )}
-                            </Box>
-                          )}
-                          {selection && (
-                            <Box sx={{ pl: 4, pb: 1 }}>
-                              {cov.pricing_mode === "PERCENTAGE" && (
-                                <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 1 }}>
-                                  Your net rate: <strong>{formatRate(cov.rate)}</strong>
-                                  {cov.is_custom_rate ? " (your rate)" : " (standard rate)"}
-                                </Typography>
-                              )}
-                              <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 1 }}>
-                                {cov.clause}
-                              </Typography>
-
-                              {cov.pricing_mode === "PERCENTAGE" && (
-                                <Grid container spacing={2} sx={{ mb: 1 }}>
-                                  <Grid size={6}>
-                                    <NumberField
-                                      label="Coverage amount"
-                                      value={selection.coverage_amount}
-                                      onChange={(v) => updateCoverageField(cov.id, "coverage_amount", v)}
-                                      required
-                                      fullWidth
-                                      size="small"
-                                      error={resolved.exceedsMax}
-                                      helperText={resolved.exceedsMax ? "Exceeds the maximum for this coverage" : ""}
-                                      slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
-                                    />
-                                  </Grid>
-                                </Grid>
-                              )}
-
-                              {cov.pricing_mode === "FLAT_TIER" && (
-                                <TextField
-                                  select
-                                  label="Insured value"
-                                  value={resolved.pending ? "" : String(selection.coverage_amount)}
-                                  onChange={(e) => updateCoverageField(cov.id, "coverage_amount", e.target.value)}
-                                  required
-                                  fullWidth
-                                  size="small"
-                                  sx={{ mb: 1 }}
-                                >
-                                  {(cov.tier_based_prices || []).map((tier) => (
-                                    <MenuItem key={tier.id} value={String(tier.coverage_amount)}>
-                                      {formatPHP(tier.coverage_amount)} — {formatPHP(tier.coverage_price)}
-                                    </MenuItem>
-                                  ))}
-                                </TextField>
-                              )}
-
-                              {cov.pricing_mode === "VEHICLE_SEATS_BASED" && (
-                                <TextField
-                                  select
-                                  label="Insured amount for each occupant"
-                                  value={
-                                    (cov.seats_tier_prices || []).some(
-                                      (t) => String(t.insured_amount_per_occupant) === String(selection.coverage_amount)
-                                    )
-                                      ? String(selection.coverage_amount)
-                                      : ""
-                                  }
-                                  onChange={(e) => updateCoverageField(cov.id, "coverage_amount", e.target.value)}
-                                  required
-                                  fullWidth
-                                  size="small"
-                                  sx={{ mb: 1 }}
-                                >
-                                  {(cov.seats_tier_prices || []).map((tier) => (
-                                    <MenuItem
-                                      key={tier.insured_amount_per_occupant}
-                                      value={String(tier.insured_amount_per_occupant)}
-                                    >
-                                      {formatPHP(tier.insured_amount_per_occupant)}/occupant — {formatPHP(tier.rate_per_excess_seat)}/excess seat
-                                    </MenuItem>
-                                  ))}
-                                </TextField>
-                              )}
-
-                              {cov.pricing_mode === "VALUE_PERCENTAGE" && resolved.pending && (
-                                <Alert severity="info" sx={{ mb: 1 }}>
-                                  {resolved.noTier
-                                    ? "No pricing tier is set up yet for this coverage — contact Settings."
-                                    : "Priced automatically once the vehicle's estimated value is assessed."}
-                                </Alert>
-                              )}
-
-                              {!resolved.pending && (
-                                <>
-                                  <Grid container spacing={2}>
-                                    <Grid size={6}>
-                                      <NumberField
-                                        label="Premium amount (your price)"
-                                        value={selection.premium_amount}
-                                        onChange={(v) => updateCoverageField(cov.id, "premium_amount", v)}
-                                        required
-                                        fullWidth
-                                        size="small"
-                                        error={resolved.belowMinimum}
-                                        helperText={
-                                          resolved.belowMinimum
-                                            ? `Below the amount payable to Bethel of ${formatPHP(resolved.minPremiumPerVehicle)}`
-                                            : ""
-                                        }
-                                        slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
-                                      />
-                                    </Grid>
-                                  </Grid>
-                                  <Alert severity="success" sx={{ mt: 1 }}>
-                                    <Stack spacing={0.25}>
-                                      {cov.pricing_mode === "VALUE_PERCENTAGE" && (
-                                        <>
-                                          <span>
-                                            Insured value: <strong>{formatPHP(resolved.coverage_amount)}</strong>
-                                          </span>
-                                          <span>
-                                            Rate: <strong>{formatRate(resolved.effectiveRate)}</strong>
-                                          </span>
-                                        </>
-                                      )}
-                                      {cov.pricing_mode === "VEHICLE_SEATS_BASED" && (
-                                        <span>
-                                          Insured amount: <strong>{formatPHP(resolved.coverage_amount)}</strong>{" "}
-                                          (seat threshold {cov.seats_threshold})
-                                        </span>
-                                      )}
-                                      <span>
-                                        Payable to Bethel: <strong>{formatPHP(resolved.payable_to_bethel)}</strong>
-                                      </span>
-                                      {resolved.hasPremium && !resolved.belowMinimum && (
-                                        <span>
-                                          Your Profit: <strong>{formatPHP(resolved.agentEarnings)}</strong>
-                                        </span>
-                                      )}
-                                    </Stack>
-                                  </Alert>
-                                </>
-                              )}
-                            </Box>
-                          )}
+                          {renderCoverageDetails(cov, selection, resolved, isGrossTargetRow)}
                         </Box>
                       );
                     })}

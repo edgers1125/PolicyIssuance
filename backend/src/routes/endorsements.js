@@ -6,12 +6,14 @@ const { validateBody, validateQuery, validateParams } = require("../middleware/v
 const { getCurrentAgentId } = require("../lib/agent");
 const { fetchByPriority } = require("../lib/priorityPagination");
 const { resolveCoverageRows, computeChargeTotals, round2 } = require("../lib/coveragePricing");
+const { computeDueDate, applyDebitToOriginalBucket } = require("../lib/agentPayables");
 const { currentVehicleValue } = require("../lib/vehicleValue");
 const {
   VEHICLE_CHANGE_TYPES,
   COVERAGE_TARGET_CHANGE_TYPES,
   createEndorsementRequestSchema,
   endorsementChangeSchema,
+  approveEndorsementSchema,
   rejectEndorsementSchema,
   listEndorsementRequestsQuerySchema,
   endorsementIdParamSchema,
@@ -203,6 +205,103 @@ async function priceAddCoverageChange(policy, baseline, input) {
   };
 }
 
+// Prices a VEHICLE_ESTIMATED_VALUE change — corrects one policy vehicle's
+// assessed value and recomputes the margin of whichever single
+// VALUE_PERCENTAGE PolicyCoverage row is priced off that vehicle, through the
+// exact same lib/coveragePricing.js engine used everywhere else (a
+// single-coverage, single-vehicle call, same shape as priceAddCoverageChange
+// above — the new value is passed in directly as the vehicle's value rather
+// than depreciated through currentVehicleValue, since the agent/approver is
+// stating what the vehicle is actually worth right now, superseding whatever
+// depreciation would otherwise say). Unlike ADD_COVERAGE, this never creates
+// a new PolicyCoverage row — it corrects an existing one in place — so the
+// coverage_amount/premium_amount/payable_to_bethel this returns are DELTAS
+// (new minus old), not absolute values: POST /:id/approve adds them onto the
+// existing row, and computeEndorsementChargeDelta below sums them directly
+// into the printed endorsement's own charges the same way it already sums
+// ADD_COVERAGE's absolute premium_amount. The agent's own original margin
+// (premium_amount minus payable_to_bethel) on that row is preserved — only
+// the portion actually owed to Bethel moves with the corrected value.
+async function priceVehicleValueChange(policy, baseline, input) {
+  if (!input.policy_vehicle_id) {
+    throw new HttpError(400, "policy_vehicle_id is required to correct a vehicle's estimated value");
+  }
+  const newValue = Number(input.new_value);
+  if (!Number.isFinite(newValue) || newValue < 0) {
+    throw new HttpError(400, "new_value must be a non-negative number");
+  }
+
+  const policyVehicle = await prisma.policyVehicle.findFirst({
+    where: { id: input.policy_vehicle_id, policy_id: baseline.id },
+    select: {
+      no_of_seats_snapshot: true,
+      vehicle: { select: { estimated_value: true } },
+    },
+  });
+  if (!policyVehicle) {
+    throw new HttpError(400, "policy_vehicle_id does not belong to this policy");
+  }
+
+  // An issuance-time PolicyCoverage row doesn't retain which of possibly-
+  // several vehicles it was originally priced against (policy_vehicle_id is
+  // only ever set on a row an ADD_COVERAGE endorsement itself created) — so
+  // this can only unambiguously match a VALUE_PERCENTAGE row on a
+  // single-vehicle policy, or one that was itself added via ADD_COVERAGE and
+  // so already carries the right policy_vehicle_id. A multi-vehicle policy
+  // whose VALUE_PERCENTAGE coverage predates any such endorsement has no
+  // reliable row to target here — an accepted gap, same as
+  // lib/policyConflicts.js's own documented one.
+  const isSingleVehiclePolicy = baseline.vehicles.length === 1;
+  const candidates = baseline.coverages.filter(
+    (c) =>
+      c.pricing_mode_snapshot === "VALUE_PERCENTAGE" &&
+      (c.policy_vehicle_id === input.policy_vehicle_id || (isSingleVehiclePolicy && !c.policy_vehicle_id))
+  );
+  if (candidates.length === 0) {
+    throw new HttpError(400, "This vehicle has no value-based coverage on this policy to reprice");
+  }
+  if (candidates.length > 1) {
+    throw new HttpError(
+      400,
+      "This vehicle has more than one value-based coverage on this policy — remove and re-add the affected coverage instead of correcting its value"
+    );
+  }
+  const targetCoverage = candidates[0];
+
+  const resolvedRows = await resolveCoverageRows({
+    coverages: [{ coverage_id: targetCoverage.coverage_id, vehicle_indices: [0], coverage_amount: 1, premium_amount: Number.MAX_SAFE_INTEGER }],
+    className: policy.class_name_snapshot,
+    vehicles: [{ no_of_seats: policyVehicle.no_of_seats_snapshot }],
+    vehicleValues: [newValue],
+    agentId: policy.agent_id,
+    startAt: new Date(baseline.effective_date),
+    endAt: new Date(baseline.expiry_date),
+  });
+  const resolved = resolvedRows[0];
+
+  const oldPremium = Number(targetCoverage.premium_amount);
+  const oldPayable = Number(targetCoverage.payable_to_bethel ?? oldPremium);
+  const oldCoverageAmount = Number(targetCoverage.coverage_amount);
+  const originalMargin = round2(oldPremium - oldPayable);
+  const newPremium = round2(resolved.payable_to_bethel + originalMargin);
+
+  return {
+    policy_vehicle_id: input.policy_vehicle_id,
+    policy_coverage_id: targetCoverage.id,
+    change_type: "VEHICLE_ESTIMATED_VALUE",
+    change_from: `Estimated value ₱${formatMoney(policyVehicle.vehicle.estimated_value ?? 0)} — ${targetCoverage.coverage_name_snapshot} Coverage Amount ₱${formatMoney(oldCoverageAmount)}, Premium ₱${formatMoney(oldPremium)}`,
+    change_to: `Estimated value ₱${formatMoney(newValue)} — ${targetCoverage.coverage_name_snapshot} Coverage Amount ₱${formatMoney(resolved.coverage_amount)}, Premium ₱${formatMoney(newPremium)}`,
+    remarks: input.remarks || null,
+    product_coverage_id: null,
+    // Deltas, not absolutes — see this function's own comment above.
+    coverage_amount: round2(resolved.coverage_amount - oldCoverageAmount),
+    premium_amount: round2(newPremium - oldPremium),
+    payable_to_bethel: round2(resolved.payable_to_bethel - oldPayable),
+    applied_rate: resolved.applied_rate,
+    is_misc: targetCoverage.is_misc_snapshot,
+  };
+}
+
 // Resolves one endorsementChangeSchema-validated line into the shape
 // EndorsementChange.createMany/create/update expects, against `baseline` — a
 // policyDetailSelect-shaped Policy row already folded (via
@@ -218,6 +317,10 @@ async function resolveEndorsementChange(baseline, input, policy) {
 
   if (change_type === "ADD_COVERAGE") {
     return priceAddCoverageChange(policy, baseline, input);
+  }
+
+  if (change_type === "VEHICLE_ESTIMATED_VALUE") {
+    return priceVehicleValueChange(policy, baseline, input);
   }
 
   if (change_type === "REMOVE_CLAUSE") {
@@ -343,6 +446,9 @@ function toPolicyContext(policy, foldedPolicy, availableCoverages) {
       color: v.color_snapshot,
       engine_number: v.engine_number_snapshot,
       chassis_number: v.chassis_number_snapshot,
+      // Live, not a snapshot — see policyDetailSelect's own note; the
+      // VEHICLE_ESTIMATED_VALUE composer's "current value" placeholder.
+      estimated_value: v.vehicle?.estimated_value ?? null,
     })),
     coverages: foldedPolicy.coverages.map((c) => ({
       id: c.id,
@@ -375,20 +481,46 @@ function attachChangeLabels(policy, changes) {
 
 // The pricing CHANGE this endorsement's own financial lines introduce —
 // ADD_COVERAGE contributes its premium_amount positively, REMOVE_CLAUSE
-// contributes the removed line's own premium_amount negatively (a refund) —
-// run through the same total_premium/doc_stamps/vat/lgt/misc split
-// computeChargeTotals uses elsewhere, then totalled. Every other change type
-// contributes nothing (no premium/coverage-amount effect at all — see
-// EndorsementChangeType's own comment). CANCEL_POLICY is deliberately not
-// represented here either — a cancellation's own payable effect is a ledger
-// debit, not a premium/coverage change on this document.
-function computeEndorsementChargeDelta(changes) {
+// contributes the removed line's own premium_amount negatively (a refund),
+// VEHICLE_ESTIMATED_VALUE contributes its own premium_amount as-is (already a
+// signed delta — see priceVehicleValueChange) — run through the same
+// total_premium/doc_stamps/vat/lgt/misc split computeChargeTotals uses
+// elsewhere, then totalled. Every other change type contributes nothing (no
+// premium/coverage-amount effect at all — see EndorsementChangeType's own
+// comment).
+//
+// CANCEL_POLICY is a special case, not summed with the rest — a
+// CANCELLATION's single synthesized line carries no premium/coverage-amount
+// of its own to sum (its actual payable effect is a separate ledger debit,
+// computeCancellationProration, not a premium/coverage change), but the
+// printed endorsement's own charges block still has to show *something*
+// meaningful rather than a flat, misleading 0 — cancelling reverses this
+// policy's entire current charges, so this returns the negative of whatever
+// `policy` (a policyDetailSelect-shaped row, or its already-folded baseline —
+// folding never touches these columns, see Policy.total_premium's own schema
+// comment) is presently charging. `policy` is only ever required by callers
+// that might pass a CANCEL_POLICY change (renderEndorsementPdf, the
+// preview-pdf draft route below) — every other caller only ever deals in
+// CORRECTION changes and can omit it.
+function computeEndorsementChargeDelta(changes, policy) {
+  const cancelChange = changes.find((c) => c.change_type === "CANCEL_POLICY");
+  if (cancelChange) {
+    const totalPremium = round2(-Number(policy?.total_premium || 0));
+    const docStamps = round2(-Number(policy?.doc_stamps || 0));
+    const vat = round2(-Number(policy?.vat || 0));
+    const lgt = round2(-Number(policy?.lgt || 0));
+    const misc = round2(-Number(policy?.misc || 0));
+    return { totalPremium, docStamps, vat, lgt, misc, totalAmount: round2(totalPremium + docStamps + vat + lgt + misc) };
+  }
+
   const rows = [];
   for (const c of changes) {
     if (c.change_type === "ADD_COVERAGE" && c.premium_amount != null) {
       rows.push({ premium_amount: Number(c.premium_amount), is_misc: Boolean(c.is_misc) });
     } else if (c.change_type === "REMOVE_CLAUSE" && c.premium_amount != null) {
       rows.push({ premium_amount: -Number(c.premium_amount), is_misc: Boolean(c.is_misc) });
+    } else if (c.change_type === "VEHICLE_ESTIMATED_VALUE" && c.premium_amount != null) {
+      rows.push({ premium_amount: Number(c.premium_amount), is_misc: Boolean(c.is_misc) });
     }
   }
   if (!rows.length) {
@@ -419,6 +551,28 @@ function computeCancellationProration({ basisAmount, effectiveDate, expiryDate, 
   return { totalDays, elapsedDays, remainingDays, dailyRate, deduction, description };
 }
 
+// How much of an ADD_COVERAGE/REMOVE_CLAUSE/VEHICLE_ESTIMATED_VALUE line's
+// own margin (or margin delta) actually gets credited/debited to the agent's
+// payable ledger, by default — the fraction of the policy's own current
+// coverage period still remaining as of this endorsement's own effective_date,
+// same remaining-days-over-full-period shape as computeCancellationProration
+// above, just without the "already elapsed" framing (there's no cancellation
+// date here, only "from here to expiry"). Returns 1 (no proration at all)
+// once the endorsement's effective_date is on/before the period's own start,
+// and clamps to [0, 1] either way — an endorsement can't earn negative or
+// more-than-full margin just because its own effective_date landed outside
+// the period. Called only when the approver leaves POST /:id/approve's own
+// `prorate` flag at its default `true`; passing `prorate: false` (the review
+// dialog's "Do not apply pro-rated" checkbox) skips this entirely and posts
+// the full margin/delta instead, same as this app's original behavior before
+// this flag existed.
+function computeProrationFactor(effectiveDate, expiryDate, endorsementEffectiveDate) {
+  const totalMs = new Date(expiryDate).getTime() - new Date(effectiveDate).getTime();
+  if (totalMs <= 0) return 1;
+  const remainingMs = new Date(expiryDate).getTime() - new Date(endorsementEffectiveDate).getTime();
+  return Math.max(0, Math.min(1, remainingMs / totalMs));
+}
+
 // Renders one saved EndorsementRequest (`endorsement`, endorsementPdfSelect-
 // shaped) as a PDF Buffer — shared by GET /:id/pdf, POST /:id/resend-email,
 // and the submitted/approved email attachments, so all four can never
@@ -444,7 +598,7 @@ async function renderEndorsementPdf(endorsement, policy) {
       : endorsement.status === "REJECTED"
       ? "ENDORSEMENT REJECTED"
       : null;
-  const delta = computeEndorsementChargeDelta(endorsement.changes);
+  const delta = computeEndorsementChargeDelta(endorsement.changes, baseline);
 
   return buildEndorsementPdf({
     endorsementNumber: endorsement.endorsement_number,
@@ -797,7 +951,7 @@ router.post(
       const withThis = foldEndorsementChanges(policy, [...priorApprovedChanges, ...resolvedChanges]);
       const baseline = applyFoldedState(policy, foldEndorsementChanges(policy, priorApprovedChanges));
       const insuredAddress = baseline.addresses.find((a) => a.role === "INSURED");
-      const delta = computeEndorsementChargeDelta(resolvedChanges);
+      const delta = computeEndorsementChargeDelta(resolvedChanges, baseline);
 
       const pdfBuffer = await buildEndorsementPdf({
         endorsementNumber: "TO BE ASSIGNED ON SUBMISSION",
@@ -1159,8 +1313,10 @@ router.post(
   "/:id/approve",
   requirePermission("APPROVE_ENDORSEMENT"),
   validateParams(endorsementIdParamSchema),
+  validateBody(approveEndorsementSchema),
   async (req, res, next) => {
     try {
+      const { prorate } = req.body;
       const endorsement = await prisma.endorsementRequest.findUnique({
         where: { id: req.params.id },
         select: {
@@ -1202,10 +1358,19 @@ router.post(
         return res.status(404).json({ error: "Policy not found" });
       }
 
+      // Computed once, shared by both branches below — the policy's own
+      // current (every earlier-approved endorsement folded in) effective/
+      // expiry dates, needed by a CANCELLATION's own day-proration and by a
+      // CORRECTION's ADD_COVERAGE/REMOVE_CLAUSE/VEHICLE_ESTIMATED_VALUE
+      // lines' own remaining-period proration (see computeProrationFactor).
+      const priorApprovedChanges = (policy.endorsement_requests || []).flatMap((e) => e.changes);
+      const folded = applyFoldedState(policy, foldEndorsementChanges(policy, priorApprovedChanges));
+      const prorationFactor = prorate
+        ? computeProrationFactor(folded.effective_date, folded.expiry_date, endorsement.effective_date)
+        : 1;
+
       await prisma.$transaction(async (tx) => {
         if (endorsement.request_type === "CANCELLATION") {
-          const priorApprovedChanges = (policy.endorsement_requests || []).flatMap((e) => e.changes);
-          const folded = applyFoldedState(policy, foldEndorsementChanges(policy, priorApprovedChanges));
           const commissionSoFar = await tx.agentPayableTransaction.aggregate({
             where: { policy_id: policy.id, transaction_type: { in: ["ISSUANCE", "ENDORSEMENT"] } },
             _sum: { amount: true },
@@ -1223,6 +1388,12 @@ router.post(
             data: { policy_status: "CANCELLED", cancelled_at: endorsement.effective_date },
           });
           if (proration.deduction !== 0) {
+            // A cancellation clawback claws back against the policy's own
+            // original ISSUANCE bucket (same treatment as a REMOVE_CLAUSE
+            // debit below) rather than opening an independent one — it's
+            // reducing commission already credited for *this* policy, not
+            // creating a new one of its own with a fresh due date.
+            const appliesToId = await applyDebitToOriginalBucket(tx, policy.id, proration.deduction);
             await tx.agentPayableTransaction.create({
               data: {
                 agent_id: policy.agent_id,
@@ -1231,6 +1402,7 @@ router.post(
                 transaction_type: "CANCELLED_POLICY",
                 amount: -proration.deduction,
                 remarks: proration.description,
+                applies_to_transaction_id: appliesToId,
               },
             });
             await tx.agent.update({ where: { id: policy.agent_id }, data: { payable: { decrement: proration.deduction } } });
@@ -1262,17 +1434,37 @@ router.post(
               });
 
               const margin = round2(Number(change.premium_amount) - Number(change.payable_to_bethel));
+              // Prorated by default against how much of the coverage period
+              // remains from this endorsement's own effective_date — see
+              // computeProrationFactor — unless the approver checked "Do not
+              // apply pro-rated" (prorate: false, prorationFactor === 1).
+              // Only the ledger amount is prorated; the PolicyCoverage row
+              // itself always carries the coverage's own full, correctly-
+              // priced premium/coverage_amount.
+              const postedAmount = round2(margin * prorationFactor);
+              // An ADD_COVERAGE credit opens its own new payable-aging
+              // bucket — its own due date off this endorsement's own
+              // effective_date, independent of the policy's original
+              // ISSUANCE bucket (see lib/agentPayables.js).
+              const addingAgent = await tx.agent.findUnique({
+                where: { id: policy.agent_id },
+                select: { payment_terms_days: true },
+              });
               await tx.agentPayableTransaction.create({
                 data: {
                   agent_id: policy.agent_id,
                   policy_id: policy.id,
                   endorsement_request_id: endorsement.id,
                   transaction_type: "ENDORSEMENT",
-                  amount: margin,
-                  remarks: `Added coverage "${change.product_coverage.coverage_name}" via endorsement ${endorsement.id}`,
+                  amount: postedAmount,
+                  remarks:
+                    `Added coverage "${change.product_coverage.coverage_name}" via endorsement ${endorsement.id}` +
+                    (prorationFactor < 1 ? ` (prorated ${Math.round(prorationFactor * 100)}% of ₱${formatMoney(margin)} margin)` : ""),
+                  due_date: computeDueDate(endorsement.effective_date, addingAgent.payment_terms_days),
+                  remaining_amount: postedAmount,
                 },
               });
-              await tx.agent.update({ where: { id: policy.agent_id }, data: { payable: { increment: margin } } });
+              await tx.agent.update({ where: { id: policy.agent_id }, data: { payable: { increment: postedAmount } } });
               coverageSetChanged = true;
             } else if (change.change_type === "REMOVE_CLAUSE") {
               const targetCoverage = await tx.policyCoverage.findUnique({ where: { id: change.policy_coverage_id } });
@@ -1289,17 +1481,105 @@ router.post(
                   ? Number(change.payable_to_bethel)
                   : Number(change.premium_amount);
               const margin = round2(Number(change.premium_amount) - payableToBethel);
+              // Same prorate-by-default treatment as ADD_COVERAGE above.
+              const postedAmount = round2(margin * prorationFactor);
+              // A REMOVE_CLAUSE debit claws back against the policy's own
+              // original ISSUANCE bucket rather than opening a new one — see
+              // lib/agentPayables.js's applyDebitToOriginalBucket.
+              const appliesToId = await applyDebitToOriginalBucket(tx, policy.id, postedAmount);
               await tx.agentPayableTransaction.create({
                 data: {
                   agent_id: policy.agent_id,
                   policy_id: policy.id,
                   endorsement_request_id: endorsement.id,
                   transaction_type: "ENDORSEMENT",
-                  amount: -margin,
-                  remarks: `Removed coverage "${targetCoverage.coverage_name_snapshot}" via endorsement ${endorsement.id}`,
+                  amount: -postedAmount,
+                  remarks:
+                    `Removed coverage "${targetCoverage.coverage_name_snapshot}" via endorsement ${endorsement.id}` +
+                    (prorationFactor < 1 ? ` (prorated ${Math.round(prorationFactor * 100)}% of ₱${formatMoney(margin)} margin)` : ""),
+                  applies_to_transaction_id: appliesToId,
                 },
               });
-              await tx.agent.update({ where: { id: policy.agent_id }, data: { payable: { decrement: margin } } });
+              await tx.agent.update({ where: { id: policy.agent_id }, data: { payable: { decrement: postedAmount } } });
+              coverageSetChanged = true;
+            } else if (change.change_type === "VEHICLE_ESTIMATED_VALUE") {
+              const targetCoverage = await tx.policyCoverage.findUnique({ where: { id: change.policy_coverage_id } });
+              if (!targetCoverage || targetCoverage.removed_at) {
+                throw new HttpError(409, "The value-based coverage this change targets has since been removed");
+              }
+              const newCoverageAmount = round2(Number(targetCoverage.coverage_amount) + Number(change.coverage_amount));
+              const newPremium = round2(Number(targetCoverage.premium_amount) + Number(change.premium_amount));
+              const oldPayable =
+                targetCoverage.payable_to_bethel !== null && targetCoverage.payable_to_bethel !== undefined
+                  ? Number(targetCoverage.payable_to_bethel)
+                  : Number(targetCoverage.premium_amount);
+              const newPayable = round2(oldPayable + Number(change.payable_to_bethel));
+              await tx.policyCoverage.update({
+                where: { id: targetCoverage.id },
+                data: {
+                  coverage_amount: newCoverageAmount,
+                  premium_amount: newPremium,
+                  payable_to_bethel: newPayable,
+                  applied_rate: change.applied_rate,
+                },
+              });
+
+              // change.premium_amount/payable_to_bethel are already deltas
+              // (new minus old — see priceVehicleValueChange), so the margin
+              // delta is just their difference; same prorate-by-default
+              // treatment as ADD_COVERAGE/REMOVE_CLAUSE above. The sign of
+              // the resulting posted amount decides how it's booked, same
+              // convention lib/agentPayables.js's isBucketTransactionType
+              // relies on everywhere else: a non-negative ENDORSEMENT amount
+              // is always its own new bucket (mirrors ADD_COVERAGE's own
+              // credit, own due_date), a negative one always claws back
+              // against the policy's original ISSUANCE bucket (mirrors
+              // REMOVE_CLAUSE's own debit) — never left ambiguous the way an
+              // unconditional clawback regardless of sign would leave it.
+              const marginDelta = round2(Number(change.premium_amount) - Number(change.payable_to_bethel));
+              const postedAmount = round2(marginDelta * prorationFactor);
+              // Recorded even when exactly 0 (a fully-prorated-away or
+              // net-unchanged correction) — same "the ledger's own
+              // row-per-change history stays complete, no silent gaps"
+              // reasoning as ADD_COVERAGE's own ISSUANCE-style credit above.
+              if (postedAmount >= 0) {
+                const owningAgent = await tx.agent.findUnique({
+                  where: { id: policy.agent_id },
+                  select: { payment_terms_days: true },
+                });
+                await tx.agentPayableTransaction.create({
+                  data: {
+                    agent_id: policy.agent_id,
+                    policy_id: policy.id,
+                    endorsement_request_id: endorsement.id,
+                    transaction_type: "ENDORSEMENT",
+                    amount: postedAmount,
+                    remarks:
+                      `Corrected vehicle estimated value via endorsement ${endorsement.id}` +
+                      (prorationFactor < 1 ? ` (prorated ${Math.round(prorationFactor * 100)}% of ₱${formatMoney(marginDelta)} margin increase)` : ""),
+                    due_date: computeDueDate(endorsement.effective_date, owningAgent.payment_terms_days),
+                    remaining_amount: postedAmount,
+                  },
+                });
+                await tx.agent.update({ where: { id: policy.agent_id }, data: { payable: { increment: postedAmount } } });
+              } else {
+                const debitAmount = -postedAmount;
+                const appliesToId = await applyDebitToOriginalBucket(tx, policy.id, debitAmount);
+                await tx.agentPayableTransaction.create({
+                  data: {
+                    agent_id: policy.agent_id,
+                    policy_id: policy.id,
+                    endorsement_request_id: endorsement.id,
+                    transaction_type: "ENDORSEMENT",
+                    amount: postedAmount,
+                    remarks:
+                      `Corrected vehicle estimated value via endorsement ${endorsement.id}` +
+                      (prorationFactor < 1 ? ` (prorated ${Math.round(prorationFactor * 100)}% of ₱${formatMoney(-marginDelta)} margin decrease)` : ""),
+                    applies_to_transaction_id: appliesToId,
+                  },
+                });
+                await tx.agent.update({ where: { id: policy.agent_id }, data: { payable: { decrement: debitAmount } } });
+              }
               coverageSetChanged = true;
             }
           }

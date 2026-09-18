@@ -17,6 +17,7 @@ import {
   FormControlLabel,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
+import { useUnsavedChanges } from "../context/UnsavedChangesContext";
 import { getQuotation, listPaymentMethods, previewApplicationPdf, submitQuotation } from "../api/client";
 import { formatPHP } from "../utils/currency";
 import { PdfViewer } from "../components/PdfViewer";
@@ -27,7 +28,7 @@ import { PdfViewer } from "../components/PdfViewer";
 // dialog only asks for that, previews the resulting policy schedule, and
 // only then actually submits — mirroring the same preview-before-commit
 // pattern PolicyApplication.jsx's own submit flow already uses.
-export function SubmitQuotationDialog({ quotationId, token, onClose, onSubmitted }) {
+export function SubmitQuotationDialog({ open, quotationId, token, onClose, onSubmitted }) {
   const [loading, setLoading] = useState(true);
   const [detail, setDetail] = useState(null);
   const [bethelPaymentMethods, setBethelPaymentMethods] = useState([]);
@@ -45,6 +46,17 @@ export function SubmitQuotationDialog({ quotationId, token, onClose, onSubmitted
   const [previewPdfUrl, setPreviewPdfUrl] = useState(null);
   const [previewPdfLoading, setPreviewPdfLoading] = useState(false);
   const [previewPdfError, setPreviewPdfError] = useState("");
+
+  // Registered app-wide so switching pages while this dialog holds
+  // in-progress payment/delivery input warns first — see CLAUDE.md's
+  // unsaved-changes convention. Once submitted the quotation's own Actions
+  // column disables reopening this dialog for it, so there's no need to
+  // re-baseline this against a "just submitted" state the way
+  // EditQuotationDialog does.
+  const isDirty = Boolean(
+    paymentMethod || paymentRemittance || bethelPaymentMethodId || !sendPolicyToEmail || !sendPolicyToEmailOnApproval
+  );
+  useUnsavedChanges("submit-quotation-dialog", open && isDirty);
 
   useEffect(() => {
     if (!quotationId) return;
@@ -99,6 +111,7 @@ export function SubmitQuotationDialog({ quotationId, token, onClose, onSubmitted
         pricing_mode: c.pricing_mode,
       })),
       deductibleRate: detail.deductible_rate,
+      minimumDeductibleAmount: detail.minimum_deductible_amount,
       totalPremium: detail.total_premium,
       docStamps: detail.doc_stamps,
       vat: detail.vat,
@@ -162,6 +175,8 @@ export function SubmitQuotationDialog({ quotationId, token, onClose, onSubmitted
         send_policy_to_email: sendPolicyToEmail,
         send_policy_to_email_on_approval: sendPolicyToEmailOnApproval,
       });
+      setPreviewOpen(false);
+      setConfirmChecked(false);
       onSubmitted?.(application);
       onClose();
     } catch (err) {
@@ -173,7 +188,7 @@ export function SubmitQuotationDialog({ quotationId, token, onClose, onSubmitted
   }
 
   return (
-    <Dialog open={Boolean(quotationId)} onClose={onClose} fullWidth maxWidth="sm">
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm" keepMounted>
       <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         {detail ? `Submit ${detail.quotation_number} as Policy Application` : "Submit as Policy Application"}
         <IconButton onClick={onClose} aria-label="Close">

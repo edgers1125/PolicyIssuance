@@ -53,6 +53,7 @@ const CHANGE_TITLES = {
   REMOVE_CLAUSE: "DELETION OF COVERAGE",
   ADD_COVERAGE: "ADDITIONAL COVERAGE",
   CANCEL_POLICY: "CANCELLATION OF POLICY",
+  VEHICLE_ESTIMATED_VALUE: "CORRECT ESTIMATED VALUE",
 };
 
 function changeTitle(c) {
@@ -75,6 +76,8 @@ function describeChange(c) {
       return `The ${c.coverage_label || "coverage"} is removed from this policy (${from})`;
     case "ADD_COVERAGE":
       return to;
+    case "VEHICLE_ESTIMATED_VALUE":
+      return `The estimated value of the vehicle${c.vehicle_label ? ` (${c.vehicle_label})` : ""} is corrected, adjusting its coverage's premium accordingly (From: "${from}" To: "${to}")`;
     case "CANCEL_POLICY":
       return `This policy is cancelled effective the date above.${c.remarks ? ` Reason: ${c.remarks}` : ""}`;
     default: {

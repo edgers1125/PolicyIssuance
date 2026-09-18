@@ -18,6 +18,7 @@ import MenuIcon from "@mui/icons-material/Menu";
 import LogoutIcon from "@mui/icons-material/Logout";
 import { BrandMark } from "../components/BrandMark";
 import { useAuth } from "../context/AuthContext";
+import { useNavigationGuard } from "../context/UnsavedChangesContext";
 import { navItems } from "../nav/navItems";
 
 const DRAWER_WIDTH = 260;
@@ -31,6 +32,7 @@ export function AppLayout() {
   const { logout, permissions } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const confirmNavigation = useNavigationGuard();
 
   // While permissions are still loading, show only the items that don't need
   // one at all, so nothing the user lacks access to flashes on screen first.
@@ -53,6 +55,7 @@ export function AppLayout() {
   }
 
   function handleLogout() {
+    if (!confirmNavigation()) return;
     logout();
     navigate("/login");
   }
@@ -69,6 +72,8 @@ export function AppLayout() {
                 key={path}
                 selected={selected}
                 onClick={() => {
+                  if (selected) return;
+                  if (!confirmNavigation()) return;
                   navigate(path);
                   if (isMobile) setMobileOpen(false);
                 }}

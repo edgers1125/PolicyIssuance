@@ -22,12 +22,18 @@ const ENDORSEMENT_CHANGE_TYPES = [
   "EDIT_CLAUSE",
   "REMOVE_CLAUSE",
   "ADD_COVERAGE",
+  "VEHICLE_ESTIMATED_VALUE",
 ];
 
 const REQUEST_TYPES = ["CORRECTION", "CANCELLATION"];
 
 // Which change types need which reference id — used by this schema's own
-// refinement and by routes/endorsements.js's change_from/change_to resolution.
+// refinement and by routes/endorsements.js's change_from/change_to
+// resolution. VEHICLE_ESTIMATED_VALUE also needs policy_vehicle_id (which
+// vehicle's value is being corrected) but — unlike the other eight — is
+// financial (see EndorsementChangeType's own comment) and short-circuits
+// before routes/endorsements.js's generic field-diff branch that this set
+// otherwise drives.
 const VEHICLE_CHANGE_TYPES = new Set([
   "VEHICLE_MODEL",
   "VEHICLE_MV_FILE",
@@ -37,6 +43,7 @@ const VEHICLE_CHANGE_TYPES = new Set([
   "VEHICLE_COLOR",
   "VEHICLE_ENGINE_NO",
   "VEHICLE_CHASSIS_NO",
+  "VEHICLE_ESTIMATED_VALUE",
 ]);
 // Both target an *existing* PolicyCoverage line via policy_coverage_id —
 // EDIT_CLAUSE edits its fine-print text only (no financial effect);
@@ -103,6 +110,11 @@ const endorsementChangeInputSchema = z
       }
     } else if (data.change_type !== "REMOVE_CLAUSE" && (!data.new_value || !data.new_value.trim())) {
       ctx.addIssue({ code: "custom", path: ["new_value"], message: "new_value is required for this change type" });
+    } else if (data.change_type === "VEHICLE_ESTIMATED_VALUE") {
+      const parsed = Number(data.new_value);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        ctx.addIssue({ code: "custom", path: ["new_value"], message: "new_value must be a non-negative number" });
+      }
     }
   });
 
@@ -142,6 +154,17 @@ const createEndorsementRequestSchema = z
 // addable/editable as a standalone line — see that enum value's own comment).
 const endorsementChangeSchema = endorsementChangeInputSchema;
 
+// POST /:id/approve's optional body — whether the approver wants the ledger
+// effect of this endorsement's own financial lines (ADD_COVERAGE,
+// REMOVE_CLAUSE, VEHICLE_ESTIMATED_VALUE) prorated against how much of the
+// coverage period remains from this endorsement's own effective_date
+// (the default), or charged/credited in full ("do not apply pro-rated" in
+// the review dialog) — see routes/endorsements.js's own computeProrationFactor.
+// Set here, not at filing, since it's the approver's call, not the agent's.
+const approveEndorsementSchema = z.object({
+  prorate: z.coerce.boolean().optional().default(true),
+});
+
 const rejectEndorsementSchema = z.object({
   remarks: z
     .string()
@@ -178,6 +201,7 @@ module.exports = {
   COVERAGE_TARGET_CHANGE_TYPES,
   createEndorsementRequestSchema,
   endorsementChangeSchema,
+  approveEndorsementSchema,
   rejectEndorsementSchema,
   listEndorsementRequestsQuerySchema,
   endorsementIdParamSchema,

@@ -9,12 +9,13 @@ const {
   getUserPermissionCodes,
   INTAKE_PERMISSIONS,
 } = require("../middleware/permissions");
-const { validateBody, validateParams } = require("../middleware/validate");
+const { validateBody, validateParams, validateQuery } = require("../middleware/validate");
 const {
   updateCoverageSchema,
   productVariantIdParamSchema,
   updateProductVariantSchema,
   insuranceClassIdParamSchema,
+  listInsuranceClassesQuerySchema,
   updateInsuranceClassSchema,
   createInsuranceClassSchema,
   createProductVariantSchema,
@@ -37,10 +38,14 @@ router.get(
         where: { id: req.user.userId },
         select: { agent_id: true },
       });
-      // Never matches a real agent id — lets the nested `where: { agent_id }`
-      // filters below run unconditionally instead of branching the whole
-      // query shape on whether this user even has an agent profile.
-      const agentId = user?.agent_id ?? "no-agent-profile";
+      // The nil UUID — never matches a real agent id, so the nested
+      // `where: { agent_id }` filters below run unconditionally (returning no
+      // override rows) instead of branching the whole query shape on whether
+      // this user even has an agent profile. Has to be a syntactically valid
+      // uuid, not just an arbitrary sentinel string — agent_id is a uuid
+      // column, and Postgres rejects a non-uuid literal at the query level
+      // (a 500) before it ever gets the chance to just not match any row.
+      const agentId = user?.agent_id ?? "00000000-0000-0000-0000-000000000000";
 
       const classes = await prisma.insuranceClass.findMany({
         where: { status: "ACTIVE" },
@@ -59,12 +64,21 @@ router.get(
               // Repair Limit line (see pdf/theme.js) — null until an admin
               // sets it via Settings → Vehicle Rates.
               deductible_rate: true,
+              // A floor under deductible_rate's own computed figure — see
+              // that column's own schema comment and pdf/theme.js's
+              // computeDeductibleFigures().
+              minimum_deductible_amount: true,
               // The flat "Miscellaneous" charge every application/quotation
               // filed under this variant carries — read straight off here at
               // creation (routes/policyApplications.js's/policyQuotations.js's
               // POST /), exposed here too just so the intake wizards can
               // preview it before submitting.
               misc_fee: true,
+              // Which coverage, if any, the "Solve from Gross Total" pricing
+              // mode solves backward — see ProductVariant.gross_target_coverage_id
+              // and lib/coveragePricing.js's resolveCoverageRows. null means
+              // that mode isn't available for this variant.
+              gross_target_coverage_id: true,
               product_coverages: {
                 where: { status: "ACTIVE" },
                 orderBy: { coverage_name: "asc" },
@@ -104,10 +118,12 @@ router.get(
                         where: { agent_id: agentId },
                         orderBy: { coverage_amount: "asc" },
                       },
-                      seats_based_pricing: { select: { threshold_seats: true } },
+                      seats_based_pricing: {
+                        select: { threshold_amount: true, exceed_threshold_amount: true, exceed_threshold_price: true },
+                      },
                       agent_seats_based_pricing: {
                         where: { agent_id: agentId },
-                        select: { threshold_seats: true },
+                        select: { threshold_amount: true, exceed_threshold_amount: true, exceed_threshold_price: true },
                       },
                       seats_tier_prices: { orderBy: { insured_amount_per_occupant: "asc" } },
                       agent_seats_tier_prices: {
@@ -189,8 +205,11 @@ router.get(
                   // (rather than 0) whenever nothing's configured yet, same
                   // reasoning as `rate` above. seats_tier_prices is the
                   // "Insured amount for each occupant" dropdown's own options
-                  // (each { insured_amount_per_occupant, rate_per_excess_seat }).
-                  seats_threshold: seatsPricing ? seatsPricing.threshold_seats : null,
+                  // (each just { insured_amount_per_occupant } — the excess-
+                  // of-value bracket charge below is shared across every tier).
+                  seats_threshold_amount: seatsPricing ? seatsPricing.threshold_amount : null,
+                  seats_exceed_threshold_amount: seatsPricing ? seatsPricing.exceed_threshold_amount : null,
+                  seats_exceed_threshold_price: seatsPricing ? seatsPricing.exceed_threshold_price : null,
                   seats_tier_prices,
                   has_pricing,
                 };
@@ -217,17 +236,23 @@ router.get(
   "/insurance-classes",
   requireAuth,
   requirePermission("MANAGE_SETTINGS.MANAGE_PRODUCTS"),
+  validateQuery(listInsuranceClassesQuerySchema),
   async (req, res, next) => {
     try {
+      // "ALL" omits the status filter entirely (shows both ACTIVE and
+      // INACTIVE); "ACTIVE"/"INACTIVE" filter to exactly that value at
+      // every tier — see listInsuranceClassesQuerySchema's own comment.
+      const statusFilter = req.query.status === "ALL" ? undefined : req.query.status;
       const classes = await prisma.insuranceClass.findMany({
-        where: { status: "ACTIVE" },
+        where: statusFilter ? { status: statusFilter } : {},
         orderBy: { class_name: "asc" },
         select: {
           id: true,
           class_name: true,
           description: true,
+          status: true,
           product_variants: {
-            where: { status: "ACTIVE" },
+            where: statusFilter ? { status: statusFilter } : {},
             orderBy: { variant_name: "asc" },
             select: {
               id: true,
@@ -235,9 +260,15 @@ router.get(
               variant_name: true,
               description: true,
               deductible_rate: true,
+              minimum_deductible_amount: true,
               misc_fee: true,
+              status: true,
+              // Exposed so the Edit Variant dialog can prefill its own
+              // "Gross Target Coverage" picker — see
+              // ProductVariant.gross_target_coverage_id.
+              gross_target_coverage_id: true,
               product_coverages: {
-                where: { status: "ACTIVE" },
+                where: statusFilter ? { status: statusFilter } : {},
                 orderBy: { coverage_name: "asc" },
                 select: {
                   id: true,
@@ -247,6 +278,7 @@ router.get(
                   clause: true,
                   pricing_mode: true,
                   is_misc: true,
+                  status: true,
                   // The set of periods this coverage is offered at — the
                   // embedded pricing editor picks one before showing/editing
                   // its rate/tiers, same as Manage Coverage Pricing's own.
@@ -473,8 +505,9 @@ router.post(
 );
 
 // Settings → Manage Products' "Add Product Variant" action. deductible_rate/
-// misc_fee are both required here (unlike PATCH below, which can clear
-// either back to null) — see createProductVariantSchema.
+// minimum_deductible_amount/misc_fee are all required here (unlike PATCH
+// below, which can clear any of them back to null) — see
+// createProductVariantSchema.
 router.post(
   "/product-variants",
   requireAuth,
@@ -482,7 +515,15 @@ router.post(
   validateBody(createProductVariantSchema),
   async (req, res, next) => {
     try {
-      const { insurance_class_id, variant_code, variant_name, description, deductible_rate, misc_fee } = req.body;
+      const {
+        insurance_class_id,
+        variant_code,
+        variant_name,
+        description,
+        deductible_rate,
+        minimum_deductible_amount,
+        misc_fee,
+      } = req.body;
 
       const insuranceClass = await prisma.insuranceClass.findUnique({ where: { id: insurance_class_id } });
       if (!insuranceClass || insuranceClass.status !== "ACTIVE") {
@@ -501,6 +542,7 @@ router.post(
           variant_name,
           description,
           deductible_rate,
+          minimum_deductible_amount,
           misc_fee,
           status: "ACTIVE",
         },
@@ -526,11 +568,15 @@ router.patch(
   async (req, res, next) => {
     try {
       const { id } = req.params;
-      const { variant_code, variant_name, deductible_rate, misc_fee } = req.body;
+      const { variant_code, variant_name, deductible_rate, minimum_deductible_amount, misc_fee, gross_target_coverage_id } =
+        req.body;
 
       const actingPermissions = await getUserPermissionCodes(req.user.userId);
       if (
-        (deductible_rate !== undefined || misc_fee !== undefined) &&
+        (deductible_rate !== undefined ||
+          minimum_deductible_amount !== undefined ||
+          misc_fee !== undefined ||
+          gross_target_coverage_id !== undefined) &&
         !ensureAnyPermission(res, actingPermissions, [
           "MANAGE_SETTINGS.MANAGE_COVERAGE_PRICING",
           "MANAGE_SETTINGS.MANAGE_PRODUCTS.EDIT_PRICING",
@@ -557,9 +603,25 @@ router.patch(
         }
       }
 
+      // gross_target_coverage_id has to actually be one of this variant's own
+      // VALUE_PERCENTAGE coverages — the intake wizards' "Solve from Gross
+      // Total" mode only ever solves that one coverage's premium backward
+      // (see lib/coveragePricing.js), so pointing it at a different variant's
+      // coverage, or a non-VALUE_PERCENTAGE one, would silently break that
+      // solve rather than 400ing up front.
+      if (gross_target_coverage_id) {
+        const targetCoverage = await prisma.productCoverage.findUnique({ where: { id: gross_target_coverage_id } });
+        if (!targetCoverage || targetCoverage.product_variant_id !== id) {
+          return res.status(400).json({ error: "gross_target_coverage_id must be a coverage belonging to this product variant" });
+        }
+        if (targetCoverage.pricing_mode !== "VALUE_PERCENTAGE") {
+          return res.status(400).json({ error: "gross_target_coverage_id must reference a VALUE_PERCENTAGE-priced coverage" });
+        }
+      }
+
       const updated = await prisma.productVariant.update({
         where: { id },
-        data: { variant_code, variant_name, deductible_rate, misc_fee },
+        data: { variant_code, variant_name, deductible_rate, minimum_deductible_amount, misc_fee, gross_target_coverage_id },
       });
       res.json(updated);
     } catch (err) {

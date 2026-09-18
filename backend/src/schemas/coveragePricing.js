@@ -19,11 +19,17 @@ const updatePricingModeSchema = z.object({
   // Only meaningful (and only saved) when pricing_mode is PERCENTAGE.
   standard_rate: z.coerce.number({ error: "standard_rate must be a positive number" }).positive().optional(),
   // Only meaningful (and only saved) when pricing_mode is VEHICLE_SEATS_BASED
-  // — the single default seat threshold for this coverage at this period,
-  // same "one scalar per period" shape as standard_rate above. The tier menu
-  // itself (insured-amount-per-occupant + rate) is a separate replace-all
-  // list — see updateSeatTiersSchema below.
-  threshold_seats: z.coerce.number({ error: "threshold_seats must be zero or greater" }).int().nonnegative().optional(),
+  // — the excess-of-value bracket charge for this coverage at this period:
+  // no premium is owed up to threshold_amount; the excess above it is split
+  // into exceed_threshold_amount-sized brackets, each charged
+  // exceed_threshold_price (see lib/coveragePricing.js's resolveCoverageRows).
+  // All three are "one scalar per period" shapes, same as standard_rate
+  // above, and always sent together. The tier menu itself (insured amount
+  // per occupant) is a separate replace-all list — see updateSeatTiersSchema
+  // below.
+  threshold_amount: z.coerce.number({ error: "threshold_amount must be zero or greater" }).nonnegative().optional(),
+  exceed_threshold_amount: z.coerce.number({ error: "exceed_threshold_amount must be greater than zero" }).positive().optional(),
+  exceed_threshold_price: z.coerce.number({ error: "exceed_threshold_price must be zero or greater" }).nonnegative().optional(),
 });
 
 const valuePercentageTierSchema = z.object({
@@ -47,13 +53,13 @@ const updateFlatTiersSchema = z.object({
 });
 
 // VEHICLE_SEATS_BASED mode's own tier menu — "Insured amount for each
-// occupant" options, each with its own per-excess-seat rate. coverage_amount
-// on the resulting line is no_of_seats * insured_amount_per_occupant; the
-// premium floor is (no_of_seats - threshold_seats) * this tier's own
-// rate_per_excess_seat.
+// occupant" options. coverage_amount on the resulting line is
+// no_of_seats * insured_amount_per_occupant; the premium floor is computed
+// off that total against the coverage's shared threshold_amount/
+// exceed_threshold_amount/exceed_threshold_price (see
+// updatePricingModeSchema above) — no per-tier rate any more.
 const seatTierSchema = z.object({
   insured_amount_per_occupant: z.coerce.number({ error: "insured_amount_per_occupant is required" }).positive(),
-  rate_per_excess_seat: z.coerce.number({ error: "rate_per_excess_seat is required" }).nonnegative(),
 });
 
 const updateSeatTiersSchema = z.object({

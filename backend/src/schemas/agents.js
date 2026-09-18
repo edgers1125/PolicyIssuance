@@ -21,12 +21,23 @@ const { companyInputSchema } = require("./companies");
 // here when this agent ISN'T company-backed (an INDIVIDUAL, or a CORPORATE
 // agent with neither linked_company_id nor new_company).
 const AGENT_TYPES = ["INDIVIDUAL", "CORPORATE"];
+// How many days after a payable-ledger bucket's own basis date (a policy's
+// issue_date, or an ADD_COVERAGE endorsement's own effective_date) it
+// becomes overdue — see Agent.payment_terms_days's own schema comment.
+// Required on every create (no "unset" state going forward); editable
+// afterward via PATCH /agents/:id (updateAgentDetailsSchema below).
+const paymentTermsDaysField = z.coerce
+  .number({ error: "payment_terms_days is required" })
+  .int()
+  .nonnegative("payment_terms_days cannot be negative");
+
 const createAgentSchema = z
   .object({
     agent_type: z.enum(AGENT_TYPES, { error: "agent_type is required" }),
     agent_code: z.string().trim().min(1, "agent_code is required").optional(),
     agent_name: z.string().trim().min(1, "agent_name is required").optional(),
     work_email: z.string().trim().email("work_email must be a valid email address").optional(),
+    payment_terms_days: paymentTermsDaysField,
     company_id: z.string().uuid("company_id must be a valid UUID").optional(),
     linked_company_id: z.string().uuid("linked_company_id must be a valid UUID").optional(),
     new_company: companyInputSchema.optional(),
@@ -104,22 +115,24 @@ const updateAgentFlatTiersSchema = z.object({
   tiers: z.array(agentFlatTierSchema),
 });
 
-// VEHICLE_SEATS_BASED-mode override of the seat threshold: unlike the tier
-// tables (a replace-all list, see agentSeatTierSchema below), this is a
-// single scalar per (agent, coverage, period) — same "one scalar override"
-// shape as AgentNetrate. null clears the override back to the coverage's
-// own default.
+// VEHICLE_SEATS_BASED-mode override of the excess-of-value bracket charge:
+// unlike the tier table (a replace-all list, see agentSeatTierSchema below),
+// this is three scalars per (agent, coverage, period), always sent/cleared
+// together — same "one scalar-set override" shape as AgentNetrate. `null`
+// clears the whole override back to the coverage's own default.
 const updateAgentSeatsBasedPricingSchema = z.object({
   coverage_in_days: coverageInDaysField,
-  threshold_seats: z.coerce.number({ error: "threshold_seats is required" }).int().nonnegative().nullable(),
+  threshold_amount: z.coerce.number({ error: "threshold_amount is required" }).nonnegative().nullable(),
+  exceed_threshold_amount: z.coerce.number({ error: "exceed_threshold_amount is required" }).positive().nullable(),
+  exceed_threshold_price: z.coerce.number({ error: "exceed_threshold_price is required" }).nonnegative().nullable(),
 });
 
 // VEHICLE_SEATS_BASED-mode override of the tier menu itself — same
 // replace-all pattern as agentFlatTierSchema, just keyed by
-// insured_amount_per_occupant instead of coverage_amount.
+// insured_amount_per_occupant instead of coverage_amount. No per-tier rate
+// any more — see updateAgentSeatsBasedPricingSchema above.
 const agentSeatTierSchema = z.object({
   insured_amount_per_occupant: z.coerce.number({ error: "insured_amount_per_occupant is required" }).positive(),
-  rate_per_excess_seat: z.coerce.number({ error: "rate_per_excess_seat is required" }).nonnegative(),
 });
 
 const updateAgentSeatTiersSchema = z.object({
@@ -127,8 +140,17 @@ const updateAgentSeatTiersSchema = z.object({
   tiers: z.array(agentSeatTierSchema),
 });
 
+// PATCH /agents/:id — currently the only editable basic field on an
+// already-created agent (agent_code/agent_name/work_email have no edit path
+// at all yet; company_id/linked_company_id are set once at creation via
+// POST / and not revisited here).
+const updateAgentDetailsSchema = z.object({
+  payment_terms_days: paymentTermsDaysField,
+});
+
 module.exports = {
   createAgentSchema,
+  updateAgentDetailsSchema,
   getAgentRatesQuerySchema,
   updateNetratesSchema,
   updateAgentValueTiersSchema,

@@ -19,13 +19,15 @@ import { listAccountingOverview } from "../api/client";
 import { formatPHP } from "../utils/currency";
 
 // The Accounting page's "Overview" tab (and its default/first one) — one row
-// per agent: identity, premium production, and the agent's current payable
-// balance. Unpaginated, same "small, complete roster" convention as
-// MyAgents.jsx (GET /accounting/overview mirrors that page's own agent list
-// shape) — reads Agent.payable directly rather than summing the ledger live,
-// which is the whole point of that denormalized column (see its own schema
-// comment); the Transactions tab is where the full ledger is actually
-// browsable for auditing.
+// per agent: identity, premium production, and the agent's payable balance,
+// split into Total Payable Balance (Agent.payable's own cached running
+// total — the whole point of that denormalized column, see its own schema
+// comment) and Overdue Payable Balance (the portion of it whose own
+// payable-aging bucket is already past its due date — see
+// lib/agentPayables.js's computeAgentPayableBalances). Unpaginated, same
+// "small, complete roster" convention as MyAgents.jsx (GET /accounting/overview
+// mirrors that page's own agent list shape); the Transactions tab is where
+// the full ledger is actually browsable for auditing.
 export function AccountingOverview() {
   const { token } = useAuth();
   const [rows, setRows] = useState([]);
@@ -62,19 +64,21 @@ export function AccountingOverview() {
                   <TableCell>Agent</TableCell>
                   <TableCell align="right">Premiums Generated</TableCell>
                   <TableCell align="right">Last 30 Days</TableCell>
-                  <TableCell align="right">Payable Balance</TableCell>
+                  <TableCell align="right">Overdue Payable Balance</TableCell>
+                  <TableCell align="right">Total Payable Balance</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {rows.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={4} align="center" sx={{ py: 4, color: "text.secondary" }}>
+                    <TableCell colSpan={5} align="center" sx={{ py: 4, color: "text.secondary" }}>
                       No agents yet.
                     </TableCell>
                   </TableRow>
                 ) : (
                   rows.map((a) => {
-                    const payable = Number(a.payable);
+                    const totalPayable = Number(a.total_payable);
+                    const overduePayable = Number(a.overdue_payable);
                     return (
                       <TableRow key={a.id} hover>
                         <TableCell>
@@ -88,9 +92,17 @@ export function AccountingOverview() {
                         <TableCell align="right">
                           <Typography
                             variant="body2"
-                            sx={{ fontWeight: 600, color: payable > 0 ? "warning.main" : "text.primary" }}
+                            sx={{ fontWeight: 600, color: overduePayable > 0 ? "error.main" : "text.primary" }}
                           >
-                            {formatPHP(payable)}
+                            {formatPHP(overduePayable)}
+                          </Typography>
+                        </TableCell>
+                        <TableCell align="right">
+                          <Typography
+                            variant="body2"
+                            sx={{ fontWeight: 600, color: totalPayable > 0 ? "warning.main" : "text.primary" }}
+                          >
+                            {formatPHP(totalPayable)}
                           </Typography>
                         </TableCell>
                       </TableRow>

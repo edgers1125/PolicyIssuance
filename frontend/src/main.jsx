@@ -5,6 +5,7 @@ import { ThemeProvider, CssBaseline } from '@mui/material'
 import theme from './theme.js'
 import App from './App.jsx'
 import { AuthProvider } from './context/AuthContext.jsx'
+import { UnsavedChangesProvider } from './context/UnsavedChangesContext.jsx'
 
 createRoot(document.getElementById('root')).render(
   <StrictMode>
@@ -12,7 +13,9 @@ createRoot(document.getElementById('root')).render(
       <CssBaseline />
       <BrowserRouter>
         <AuthProvider>
-          <App />
+          <UnsavedChangesProvider>
+            <App />
+          </UnsavedChangesProvider>
         </AuthProvider>
       </BrowserRouter>
     </ThemeProvider>

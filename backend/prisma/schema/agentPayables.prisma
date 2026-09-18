@@ -48,11 +48,48 @@ model AgentPayableTransaction {
   created_by_user_id String?                   @db.Uuid
   created_at       DateTime                    @default(now())
 
+  // --- Payable-aging columns (payment-terms/overdue tracking) ---
+  // Only ever set on a "bucket" row — one that opens its own outstanding
+  // balance with its own due date: an ISSUANCE row, or an ENDORSEMENT row
+  // created by an ADD_COVERAGE line. Computed once, at creation, as
+  // basis_date + Agent.payment_terms_days (the policy's own issue_date for
+  // ISSUANCE, the endorsement's own effective_date for ADD_COVERAGE) and
+  // frozen forever after that — same snapshot convention this schema already
+  // uses everywhere else (e.g. applied_rate) — a later change to the agent's
+  // own payment_terms_days never moves an already-created bucket's due date.
+  // Left null on every other row (PAYMENT, and the debit-side ENDORSEMENT/
+  // CANCELLED_POLICY rows, which reduce someone else's bucket instead of
+  // opening their own — see applies_to_transaction_id below).
+  due_date         DateTime?
+  // Only meaningful on a bucket row (see due_date above). Starts equal to
+  // `amount` and is decremented — unbounded, it can go negative, meaning the
+  // agent was overpaid against this specific bucket and now owes it back —
+  // by whatever gets allocated against it: a REMOVE_CLAUSE/CANCELLED_POLICY
+  // debit mapped onto it via applies_to_transaction_id below, or a PAYMENT
+  // applied against it via lib/agentPayables.js's own oldest-due-first
+  // allocation. The Accounting Overview's own Total/Overdue Payable Balance
+  // split (lib/agentPayables.js's computeAgentPayableBalances) is just
+  // SUM(remaining_amount) across every bucket row, filtered by due_date for
+  // the Overdue figure.
+  remaining_amount Decimal?                    @db.Decimal(18, 2)
+  // Self-relation, set only on a REMOVE_CLAUSE-debit ENDORSEMENT row or a
+  // CANCELLED_POLICY row — points at that same policy's own ISSUANCE row,
+  // the bucket this debit actually reduces (rather than opening a new one of
+  // its own) via lib/agentPayables.js's applyDebitToOriginalBucket(). A
+  // PAYMENT row is deliberately never given this FK even though its own
+  // oldest-due-first allocation may end up touching more than one bucket —
+  // see AgentPayableTransaction's own note in CLAUDE.md on this accepted
+  // scope limit.
+  applies_to_transaction_id String?            @db.Uuid
+
   agent               Agent               @relation(fields: [agent_id], references: [id])
   policy              Policy?             @relation(fields: [policy_id], references: [id])
   endorsement_request EndorsementRequest? @relation(fields: [endorsement_request_id], references: [id])
   created_by_user     User?               @relation(fields: [created_by_user_id], references: [id])
+  applies_to_transaction AgentPayableTransaction?  @relation("AgentPayableTransactionAppliesTo", fields: [applies_to_transaction_id], references: [id])
+  applied_debits         AgentPayableTransaction[] @relation("AgentPayableTransactionAppliesTo")
 
   @@index([agent_id])
   @@index([policy_id])
+  @@index([due_date])
 }

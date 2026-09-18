@@ -11,6 +11,9 @@ const {
   paymentFieldsSchema,
   refineBethelPaymentMethod,
   bethelPaymentMethodRefinement,
+  pricingModeFieldsSchema,
+  refineTargetGrossAmount,
+  targetGrossAmountRefinement,
 } = require("./policyIntakeShared");
 
 // Identical intake shape to createApplicationSchema (same customer/vehicle/
@@ -40,8 +43,10 @@ const createQuotationSchema = z
     // permission check, not something a static schema can express.
     agent_id: z.string().uuid("agent_id must be a valid UUID").optional(),
   })
+  .merge(pricingModeFieldsSchema)
   .refine(refineExactlyOneParty, exactlyOnePartyRefinement)
-  .refine(refineWholeDayPeriod, wholeDayPeriodRefinement);
+  .refine(refineWholeDayPeriod, wholeDayPeriodRefinement)
+  .refine(refineTargetGrossAmount, targetGrossAmountRefinement);
 
 // PATCH /policy-quotations/:id — deliberately narrow: only the fields the
 // Quotation Tracker's edit action actually lets an agent change (coverage
@@ -49,6 +54,9 @@ const createQuotationSchema = z
 // themselves). Everything else about a quotation (party, product, vehicles,
 // addresses) is set once at creation and never touched here — changing any
 // of those is really a different quotation, not an edit of this one.
+// Deliberately no pricing_input_mode/target_gross_amount here — "Solve from
+// Gross Total" is only offered on the two intake wizards (fresh creation),
+// not this edit form (see PolicyApplication.jsx/QuotationCreator.jsx).
 const updateQuotationSchema = z
   .object({
     coverage_start_at: z.coerce.date({ error: "coverage_start_at is required and must be a valid date" }),

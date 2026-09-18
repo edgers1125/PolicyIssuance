@@ -25,6 +25,14 @@ model ProductVariant {
   // ₱500 towing amount — see pdf/theme.js's computeDeductibleFigures()/
   // TOWING_AMOUNT (there is no longer a separate repair-limit rate).
   deductible_rate    Decimal?     @db.Decimal(7, 4)
+  // A floor under deductible_rate's own computed figure — the policy
+  // schedule's Section III Deductible line is actually
+  // max(vehicle_value * deductible_rate, minimum_deductible_amount), so a
+  // cheaply-valued vehicle never prints a deductible below this variant's
+  // own minimum. Null is treated the same as deductible_rate being null for
+  // whichever side is unconfigured — see pdf/theme.js's
+  // computeDeductibleFigures(), which takes both and picks the higher.
+  minimum_deductible_amount Decimal? @db.Decimal(18, 2)
   // The flat "Miscellaneous" charge on every application/quotation filed
   // under this variant — no longer an amount the agent types in per filing
   // (routes/policyApplications.js's/policyQuotations.js's POST / read this
@@ -32,10 +40,24 @@ model ProductVariant {
   // treated as ₱0, same "unconfigured means nothing charged" convention as
   // deductible_rate above, rather than blocking issuance.
   misc_fee           Decimal?     @db.Decimal(18, 2)
+  // The one VALUE_PERCENTAGE coverage under this variant whose premium is
+  // solved backward from an agent-entered target gross total, when the
+  // intake wizard's pricing mode is switched to "Solve from Gross Total" —
+  // see lib/coveragePricing.js's resolveCoverageRows for the actual solve.
+  // Every other coverage the agent selects on that filing still prices/
+  // enters exactly as normal; only this one's premium is computed. Set via
+  // Settings -> Manage Products' Edit Variant dialog, gated the same as
+  // deductible_rate/misc_fee. Null means this variant has no gross-solve
+  // target configured, and the wizard's "Solve from Gross Total" toggle
+  // stays unavailable for it. Must reference a VALUE_PERCENTAGE coverage
+  // belonging to this same variant — enforced at PATCH /product-variants/:id,
+  // not a DB constraint.
+  gross_target_coverage_id String? @db.Uuid
   created_at         DateTime     @default(now())
   updated_at         DateTime     @updatedAt
 
-  insurance_class     InsuranceClass      @relation(fields: [insurance_class_id], references: [id])
+  insurance_class       InsuranceClass   @relation(fields: [insurance_class_id], references: [id])
+  gross_target_coverage ProductCoverage? @relation("VariantGrossTargetCoverage", fields: [gross_target_coverage_id], references: [id])
   product_coverages   ProductCoverage[]
   policy_applications PolicyApplication[]
   policy_quotations   PolicyQuotation[]
@@ -75,6 +97,11 @@ model ProductCoverage {
   // ADD_COVERAGE endorsement lines proposing to add this catalog coverage to
   // an already-issued policy — see EndorsementChange.product_coverage_id.
   endorsement_changes   EndorsementChange[]
+  // Every ProductVariant (at most its own — this coverage's own variant, see
+  // ProductVariant.gross_target_coverage_id's own comment) that's currently
+  // designated to solve this coverage's premium backward from a target gross
+  // total.
+  gross_target_for_variants ProductVariant[] @relation("VariantGrossTargetCoverage")
   // Every pricing table (the coverage's own default pricing, and each
   // agent's override of it) hangs off CoverageAllowablePeriod instead of
   // pointing back here directly — that row already carries the coverage_id,
@@ -171,17 +198,21 @@ model CoverageTierBasedPricing {
 // VEHICLE_SEATS_BASED mode: the agent picks one of this coverage's insured
 // -amount-per-occupant tiers (CoverageSeatsTierPricing below) as "Insured
 // amount for each occupant" — coverage_amount is then the vehicle's own
-// no_of_seats * that amount (e.g. 15 seats * ₱100,000 = ₱1,500,000 insured),
-// and the premium floor is (no_of_seats - threshold_seats) * that same
-// tier's own rate_per_excess_seat (e.g. a 7-seat threshold on a 15-seater
-// picking the ₱100,000/₱90-per-seat tier floors at 8 * ₱90 = ₱720).
-// threshold_seats itself is coverage-wide, not per-tier — 1:1 per allowable
-// period, same shape as CoveragePercentageBasedPricing, since there's a
-// single default (not a tiered value) to replace per period.
+// no_of_seats * that amount (e.g. 7 seats * ₱100,000 = ₱700,000 insured).
+// The premium floor is no longer keyed off seat count at all — it's an
+// excess-of-value bracket charge against that same ₱700,000 insured amount:
+// no charge for insured value at or below threshold_amount (e.g.
+// ₱350,000); the excess above it (₱350,000 in this example) is split into
+// exceed_threshold_amount-sized brackets (e.g. ₱50,000 each = 7 brackets)
+// and each bracket is charged exceed_threshold_price (e.g. ₱50), floor
+// = ₱350. All three scalars are coverage-wide (not per-tier) — 1:1 per
+// allowable period, same shape as CoveragePercentageBasedPricing.
 model CoverageSeatsBasedPricing {
   id                           String   @id @default(uuid()) @db.Uuid
   coverage_allowable_period_id String   @unique @db.Uuid
-  threshold_seats              Int
+  threshold_amount             Decimal  @db.Decimal(18, 2)
+  exceed_threshold_amount      Decimal  @db.Decimal(18, 2)
+  exceed_threshold_price       Decimal  @db.Decimal(10, 2)
   created_at                   DateTime @default(now())
   updated_at                   DateTime @updatedAt
 
@@ -190,13 +221,14 @@ model CoverageSeatsBasedPricing {
 
 // VEHICLE_SEATS_BASED mode's own tier menu — same shape/role as
 // CoverageTierBasedPricing (FLAT_TIER's own menu), just keyed by
-// insured_amount_per_occupant instead of a flat coverage_amount, and paired
-// with this tier's own rate_per_excess_seat rather than one fixed price.
+// insured_amount_per_occupant instead of a flat coverage_amount. No longer
+// carries its own per-tier rate — the excess-of-value bracket charge above
+// is one shared default/override (CoverageSeatsBasedPricing/
+// AgentSeatsBasedPricing), not tiered by insured amount per occupant.
 model CoverageSeatsTierPricing {
   id                           String   @id @default(uuid()) @db.Uuid
   coverage_allowable_period_id String   @db.Uuid
   insured_amount_per_occupant  Decimal  @db.Decimal(18, 2)
-  rate_per_excess_seat         Decimal  @db.Decimal(10, 2)
   created_at                   DateTime @default(now())
 
   allowable_period CoverageAllowablePeriod @relation(fields: [coverage_allowable_period_id], references: [id])

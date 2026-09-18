@@ -1,0 +1,2 @@
+-- AlterEnum
+ALTER TYPE "EndorsementChangeType" ADD VALUE 'VEHICLE_ESTIMATED_VALUE';

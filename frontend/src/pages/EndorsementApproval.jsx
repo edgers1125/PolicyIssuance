@@ -51,7 +51,12 @@ export function EndorsementApproval() {
   const [rowsPerPage, setRowsPerPage] = useState(10);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [reviewing, setReviewing] = useState(null);
+  // Split "which endorsement" from "is the dialog open" so EndorsementReviewDialog
+  // (rendered unconditionally, keepMounted below) keeps its in-progress draft
+  // across a Cancel/X/backdrop close — only re-fetching when a genuinely
+  // different endorsement is opened. See UnsavedChangesContext.jsx.
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewingEndorsement, setReviewingEndorsement] = useState(null);
 
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -168,7 +173,10 @@ export function EndorsementApproval() {
                     <TableRow
                       key={e.id}
                       hover
-                      onClick={() => setReviewing({ id: e.id, endorsementNumber: e.endorsement_number })}
+                      onClick={() => {
+                        setReviewingEndorsement({ id: e.id, endorsementNumber: e.endorsement_number });
+                        setReviewOpen(true);
+                      }}
                       sx={{ cursor: "pointer" }}
                     >
                       <TableCell sx={{ fontFamily: "monospace", whiteSpace: "nowrap" }}>{e.endorsement_number}</TableCell>
@@ -207,15 +215,14 @@ export function EndorsementApproval() {
         </Paper>
       )}
 
-      {reviewing && (
-        <EndorsementReviewDialog
-          endorsementId={reviewing.id}
-          endorsementNumber={reviewing.endorsementNumber}
-          token={token}
-          onClose={() => setReviewing(null)}
-          onDecided={loadEndorsements}
-        />
-      )}
+      <EndorsementReviewDialog
+        open={reviewOpen}
+        endorsementId={reviewingEndorsement?.id ?? null}
+        endorsementNumber={reviewingEndorsement?.endorsementNumber}
+        token={token}
+        onClose={() => setReviewOpen(false)}
+        onDecided={loadEndorsements}
+      />
     </>
   );
 }

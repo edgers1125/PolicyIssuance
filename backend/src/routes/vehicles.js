@@ -6,6 +6,8 @@ const { validateBody, validateQuery } = require("../middleware/validate");
 const { getCurrentAgentId } = require("../lib/agent");
 const { updateVehicleSchema, lookupVehicleQuerySchema } = require("../schemas/vehicles");
 const { currentVehicleValue } = require("../lib/vehicleValue");
+const { assertVehicleIdentifiersUnique } = require("../lib/vehicleUniqueness");
+const { sendIfHttpError } = require("../lib/httpError");
 
 const router = express.Router();
 
@@ -156,39 +158,39 @@ router.patch("/:id", validateBody(updateVehicleSchema), async (req, res, next) =
       }
     }
 
-    // Once a vehicle has ever been assessed, both the value and the date are
-    // frozen — the value only ever moves through automatic depreciation from
-    // here on, never a direct edit, no matter what the client sends.
+    // Once a vehicle's assessment has actually been finalized — a policy for
+    // it has been approved, see routes/policyApproval.js's
+    // approveApplicationRecord — both the value and the date are frozen from
+    // here on, the value only ever moving through automatic depreciation,
+    // never a direct edit no matter what the client sends. Until then,
+    // estimated_value stays freely correctable here too.
     const current = await prisma.vehicle.findUnique({
       where: { id },
       select: { estimated_value: true, initial_assessment_date: true, plate_number: true },
     });
     const alreadyAssessed = Boolean(current?.initial_assessment_date);
 
-    // This is the one legitimate place a plate number can ever change (a
+    // This is the one legitimate place plate_number can ever change (a
     // genuine data-entry correction) — everywhere else (reassigning a
     // vehicle to a new owner/agent) leaves it untouched, see
     // policyApplications.js/policyQuotations.js's own reassign_owner
-    // branches. Since it's changing here, it must be re-checked the same way
-    // a brand-new vehicle's plate is, so a "correction" can't silently
-    // collide with a different, already-on-file vehicle.
-    const plateChanged = plate_number && current?.plate_number !== plate_number;
-    if (plateChanged) {
-      const duplicate = await prisma.vehicle.findFirst({
-        where: { plate_number: { equals: plate_number, mode: "insensitive" }, id: { not: id } },
-        select: { id: true },
-      });
-      if (duplicate) {
-        return res.status(409).json({ error: `Plate number ${plate_number} is already on file for another vehicle` });
-      }
-    }
+    // branches. mv_file_no/engine_number/chassis_number are always editable
+    // here too. Whichever of the four actually changed (or is being set for
+    // the first time) is re-checked against every *other* vehicle, so a
+    // correction can't silently collide with a different one already on
+    // file — a value left unchanged never flags against itself, thanks to
+    // excludeVehicleId.
+    await assertVehicleIdentifiersUnique(
+      { plate_number, mv_file_no, engine_number, chassis_number },
+      { excludeVehicleId: id }
+    );
 
     const vehicle = await prisma.vehicle.update({
       where: { id },
       data: {
         plate_number,
         mv_file_no,
-        engine_number,
+        engine_number: engine_number || null,
         chassis_number,
         ...(product_variant_id !== undefined ? { product_variant_id } : {}),
         make: make || null,
@@ -198,16 +200,13 @@ router.patch("/:id", validateBody(updateVehicleSchema), async (req, res, next) =
         color: color || null,
         no_of_seats,
         estimated_value: alreadyAssessed ? current.estimated_value : (estimated_value ?? null),
-        initial_assessment_date: alreadyAssessed
-          ? current.initial_assessment_date
-          : estimated_value !== undefined
-            ? new Date()
-            : null,
+        initial_assessment_date: alreadyAssessed ? current.initial_assessment_date : null,
       },
     });
 
     res.json(vehicle);
   } catch (err) {
+    if (sendIfHttpError(err, res)) return;
     next(err);
   }
 });

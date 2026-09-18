@@ -36,6 +36,7 @@ import {
   rejectApplication,
 } from "../api/client";
 import { PdfViewer } from "./PdfViewer";
+import { useUnsavedChanges } from "../context/UnsavedChangesContext";
 
 // Kept in this one dialog file rather than schemas/policyApplicationChanges.js
 // on the frontend, since nothing else needs them — mirrors the backend's own
@@ -130,7 +131,7 @@ function formatInsuredName({ first_name, middle_name, last_name }) {
 // editable name/address field (First/Middle/Last or Company Name; every
 // Address column but estimated_value) rather than one free-text box for the
 // whole combined string.
-export function ApplicationReviewDialog({ applicationId, applicationNumber, token, onClose, onApproved }) {
+export function ApplicationReviewDialog({ open, applicationId, applicationNumber, token, onClose, onApproved }) {
   const [pdfUrl, setPdfUrl] = useState(null);
   const [pdfLoading, setPdfLoading] = useState(true);
   const [pdfError, setPdfError] = useState("");
@@ -407,8 +408,34 @@ export function ApplicationReviewDialog({ applicationId, applicationNumber, toke
   const isRejected = detail?.status === "REJECTED" || rejectedFlag;
   const isClauseType = CLAUSE_CHANGE_TYPES.has(changeType);
 
+  // Unsaved-input tracking (see context/UnsavedChangesContext.jsx) — this
+  // dialog otherwise stays mounted (see the host page's `keepMounted`/
+  // split open+id state) and keeps its draft on a Cancel/X/backdrop close,
+  // so the sidebar/refresh guard needs to know whenever there's actually
+  // something to lose: the "Create Change" inline form, the COC/SA number
+  // fields (only meaningful pre-decision), or an open reject-reason panel.
+  const changeFormHasInput = Boolean(
+    changeType ||
+      vehicleId ||
+      coverageId ||
+      newValue.trim() ||
+      nameFields.first_name.trim() ||
+      nameFields.middle_name.trim() ||
+      nameFields.last_name.trim() ||
+      nameFields.company_name.trim() ||
+      Object.values(addressFields).some((v) => v.trim()) ||
+      effectiveDate ||
+      remarks.trim()
+  );
+  const cocSaHasInput = !isApproved && !isRejected && Boolean(cocNumber.trim() || saNumber.trim());
+  const rejectFormHasInput = rejectOpen && Boolean(rejectRemarks.trim());
+  useUnsavedChanges(
+    "application-review-dialog",
+    open && ((formOpen && changeFormHasInput) || cocSaHasInput || rejectFormHasInput)
+  );
+
   return (
-    <Dialog open={Boolean(applicationId)} onClose={onClose} fullWidth maxWidth="xl" scroll="paper">
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="xl" scroll="paper" keepMounted>
       <DialogTitle>{applicationNumber ? `Review Application ${applicationNumber}` : "Review Application"}</DialogTitle>
       <DialogContent dividers>
         <Box sx={{ display: "flex", gap: 3, flexDirection: { xs: "column", md: "row" } }}>

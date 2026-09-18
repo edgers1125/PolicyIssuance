@@ -247,34 +247,40 @@ function buildPolicyApplicationPdf(props) {
         doc.font(FONT_BODY).text(c.name, covCol1, rowY, { width: covColWidths[0] });
         drawCurrency(doc, c.amount, covCol2, rowY, covColWidths[1]);
         drawCurrency(doc, c.premium, covCol3, rowY, covColWidths[2]);
-        doc.moveDown(0.6);
-
-        doc.font(FONT_BODY_BOLD).fontSize(BASE_FONT_SIZE).text("Limit on Accessories", left, doc.y, { width: pageWidth });
-        doc.moveDown(0.2);
-        doc.font(FONT_BODY).text("- Standard Built-in Accessories", left, doc.y, { width: pageWidth });
-
-        // Divider between the accessories line and the deductible line below it.
-        doc.moveDown(0.3);
-        doc
-          .moveTo(left, doc.y)
-          .lineTo(left + pageWidth, doc.y)
-          .strokeColor("#999999")
-          .lineWidth(1)
-          .stroke();
-        doc.moveDown(0.3);
-
-        const { deductible, authorizedRepairLimit } = computeDeductibleFigures(c.amount, props.deductibleRate);
-        doc.font(FONT_BODY_BOLD).fontSize(BASE_FONT_SIZE).text("Deductible: ", left, doc.y, { continued: true });
-        drawCurrencyInline(doc, deductible, { bold: true });
-        doc.text("   |   Towing: ", { continued: true });
-        drawCurrencyInline(doc, TOWING_AMOUNT, { bold: true });
-        doc.text("   |   Authorized Repair Limit: ", { continued: true });
-        drawCurrencyInline(doc, authorizedRepairLimit, { bold: true, continued: false });
-        // Tight trailing gap — sectionRule() (below, before SECTION IVA)
-        // already adds its own leading gap before drawing its own divider,
-        // so this just needs to clear the text, not add a second full gap.
-        doc.moveDown(0.3);
+        doc.moveDown(0.5);
       }
+
+      // Accessories/Deductible block prints once for the whole section, not
+      // once per coverage row above — every VALUE_PERCENTAGE coverage on one
+      // vehicle already prices off that same vehicle's current depreciated
+      // value (see lib/coveragePricing.js's resolveCoverageRows), so they'd
+      // otherwise repeat the identical deductible figures once per row.
+      doc.moveDown(0.1);
+      doc.font(FONT_BODY_BOLD).fontSize(BASE_FONT_SIZE).text("Limit on Accessories", left, doc.y, { width: pageWidth });
+      doc.moveDown(0.2);
+      doc.font(FONT_BODY).text("- Standard Built-in Accessories", left, doc.y, { width: pageWidth });
+
+      // Divider between the accessories line and the deductible line below it.
+      doc.moveDown(0.3);
+      doc
+        .moveTo(left, doc.y)
+        .lineTo(left + pageWidth, doc.y)
+        .strokeColor("#999999")
+        .lineWidth(1)
+        .stroke();
+      doc.moveDown(0.3);
+
+      const { deductible, authorizedRepairLimit } = computeDeductibleFigures(valueCoverages[0].amount, props.deductibleRate, props.minimumDeductibleAmount);
+      doc.font(FONT_BODY_BOLD).fontSize(BASE_FONT_SIZE).text("Deductible: ", left, doc.y, { continued: true });
+      drawCurrencyInline(doc, deductible, { bold: true });
+      doc.text("   |   Towing: ", { continued: true });
+      drawCurrencyInline(doc, TOWING_AMOUNT, { bold: true });
+      doc.text("   |   Authorized Repair Limit: ", { continued: true });
+      drawCurrencyInline(doc, authorizedRepairLimit, { bold: true, continued: false });
+      // Tight trailing gap — sectionRule() (below, before SECTION IVA)
+      // already adds its own leading gap before drawing its own divider,
+      // so this just needs to clear the text, not add a second full gap.
+      doc.moveDown(0.3);
     }
 
     sectionRule();
@@ -324,9 +330,26 @@ function buildPolicyApplicationPdf(props) {
       doc.moveDown(0.4);
       const seats = Number(vehicles[0]?.no_of_seats);
       const occupants = Number.isFinite(seats) && seats > 0 ? seats - 1 : "—";
+      // The per-occupant amount used to be a hardcoded ₱50,000 regardless of
+      // what was actually priced — now reads the real VEHICLE_SEATS_BASED
+      // coverage's own insured-amount-per-occupant tier (coverage_amount is
+      // that tier times this same vehicle's own seat count, so dividing back
+      // out recovers the per-occupant figure the agent actually picked —
+      // ₱50k/₱100k/₱150k/etc., see lib/coveragePricing.js's VEHICLE_SEATS_BASED
+      // branch). Falls back to the old ₱50,000.00 only when no such coverage
+      // is present at all or the seat count can't be resolved.
+      const seatsBasedCoverage = coverages.find((c) => c.pricing_mode === "VEHICLE_SEATS_BASED");
+      const perOccupantAmount =
+        seatsBasedCoverage && Number.isFinite(seats) && seats > 0
+          ? Number(seatsBasedCoverage.amount) / seats
+          : null;
+      const perOccupantDisplay =
+        perOccupantAmount != null
+          ? perOccupantAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+          : "50,000.00";
       doc
         .font(FONT_BODY)
-        .text(`1 DRIVER AND ${occupants} OCCUPANTS OR PASSENGERS AT Php. 50,000.00 EACH`, left, doc.y, { width: pageWidth });
+        .text(`1 DRIVER AND ${occupants} OCCUPANTS OR PASSENGERS AT Php. ${perOccupantDisplay} EACH`, left, doc.y, { width: pageWidth });
 
       doc.moveDown(0.8);
       doc

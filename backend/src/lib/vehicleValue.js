@@ -20,9 +20,22 @@ function wholeYearsElapsed(from, to) {
 // of its assessment date — never gradually, and never partway through a year
 // — from the date it was first assessed. This is what VALUE_PERCENTAGE
 // coverage pricing is based on, never the frozen original estimate itself.
+//
+// initialAssessmentDate is only ever finalized once an application/quotation
+// vehicle's own policy has actually been approved (see
+// routes/policyApproval.js's approveApplicationRecord, which stamps it as
+// the policy's own effective_date — the true date of inception — rather
+// than whenever the paperwork happened to be filed, so a later renewal's
+// depreciation always ticks a full year from the real anniversary). Until
+// then it stays null — a still-pending filing's own estimated_value is
+// simply used undepreciated, since there's no anchor date to count years
+// against yet.
 function currentVehicleValue(estimatedValue, initialAssessmentDate, asOf = new Date()) {
-  if (estimatedValue === null || estimatedValue === undefined || !initialAssessmentDate) {
+  if (estimatedValue === null || estimatedValue === undefined) {
     return null;
+  }
+  if (!initialAssessmentDate) {
+    return Number(estimatedValue);
   }
   const yearsElapsed = wholeYearsElapsed(new Date(initialAssessmentDate), asOf);
   return Number(estimatedValue) * Math.pow(1 - ANNUAL_DEPRECIATION_RATE, yearsElapsed);

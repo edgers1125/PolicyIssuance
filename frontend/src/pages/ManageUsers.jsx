@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useUnsavedChanges } from "../context/UnsavedChangesContext";
 import {
   Container,
   Typography,
@@ -219,13 +220,31 @@ function AddUserDialog({ open, onClose, roles, permissions, agents, token, onCre
     }
   }
 
+  // Closing (Cancel/X/backdrop) never discards the in-progress draft — only
+  // clicking "Done" after a successful create does. See CLAUDE.md's
+  // unsaved-changes convention.
   function handleClose() {
+    onClose();
+  }
+
+  function handleDone() {
     reset();
     onClose();
   }
 
+  const isDirty =
+    open &&
+    !inviteLink &&
+    (email !== "" ||
+      firstName !== "" ||
+      lastName !== "" ||
+      roleId !== "" ||
+      permissionIds.length > 0 ||
+      agent !== null);
+  useUnsavedChanges("add-user-dialog", isDirty);
+
   return (
-    <Dialog open={open} onClose={handleClose} fullWidth maxWidth="sm">
+    <Dialog open={open} onClose={handleClose} fullWidth maxWidth="sm" keepMounted>
       <DialogTitle>Add User</DialogTitle>
 
       {inviteLink ? (
@@ -238,7 +257,7 @@ function AddUserDialog({ open, onClose, roles, permissions, agents, token, onCre
             <TextField value={inviteLink} fullWidth multiline slotProps={{ input: { readOnly: true } }} />
           </DialogContent>
           <DialogActions>
-            <Button onClick={handleClose} variant="contained">
+            <Button onClick={handleDone} variant="contained">
               Done
             </Button>
           </DialogActions>
@@ -310,33 +329,66 @@ function EditUserDialog({ open, onClose, user, roles, permissions, agents, token
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [inviteLink, setInviteLink] = useState("");
+  // Snapshot of the form right after it's populated from `user` — dirty
+  // tracking diffs against this rather than re-deriving from `user` on every
+  // render, so it stays stable while the agent picker's own `agents` list
+  // reloads in the background. This effect is keyed on the `user` prop
+  // object itself (not e.g. `user.id`) — the parent only ever hands this a
+  // new object when a genuinely different user is opened for editing (see
+  // ManageUsers' own split editUserOpen/editingUser state below), so
+  // reopening the SAME user after a Cancel/X/backdrop close doesn't re-fire
+  // this and clobber the in-progress draft.
+  const [originalSnapshot, setOriginalSnapshot] = useState(null);
 
   useEffect(() => {
     if (user) {
-      setFullName(user.full_name);
-      setEmail(user.email);
-      setStatus(user.status === "AWAITING_EMAIL_VERIFICATION" ? "ACTIVE" : user.status);
-      setRoleId(user.roles[0]?.id || "");
+      const resolvedStatus = user.status === "AWAITING_EMAIL_VERIFICATION" ? "ACTIVE" : user.status;
+      const resolvedRoleId = user.roles[0]?.id || "";
       // specialPermissions can include a hidden page-access permission that was
       // auto-granted alongside a real one — drop it here so it isn't silently
       // carried forward once its last visible sibling gets unchecked.
       const selectableIds = new Set(permissions.map((p) => p.id));
-      setPermissionIds(user.specialPermissions.map((p) => p.id).filter((id) => selectableIds.has(id)));
-      setResetPassword(false);
+      const resolvedPermissionIds = user.specialPermissions.map((p) => p.id).filter((id) => selectableIds.has(id));
       // Prefer the matching row from `agents` (it may carry a company_name
       // suffix the label wants) — fall back to a minimal option built from
       // the user's own embedded agent if it's missing there (e.g. an
       // INACTIVE agent, which GET /users/agents excludes).
-      setAgent(
-        user.agent
-          ? agents.find((a) => a.id === user.agent.id) || { ...user.agent, has_user: true, company_name: null }
-          : null
-      );
+      const resolvedAgent = user.agent
+        ? agents.find((a) => a.id === user.agent.id) || { ...user.agent, has_user: true, company_name: null }
+        : null;
+
+      setFullName(user.full_name);
+      setEmail(user.email);
+      setStatus(resolvedStatus);
+      setRoleId(resolvedRoleId);
+      setPermissionIds(resolvedPermissionIds);
+      setResetPassword(false);
+      setAgent(resolvedAgent);
       setError("");
       setInviteLink("");
+      setOriginalSnapshot({
+        fullName: user.full_name,
+        email: user.email,
+        status: resolvedStatus,
+        roleId: resolvedRoleId,
+        permissionIds: resolvedPermissionIds,
+        agentId: resolvedAgent?.id || null,
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
+
+  const isDirty =
+    open &&
+    originalSnapshot &&
+    (fullName !== originalSnapshot.fullName ||
+      email !== originalSnapshot.email ||
+      status !== originalSnapshot.status ||
+      roleId !== originalSnapshot.roleId ||
+      resetPassword ||
+      (agent?.id || null) !== originalSnapshot.agentId ||
+      JSON.stringify([...permissionIds].sort()) !== JSON.stringify([...originalSnapshot.permissionIds].sort()));
+  useUnsavedChanges("edit-user-dialog", Boolean(isDirty));
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -368,7 +420,7 @@ function EditUserDialog({ open, onClose, user, roles, permissions, agents, token
   if (!user) return null;
 
   return (
-    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm" keepMounted>
       <DialogTitle>Edit User</DialogTitle>
 
       {inviteLink ? (
@@ -461,7 +513,11 @@ export function ManageUsers() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [addOpen, setAddOpen] = useState(false);
+  // Split from `editUserOpen` so closing the dialog never loses which user it
+  // was open for — EditUserDialog's own [user]-keyed effect is what decides
+  // whether to re-populate the form for the (possibly unchanged) user.
   const [editingUser, setEditingUser] = useState(null);
+  const [editUserOpen, setEditUserOpen] = useState(false);
 
   function loadUsers() {
     return listUsers(token).then(setUsers);
@@ -555,7 +611,14 @@ export function ManageUsers() {
                     )}
                   </TableCell>
                   <TableCell align="right">
-                    <IconButton size="small" onClick={() => setEditingUser(u)} title="Edit user">
+                    <IconButton
+                      size="small"
+                      onClick={() => {
+                        setEditingUser(u);
+                        setEditUserOpen(true);
+                      }}
+                      title="Edit user"
+                    >
                       <EditIcon fontSize="small" />
                     </IconButton>
                   </TableCell>
@@ -580,8 +643,8 @@ export function ManageUsers() {
       />
 
       <EditUserDialog
-        open={Boolean(editingUser)}
-        onClose={() => setEditingUser(null)}
+        open={editUserOpen}
+        onClose={() => setEditUserOpen(false)}
         user={editingUser}
         roles={roles}
         agents={agents}

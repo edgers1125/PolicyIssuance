@@ -50,6 +50,7 @@ import { PdfViewer } from "./PdfViewer";
 import { NumberField } from "./NumberField";
 import { formatPHP } from "../utils/currency";
 import { useAuth } from "../context/AuthContext";
+import { useUnsavedChanges } from "../context/UnsavedChangesContext";
 import {
   CHANGE_TYPE_LABELS,
   VEHICLE_FIELD_BY_CHANGE_TYPE,
@@ -102,7 +103,7 @@ function todayDateInput() {
 // Resend to client / Renew This Policy) mirrors the Client Policies table's
 // own Actions column, so those three actions are reachable from inside the
 // detail popup too, not just the row.
-export function PolicyDetailDialog({ policyId, policyNumber, token, onClose }) {
+export function PolicyDetailDialog({ open, policyId, policyNumber, token, onClose }) {
   const { permissions } = useAuth();
   const navigate = useNavigate();
   const canCreateEndorsement = permissions?.includes("VIEW_POLICIES.CREATE_ENDORSEMENT");
@@ -277,6 +278,10 @@ export function PolicyDetailDialog({ policyId, policyNumber, token, onClose }) {
 
   function currentValueFor() {
     if (!context || !changeType) return "";
+    if (changeType === "VEHICLE_ESTIMATED_VALUE") {
+      const vehicle = context.vehicles.find((v) => v.id === vehicleId);
+      return vehicle ? formatPHP(vehicle.estimated_value || 0) : "";
+    }
     if (VEHICLE_CHANGE_TYPES.has(changeType)) {
       const vehicle = context.vehicles.find((v) => v.id === vehicleId);
       return vehicle ? vehicle[VEHICLE_FIELD_BY_CHANGE_TYPE[changeType]] || "—" : "";
@@ -362,6 +367,13 @@ export function PolicyDetailDialog({ policyId, policyNumber, token, onClose }) {
         country: addressFields.country.trim(),
       };
       displayTo = [entry.new_address.address_line_1, entry.new_address.city, entry.new_address.province].filter(Boolean).join(", ");
+    } else if (changeType === "VEHICLE_ESTIMATED_VALUE") {
+      if (newValue === "" || Number.isNaN(Number(newValue)) || Number(newValue) < 0) {
+        setLineError("Enter a valid, non-negative estimated value");
+        return;
+      }
+      entry.new_value = String(newValue);
+      displayTo = formatPHP(Number(newValue));
     } else {
       if (!newValue.trim()) {
         setLineError("Enter the new value");
@@ -470,9 +482,37 @@ export function PolicyDetailDialog({ policyId, policyNumber, token, onClose }) {
   const isAddCoverageType = changeType === "ADD_COVERAGE";
   const isCancellation = requestType === "CANCELLATION";
 
+  // Unsaved-input tracking (see context/UnsavedChangesContext.jsx) — this
+  // dialog stays mounted (keepMounted below, split open+id state on the host
+  // page) and keeps its endorsement composer draft across a Cancel/X/backdrop
+  // close, so the sidebar/refresh guard needs to know whenever the composer
+  // (its header fields, its queued changes, or its own in-progress line form)
+  // actually diverges from resetComposer()'s defaults.
+  const lineFormHasInput = Boolean(
+    changeType ||
+      vehicleId ||
+      coverageId ||
+      productCoverageId ||
+      coverageAmount ||
+      premiumAmount ||
+      newValue.trim() ||
+      Object.values(addressFields).some((v) => v.trim()) ||
+      lineRemarks.trim()
+  );
+  const isComposerDirty =
+    composerOpen &&
+    (requestType !== "CORRECTION" ||
+      effectiveDate !== todayDateInput() ||
+      remarks.trim() !== "" ||
+      sendOnFile ||
+      sendOnApproval ||
+      queuedChanges.length > 0 ||
+      (lineFormOpen && lineFormHasInput));
+  useUnsavedChanges("policy-detail-dialog", open && isComposerDirty);
+
   return (
     <>
-      <Dialog open={Boolean(policyId)} onClose={onClose} fullWidth maxWidth="xl" scroll="paper">
+      <Dialog open={open} onClose={onClose} fullWidth maxWidth="xl" scroll="paper" keepMounted>
         <DialogTitle>{policyNumber ? `Policy ${policyNumber}` : "Policy"}</DialogTitle>
         <DialogContent dividers>
           <Box sx={{ display: "flex", gap: 3, flexDirection: { xs: "column", md: "row" } }}>
@@ -841,6 +881,15 @@ export function PolicyDetailDialog({ policyId, policyNumber, token, onClose }) {
                                           />
                                           <NumberField label="Premium Amount" value={premiumAmount} onChange={setPremiumAmount} size="small" fullWidth />
                                         </Stack>
+                                      ) : changeType === "VEHICLE_ESTIMATED_VALUE" ? (
+                                        <NumberField
+                                          label="New estimated value"
+                                          value={newValue}
+                                          onChange={setNewValue}
+                                          size="small"
+                                          fullWidth
+                                          helperText="Recomputes this vehicle's value-based coverage on this policy, preserving the agent's own margin"
+                                        />
                                       ) : (
                                         changeType && (
                                           <TextField

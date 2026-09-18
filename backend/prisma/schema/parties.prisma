@@ -85,6 +85,16 @@ model Agent {
   // table itself stays the source of truth for auditing — this column is a
   // cache, never edited directly outside those same writes.
   payable    Decimal      @default(0) @db.Decimal(18, 2)
+  // How many days after a payable transaction's own basis date (a policy's
+  // issue_date for an ISSUANCE row, an endorsement's own effective_date for
+  // an ADD_COVERAGE-created ENDORSEMENT row) it becomes overdue — see
+  // AgentPayableTransaction.due_date, computed and frozen once at that row's
+  // own creation from whatever this agent's payment_terms_days was at that
+  // moment. Required going forward (schemas/agents.js's createAgentSchema);
+  // existing agents were backfilled to 30 in the migration that added this
+  // column, purely as a starting value for whoever manages each agent to
+  // revisit via PATCH /agents/:id, not a meaningful default.
+  payment_terms_days Int     @default(30)
   created_at DateTime     @default(now())
   updated_at DateTime     @updatedAt
 
@@ -198,16 +208,19 @@ model AgentFlatTierPricing {
   @@index([agent_id])
 }
 
-// VEHICLE_SEATS_BASED-mode override: this agent's own threshold for a
-// coverage at one allowable period, replacing the coverage's own
-// CoverageSeatsBasedPricing.threshold_seats for that period entirely — the
-// tier menu itself (insured-amount-per-occupant + rate) is overridden
-// separately, via AgentSeatsTierPricing below.
+// VEHICLE_SEATS_BASED-mode override: this agent's own excess-of-value
+// bracket charge for a coverage at one allowable period, replacing the
+// coverage's own CoverageSeatsBasedPricing (threshold_amount/
+// exceed_threshold_amount/exceed_threshold_price) for that period entirely,
+// all three together — the tier menu itself (insured-amount-per-occupant) is
+// overridden separately, via AgentSeatsTierPricing below.
 model AgentSeatsBasedPricing {
   id                           String   @id @default(uuid()) @db.Uuid
   agent_id                     String   @db.Uuid
   coverage_allowable_period_id String   @db.Uuid
-  threshold_seats              Int
+  threshold_amount             Decimal  @db.Decimal(18, 2)
+  exceed_threshold_amount      Decimal  @db.Decimal(18, 2)
+  exceed_threshold_price       Decimal  @db.Decimal(10, 2)
   created_at                   DateTime @default(now())
   updated_at                   DateTime @updatedAt
 
@@ -220,13 +233,12 @@ model AgentSeatsBasedPricing {
 
 // VEHICLE_SEATS_BASED-mode override of the tier menu itself — same shape/role
 // as AgentFlatTierPricing, just keyed by insured_amount_per_occupant instead
-// of coverage_amount, and paired with this tier's own rate_per_excess_seat.
+// of coverage_amount. No per-tier rate any more — see CoverageSeatsTierPricing.
 model AgentSeatsTierPricing {
   id                           String   @id @default(uuid()) @db.Uuid
   agent_id                     String   @db.Uuid
   coverage_allowable_period_id String   @db.Uuid
   insured_amount_per_occupant  Decimal  @db.Decimal(18, 2)
-  rate_per_excess_seat         Decimal  @db.Decimal(10, 2)
   created_at                   DateTime @default(now())
 
   agent            Agent                   @relation(fields: [agent_id], references: [id])

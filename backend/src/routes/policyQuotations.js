@@ -14,8 +14,9 @@ const {
 const { documentPreviewPropsSchema } = require("../schemas/policyIntakeShared");
 const { currentVehicleValue } = require("../lib/vehicleValue");
 const { getAccessibleAgentIds } = require("../lib/agent");
-const { round2, resolveCoverageRows } = require("../lib/coveragePricing");
+const { round2, resolveCoverageRows, getRequiredCoverageIds } = require("../lib/coveragePricing");
 const { resolveVehicleRenewal, resolveRiskAddressRenewal } = require("../lib/policyConflicts");
+const { assertVehicleIdentifiersUnique } = require("../lib/vehicleUniqueness");
 const { sendIfHttpError } = require("../lib/httpError");
 const { sendMail } = require("../lib/mailer");
 const { buildSubmissionEmailContent } = require("../lib/applicationEmails");
@@ -293,6 +294,8 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
       insured_address,
       remarks,
       send_policy_to_email,
+      pricing_input_mode,
+      target_gross_amount,
     } = req.body;
 
     const insured_type = customer_id ? "INDIVIDUAL" : "CORPORATE";
@@ -301,7 +304,7 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
 
     const productVariant = await prisma.productVariant.findUnique({
       where: { id: product_variant_id },
-      select: { misc_fee: true, insurance_class: { select: { class_name: true } } },
+      select: { misc_fee: true, gross_target_coverage_id: true, insurance_class: { select: { class_name: true } } },
     });
     if (!productVariant) {
       return res.status(400).json({ error: "product_variant_id does not match an existing product" });
@@ -318,6 +321,34 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
     }
     if (requiresInsuredAddress && !insured_address) {
       return res.status(400).json({ error: "An insured address is required for this quotation" });
+    }
+
+    // Every FLAT_TIER/VEHICLE_SEATS_BASED coverage actually priced for this
+    // variant/period is mandatory — not an optional checkbox on the intake
+    // form (see PolicyApplication.jsx's own "Required Coverages" subheading)
+    // — so a direct API call can't skip one either.
+    const coveragePeriodDaysForRequiredCheck = Math.round(
+      (new Date(endAt).getTime() - new Date(startAt).getTime()) / (24 * 60 * 60 * 1000)
+    );
+    const requiredCoverages = await getRequiredCoverageIds({
+      productVariantId: product_variant_id,
+      coveragePeriodDays: coveragePeriodDaysForRequiredCheck,
+      agentId: agent.id,
+    });
+    const selectedCoverageIds = new Set(coverages.map((c) => c.coverage_id));
+    const missingRequiredCoverages = requiredCoverages.filter((rc) => !selectedCoverageIds.has(rc.id));
+    if (missingRequiredCoverages.length > 0) {
+      return res.status(400).json({
+        error: `The following required coverages are missing: ${missingRequiredCoverages.map((c) => c.coverage_name).join(", ")}`,
+      });
+    }
+    // At least one coverage outside the mandatory FLAT_TIER/VEHICLE_SEATS_BASED
+    // set is required too — see routes/policyApplications.js's own identical
+    // check for the full reasoning.
+    const requiredCoverageIdSet = new Set(requiredCoverages.map((c) => c.id));
+    const hasOptionalCoverage = coverages.some((c) => !requiredCoverageIdSet.has(c.coverage_id));
+    if (!hasOptionalCoverage) {
+      return res.status(400).json({ error: "Select at least one coverage in addition to the required ones" });
     }
 
     async function resolveVehicleValue(v) {
@@ -386,6 +417,9 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
       agentId: agent.id,
       startAt,
       endAt,
+      targetGrossAmount: pricing_input_mode === "TARGET_GROSS" ? target_gross_amount : undefined,
+      miscFee: productVariant.misc_fee,
+      grossTargetCoverageId: productVariant.gross_target_coverage_id,
     });
 
     // Same is_misc split as applications (see policyApplications.js's own
@@ -412,22 +446,13 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
     if (className === "Motor") {
       for (const v of vehicles) {
         if (!v.existing_vehicle_id) {
-          // Same plate-uniqueness rule POST /policy-applications enforces —
-          // a plate number identifies one real vehicle, and Vehicle.plate_number
-          // carries no DB-level uniqueness, so this is the only thing stopping
-          // an agent from sidestepping the plate-lookup/reassignment flow and
-          // creating a second Vehicle row for an already-on-file plate.
-          if (v.plate_number) {
-            const duplicate = await prisma.vehicle.findFirst({
-              where: { plate_number: { equals: v.plate_number, mode: "insensitive" } },
-              select: { id: true },
-            });
-            if (duplicate) {
-              return res.status(409).json({
-                error: `Plate number ${v.plate_number} is already on file for another vehicle — look it up and reuse or reassign it instead of entering it as new`,
-              });
-            }
-          }
+          // Same identifier-uniqueness rule POST /policy-applications
+          // enforces — each of plate_number/mv_file_no/engine_number/
+          // chassis_number is meant to identify one real vehicle, so this is
+          // what stops an agent from sidestepping the plate-lookup/
+          // reassignment flow and creating a second Vehicle row for
+          // identifiers already on file.
+          await assertVehicleIdentifiersUnique(v);
           continue;
         }
 
@@ -436,6 +461,13 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
           if (!vehicleExists) {
             return res.status(400).json({ error: "One of the selected vehicles no longer exists" });
           }
+          // The agent may have corrected mv_file_no/engine_number/chassis_number
+          // while confirming the match — re-check those corrections don't
+          // collide with a *different* vehicle.
+          await assertVehicleIdentifiersUnique(
+            { mv_file_no: v.mv_file_no, engine_number: v.engine_number, chassis_number: v.chassis_number },
+            { excludeVehicleId: v.existing_vehicle_id }
+          );
           continue;
         }
 
@@ -483,21 +515,27 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
       return res.status(400).json({ error: "The selected insured address is not on file for this customer/company" });
     }
 
-    // A quotation is a non-binding preview, so vehicle/risk-address history
-    // is only ever silently recorded here (enforce: false — never blocks),
-    // purely so the quotation itself already carries which policy it'd
-    // continue. The real enforcement (and a fresh recompute, in case
-    // something changed since) happens for real at POST /:id/submit, the
-    // moment this actually turns into a binding application — same
-    // non-binding-preview-vs-real-commit split coverage pricing already
-    // follows elsewhere in this app.
+    // Same "no double-insuring the same asset" rule POST /policy-applications
+    // enforces — a quotation used to leave this unenforced (enforce: false),
+    // recording renewedPolicyId only as a silent hint, on the reasoning that
+    // a quotation is a non-binding preview. That let an agent quote (and the
+    // UI happily preview/save) a vehicle that already has an active,
+    // overlapping policy, which is exactly the plate-lookup warning banner in
+    // QuotationCreator.jsx is now meant to catch before the agent even gets
+    // this far — so this is enforced here too now, 409ing with the same
+    // structured `conflict` body applications throw (a still-pending
+    // application for the vehicle/address, or an active policy whose
+    // effectivity period overlaps this quotation's own). Re-run fresh (never
+    // trusted from this quotation's own stored value) at POST /:id/submit,
+    // since real-world state may have changed by the time it actually
+    // becomes a binding application.
     let renewedPolicyId = null;
     if (className === "Motor") {
       const vehicleIdsForHistory = vehicles.filter((v) => v.existing_vehicle_id).map((v) => v.existing_vehicle_id);
-      const resolved = await resolveVehicleRenewal(vehicleIdsForHistory, startAt, endAt, { enforce: false });
+      const resolved = await resolveVehicleRenewal(vehicleIdsForHistory, startAt, endAt, { enforce: true });
       renewedPolicyId = resolved.renewedPolicyId;
     } else if (requiresRiskAddress && risk_address.existing_address_id) {
-      const resolved = await resolveRiskAddressRenewal(risk_address.existing_address_id, startAt, endAt, { enforce: false });
+      const resolved = await resolveRiskAddressRenewal(risk_address.existing_address_id, startAt, endAt, { enforce: true });
       renewedPolicyId = resolved.renewedPolicyId;
     }
 
@@ -540,6 +578,11 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
             vehicleId = v.existing_vehicle_id;
 
             if (v.reassign_owner) {
+              // initial_assessment_date is only ever finalized once a policy
+              // for this vehicle is actually approved — see
+              // routes/policyApproval.js's approveApplicationRecord. Until
+              // then estimated_value stays freely correctable by whichever
+              // filing reuses this vehicle next, same as a brand-new one.
               const currentVehicle = await tx.vehicle.findUnique({
                 where: { id: vehicleId },
                 select: { estimated_value: true, initial_assessment_date: true },
@@ -553,7 +596,7 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
                   // branch; it stays fixed across reassignment, correctable
                   // only via PATCH /vehicles/:id.
                   mv_file_no: v.mv_file_no,
-                  engine_number: v.engine_number,
+                  engine_number: v.engine_number || null,
                   chassis_number: v.chassis_number,
                   make: v.make || null,
                   model: v.model || null,
@@ -562,11 +605,7 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
                   color: v.color || null,
                   no_of_seats: v.no_of_seats,
                   estimated_value: alreadyAssessed ? currentVehicle.estimated_value : (v.estimated_value ?? null),
-                  initial_assessment_date: alreadyAssessed
-                    ? currentVehicle.initial_assessment_date
-                    : v.estimated_value !== undefined
-                      ? new Date()
-                      : null,
+                  initial_assessment_date: alreadyAssessed ? currentVehicle.initial_assessment_date : null,
                 },
               });
 
@@ -584,7 +623,7 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
               data: {
                 plate_number: v.plate_number,
                 mv_file_no: v.mv_file_no,
-                engine_number: v.engine_number,
+                engine_number: v.engine_number || null,
                 chassis_number: v.chassis_number,
                 product_variant_id: v.product_variant_id,
                 make: v.make || null,
@@ -594,7 +633,10 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
                 color: v.color || null,
                 no_of_seats: v.no_of_seats,
                 estimated_value: v.estimated_value ?? null,
-                initial_assessment_date: v.estimated_value !== undefined ? new Date() : null,
+                // Not finalized until an application for this vehicle is
+                // actually approved — see the reassign_owner branch above
+                // and routes/policyApproval.js.
+                initial_assessment_date: null,
               },
             });
             vehicleId = createdVehicle.id;
@@ -726,6 +768,7 @@ const quotationDetailSelect = {
       variant_name: true,
       insurance_class: { select: { class_name: true } },
       deductible_rate: true,
+      minimum_deductible_amount: true,
     },
   },
   // Ordered so a coverage's vehicle_indices (positions into this array) mean
@@ -788,7 +831,7 @@ const quotationDetailSelect = {
   // still be edited/submitted — see toQuotationDetail's `converted` field.
   converted_application: { select: { id: true, application_number: true } },
   // The policy this quotation was auto-detected as continuing (see
-  // lib/policyConflicts.js, enforce:false) — its own policy_number feeds the
+  // lib/policyConflicts.js) — its own policy_number feeds the
   // "Renewing/Replacing:" line on the quotation PDF.
   renewed_policy: { select: { policy_number: true } },
 };
@@ -831,6 +874,7 @@ function toQuotationDetail(quotation) {
     product_variant_id: quotation.product_variant_id,
     variant_name: quotation.product_variant.variant_name,
     deductible_rate: quotation.product_variant.deductible_rate,
+    minimum_deductible_amount: quotation.product_variant.minimum_deductible_amount,
     agent_code: quotation.agent.agent_code,
     agent_name: quotation.agent.agent_name,
     quotation_date: quotation.quotation_date,
@@ -880,6 +924,7 @@ function toPreviewProps(detail) {
     vehicles: detail.vehicles || [],
     coverages: detail.coverages || [],
     deductibleRate: detail.deductible_rate,
+    minimumDeductibleAmount: detail.minimum_deductible_amount,
     totalPremium: detail.total_premium,
     docStamps: detail.doc_stamps,
     vat: detail.vat,
@@ -955,6 +1000,7 @@ router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(update
         // their own is_misc flag; the flat variant fee it's added to hasn't
         // changed, but the coverage-derived portion of misc needs to stay in
         // sync with whatever coverages this edit actually saves.
+        product_variant_id: true,
         product_variant: { select: { misc_fee: true, insurance_class: { select: { class_name: true } } } },
         converted_application: { select: { application_number: true } },
         vehicles: {
@@ -1005,6 +1051,31 @@ router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(update
         ? Number(riskAddressValue)
         : null;
 
+    // Same "every FLAT_TIER/VEHICLE_SEATS_BASED coverage actually priced for
+    // this period is mandatory" rule as POST / above — an edit can't strip
+    // one out either.
+    const coveragePeriodDaysForRequiredCheck = Math.round(
+      (new Date(endAt).getTime() - new Date(startAt).getTime()) / (24 * 60 * 60 * 1000)
+    );
+    const requiredCoverages = await getRequiredCoverageIds({
+      productVariantId: quotation.product_variant_id,
+      coveragePeriodDays: coveragePeriodDaysForRequiredCheck,
+      agentId: quotation.agent_id,
+    });
+    const selectedCoverageIds = new Set(coverages.map((c) => c.coverage_id));
+    const missingRequiredCoverages = requiredCoverages.filter((rc) => !selectedCoverageIds.has(rc.id));
+    if (missingRequiredCoverages.length > 0) {
+      return res.status(400).json({
+        error: `The following required coverages are missing: ${missingRequiredCoverages.map((c) => c.coverage_name).join(", ")}`,
+      });
+    }
+    // Same "at least one optional coverage" rule as POST / above.
+    const requiredCoverageIdSet = new Set(requiredCoverages.map((c) => c.id));
+    const hasOptionalCoverage = coverages.some((c) => !requiredCoverageIdSet.has(c.coverage_id));
+    if (!hasOptionalCoverage) {
+      return res.status(400).json({ error: "Select at least one coverage in addition to the required ones" });
+    }
+
     const resolvedRows = await resolveCoverageRows({
       coverages,
       className,
@@ -1026,15 +1097,15 @@ router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(update
     const miscAmount = round2((Number(quotation.product_variant.misc_fee) || 0) + miscFromCoverages);
     const policyQuotationVehicleIds = quotation.vehicles.map((v) => v.id);
 
-    // Re-derived on every edit (still non-enforced — see POST /) since a
-    // changed coverage period can change which policy (if any) this would
-    // continue.
+    // Re-derived on every edit, enforced the same as POST / above (see that
+    // route's own comment) — a changed coverage period can both change which
+    // policy this would continue and newly overlap one it didn't before.
     let renewedPolicyId = null;
     if (className === "Motor") {
-      const resolved = await resolveVehicleRenewal(quotation.vehicles.map((v) => v.vehicle_id), startAt, endAt, { enforce: false });
+      const resolved = await resolveVehicleRenewal(quotation.vehicles.map((v) => v.vehicle_id), startAt, endAt, { enforce: true });
       renewedPolicyId = resolved.renewedPolicyId;
     } else if (className === "Property" && quotation.addresses[0]?.address_id) {
-      const resolved = await resolveRiskAddressRenewal(quotation.addresses[0].address_id, startAt, endAt, { enforce: false });
+      const resolved = await resolveRiskAddressRenewal(quotation.addresses[0].address_id, startAt, endAt, { enforce: true });
       renewedPolicyId = resolved.renewedPolicyId;
     }
 

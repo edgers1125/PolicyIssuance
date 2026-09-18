@@ -22,6 +22,7 @@ import {
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import { useAuth } from "../context/AuthContext";
+import { useUnsavedChanges } from "../context/UnsavedChangesContext";
 import { getQuotation, getProductCatalog, updateQuotation, previewQuotationPdf } from "../api/client";
 import { formatPHP, formatRate } from "../utils/currency";
 import { formatPeriodLabel } from "../utils/coveragePeriods";
@@ -123,7 +124,7 @@ function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
       if (!Number.isFinite(seats) || seats <= 0) {
         return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
       }
-      if (cov.seats_threshold === null || cov.seats_threshold === undefined) {
+      if (cov.seats_threshold_amount === null || cov.seats_threshold_amount === undefined) {
         return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true, noTier: true };
       }
       // selection.coverage_amount is the agent's chosen "insured amount for
@@ -135,9 +136,13 @@ function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
       if (!tier) {
         return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
       }
-      const excessSeats = Math.max(0, seats - Number(cov.seats_threshold));
+      // No charge up to seats_threshold_amount — the excess above it is
+      // split into seats_exceed_threshold_amount-sized brackets, each
+      // charged seats_exceed_threshold_price.
       coverageAmount = seats * Number(tier.insured_amount_per_occupant);
-      payablePerVehicle = excessSeats * Number(tier.rate_per_excess_seat);
+      const excessValue = Math.max(0, coverageAmount - Number(cov.seats_threshold_amount));
+      const brackets = Number(cov.seats_exceed_threshold_amount) > 0 ? excessValue / Number(cov.seats_exceed_threshold_amount) : 0;
+      payablePerVehicle = brackets * Number(cov.seats_exceed_threshold_price);
     } else {
       coverageAmount = Number(selection.coverage_amount) || 0;
       payablePerVehicle = coverageAmount * Number(cov.rate);
@@ -148,18 +153,25 @@ function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
     maxPayablePerVehicle = Math.max(maxPayablePerVehicle, payablePerVehicle);
   }
 
+  // FLAT_TIER is "no computation, no agent margin" — the tier's own price IS
+  // the premium, always (see backend's lib/coveragePricing.js), so there's
+  // no agent-entered figure to fall back on or floor-check here at all.
+  const isNoMarginMode = cov.pricing_mode === "FLAT_TIER";
+
   return {
     coverage_amount: totalCoverageAmount,
     payable_to_bethel: totalPayable,
-    premium_amount: enteredPremium * count,
+    premium_amount: isNoMarginMode ? totalPayable : enteredPremium * count,
     pending: false,
     minPremiumPerVehicle: maxPayablePerVehicle,
     belowMinimum:
-      Boolean(selection.premium_amount) && Math.round(enteredPremium * 100) < Math.round(maxPayablePerVehicle * 100),
+      !isNoMarginMode &&
+      Boolean(selection.premium_amount) &&
+      Math.round(enteredPremium * 100) < Math.round(maxPayablePerVehicle * 100),
     exceedsMax:
       cov.pricing_mode === "PERCENTAGE" && (Number(selection.coverage_amount) || 0) > Number(cov.effective_maximum_coverage),
-    agentEarnings: enteredPremium * count - totalPayable,
-    hasPremium: Boolean(selection.premium_amount),
+    agentEarnings: isNoMarginMode ? 0 : enteredPremium * count - totalPayable,
+    hasPremium: isNoMarginMode || Boolean(selection.premium_amount),
     effectiveRate: totalCoverageAmount > 0 ? totalPayable / totalCoverageAmount : 0,
   };
 }
@@ -201,7 +213,7 @@ function reconstructSelections(detail, isMotor) {
   return selections;
 }
 
-export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
+export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -275,7 +287,9 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
           is_custom_rate: period.is_custom_rate,
           value_percentage_tiers: period.value_percentage_tiers,
           tier_based_prices: period.tier_based_prices,
-          seats_threshold: period.seats_threshold,
+          seats_threshold_amount: period.seats_threshold_amount,
+          seats_exceed_threshold_amount: period.seats_exceed_threshold_amount,
+          seats_exceed_threshold_price: period.seats_exceed_threshold_price,
           seats_tier_prices: period.seats_tier_prices,
           has_custom_tiers: period.has_custom_tiers,
           has_pricing: period.has_pricing,
@@ -286,6 +300,42 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
   const availablePeriodDays = Array.from(
     new Set(coverages.flatMap((c) => (c.allowable_periods || []).map((p) => p.coverage_in_days)))
   ).sort((a, b) => a - b);
+
+  // FLAT_TIER and VEHICLE_SEATS_BASED coverages are both mandatory on every
+  // quotation — shown first, under their own "Required Coverages"
+  // subheading below, with no checkbox at all. FLAT_TIER carries no agent
+  // margin at all; VEHICLE_SEATS_BASED still lets the agent type/mark up
+  // their own premium (renderCoverageDetails below only special-cases
+  // FLAT_TIER's premium field). Scoped to the chosen period and only once
+  // actually priced, same has_pricing gate as everything else.
+  const requiredCoverages = coverages.filter(
+    (cov) =>
+      ["FLAT_TIER", "VEHICLE_SEATS_BASED"].includes(cov.pricing_mode) &&
+      coverageAllowsPeriod(cov, coveragePeriodDays) &&
+      coverageIsPriced(cov)
+  );
+  const requiredCoverageIds = new Set(requiredCoverages.map((c) => c.id));
+  const optionalCoverages = coverages.filter((cov) => !requiredCoverageIds.has(cov.id));
+
+  // Auto-selects every required coverage the moment it becomes available —
+  // needed here too, not just on the create wizards, since an already-saved
+  // quotation from before this rule existed might not have one yet.
+  // toggleCoverage below refuses to ever remove one.
+  useEffect(() => {
+    if (requiredCoverages.length === 0) return;
+    setCoverageSelections((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const cov of requiredCoverages) {
+        if (!next[cov.id]) {
+          next[cov.id] = { coverage_amount: "", premium_amount: "", vehicle_indices: null };
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requiredCoverages.map((c) => c.id).join(",")]);
 
   const coverageEndAt = coverageStartAt && coveragePeriodDays
     ? addDaysToLocalDateTime(coverageStartAt, Number(coveragePeriodDays))
@@ -317,6 +367,13 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
     );
   }, [coverageStartAt, coveragePeriodDays, coverageSelections, sendPolicyToEmail, initialSnapshot]);
 
+  // Registered app-wide so switching pages (or refreshing) while this
+  // dialog holds unsaved edits warns first — see CLAUDE.md's unsaved-changes
+  // convention. `open` folds in whether the dialog is actually visible right
+  // now (closing it via Cancel/X/backdrop keeps the draft in memory but
+  // shouldn't keep blocking navigation).
+  useUnsavedChanges("edit-quotation-dialog", open && isDirty);
+
   function togglePeriod(days) {
     const next = coveragePeriodDays === days ? "" : days;
     setCoveragePeriodDays(next);
@@ -334,6 +391,9 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
   function toggleCoverage(coverageId) {
     const cov = coverages.find((c) => c.id === coverageId);
     if (!cov || !coverageAllowsPeriod(cov, coveragePeriodDays)) return;
+    // FLAT_TIER coverages are mandatory — never toggled off (see the
+    // "Required Coverages" subheading below).
+    if (requiredCoverageIds.has(coverageId)) return;
     setCoverageSelections((prev) => {
       const next = { ...prev };
       if (next[coverageId]) {
@@ -349,6 +409,111 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
 
   function updateCoverageField(coverageId, field, value) {
     setCoverageSelections((prev) => ({ ...prev, [coverageId]: { ...prev[coverageId], [field]: value } }));
+  }
+
+  // Everything below a coverage's own checkbox/label (or, for a required
+  // FLAT_TIER coverage, its plain name heading) — shared by both the
+  // "Required Coverages" and the ordinary optional-checkbox lists below so
+  // the two can never drift apart. FLAT_TIER never shows an editable premium
+  // field at all (no agent margin — see lib/coveragePricing.js) or a Profit
+  // line, since its premium is always exactly what's payable to Bethel.
+  function renderCoverageDetails(cov, selection, resolved) {
+    if (!selection) return null;
+    return (
+      <Box sx={{ pl: 4, pb: 1 }}>
+        {cov.pricing_mode === "PERCENTAGE" && (
+          <Grid container spacing={2} sx={{ mb: 1 }}>
+            <Grid size={6}>
+              <NumberField
+                label="Coverage amount"
+                value={selection.coverage_amount}
+                onChange={(v) => updateCoverageField(cov.id, "coverage_amount", v)}
+                required
+                fullWidth
+                size="small"
+                error={resolved.exceedsMax}
+                helperText={resolved.exceedsMax ? "Exceeds the maximum for this coverage" : ""}
+                slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+              />
+            </Grid>
+          </Grid>
+        )}
+        {cov.pricing_mode === "FLAT_TIER" && (
+          <TextField
+            select
+            label="Insured value"
+            value={resolved.pending ? "" : String(selection.coverage_amount)}
+            onChange={(e) => updateCoverageField(cov.id, "coverage_amount", e.target.value)}
+            required
+            fullWidth
+            size="small"
+            sx={{ mb: 1 }}
+          >
+            {(cov.tier_based_prices || []).map((tier) => (
+              <MenuItem key={tier.id} value={String(tier.coverage_amount)}>
+                {formatPHP(tier.coverage_amount)} — {formatPHP(tier.coverage_price)}
+              </MenuItem>
+            ))}
+          </TextField>
+        )}
+        {cov.pricing_mode === "VEHICLE_SEATS_BASED" && (
+          <TextField
+            select
+            label="Insured amount for each occupant"
+            value={
+              (cov.seats_tier_prices || []).some(
+                (t) => String(t.insured_amount_per_occupant) === String(selection.coverage_amount)
+              )
+                ? String(selection.coverage_amount)
+                : ""
+            }
+            onChange={(e) => updateCoverageField(cov.id, "coverage_amount", e.target.value)}
+            required
+            fullWidth
+            size="small"
+            sx={{ mb: 1 }}
+          >
+            {(cov.seats_tier_prices || []).map((tier) => (
+              <MenuItem key={tier.insured_amount_per_occupant} value={String(tier.insured_amount_per_occupant)}>
+                {formatPHP(tier.insured_amount_per_occupant)}/occupant
+              </MenuItem>
+            ))}
+          </TextField>
+        )}
+        {!resolved.pending && (
+          <>
+            {cov.pricing_mode !== "FLAT_TIER" && (
+              <NumberField
+                label="Premium amount (your price)"
+                value={selection.premium_amount}
+                onChange={(v) => updateCoverageField(cov.id, "premium_amount", v)}
+                required
+                fullWidth
+                size="small"
+                error={resolved.belowMinimum}
+                helperText={
+                  resolved.belowMinimum
+                    ? `Below the amount payable to Bethel of ${formatPHP(resolved.minPremiumPerVehicle)}`
+                    : ""
+                }
+                slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+              />
+            )}
+            <Alert severity="success" sx={{ mt: 1 }}>
+              Payable to Bethel: <strong>{formatPHP(resolved.payable_to_bethel)}</strong>
+              {cov.pricing_mode === "FLAT_TIER" && (
+                <>
+                  {" "}(fixed premium — no agent margin)
+                </>
+              )}
+              {resolved.hasPremium && !resolved.belowMinimum && cov.pricing_mode !== "FLAT_TIER" && (
+                <> &mdash; Your profit: <strong>{formatPHP(resolved.agentEarnings)}</strong></>
+              )}
+            </Alert>
+          </>
+        )}
+      </Box>
+    );
   }
 
   function buildPreviewProps() {
@@ -391,6 +556,7 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
         };
       }),
       deductibleRate: detail.deductible_rate,
+      minimumDeductibleAmount: detail.minimum_deductible_amount,
       totalPremium,
       docStamps,
       vat,
@@ -407,6 +573,22 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
     const entries = Object.entries(coverageSelections);
     if (entries.length === 0) {
       setError("Select at least one coverage.");
+      return;
+    }
+    // Safety net — requiredCoverages are auto-selected and can't be toggled
+    // off, so this should never actually trip, but confirms it here rather
+    // than only discovering a stripped-out required coverage at the server.
+    const missingRequired = requiredCoverages.filter((c) => !coverageSelections[c.id]);
+    if (missingRequired.length > 0) {
+      setError(`Missing required coverage: ${missingRequired.map((c) => c.coverage_name).join(", ")}.`);
+      return;
+    }
+    // The required ones alone (FLAT_TIER/VEHICLE_SEATS_BASED, auto-selected)
+    // aren't enough on their own — at least one coverage outside that set
+    // must actually be chosen too, same rule the server enforces.
+    const hasOptionalCoverage = entries.some(([id]) => !requiredCoverageIds.has(id));
+    if (!hasOptionalCoverage) {
+      setError("Select at least one coverage in addition to the required ones.");
       return;
     }
     if (!coverageStartAt || !coveragePeriodDays || !coverageEndAt) {
@@ -464,6 +646,15 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
         send_policy_to_email: sendPolicyToEmail,
         coverages: Object.entries(coverageSelections).map(([coverage_id, v]) => {
           const cov = coverages.find((c) => c.id === coverage_id);
+          // FLAT_TIER never collects a premium from the agent either (no
+          // margin — see resolveCoverageSelection/lib/coveragePricing.js) —
+          // send the resolved tier price itself so the schema's own
+          // .positive() shape check has something real to validate; the
+          // server ignores whatever's sent here anyway and recomputes it.
+          const resolvedPremium =
+            cov?.pricing_mode === "FLAT_TIER"
+              ? resolveCoverageSelection(cov, v, coverageVehicles, riskAddressValue)?.premium_amount
+              : null;
           return {
             coverage_id,
             // VALUE_PERCENTAGE never collects a coverage_amount from the
@@ -473,12 +664,18 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
             // selection, so send a harmless positive placeholder here
             // instead of the unset 0.
             coverage_amount: cov?.pricing_mode === "VALUE_PERCENTAGE" ? 1 : Number(v.coverage_amount) || 0,
-            premium_amount: Number(v.premium_amount) || 0,
+            premium_amount: resolvedPremium || Number(v.premium_amount) || 0,
             vehicle_indices: v.vehicle_indices ?? null,
           };
         }),
       };
       const updated = await updateQuotation(token, quotationId, payload);
+      // Re-baseline "dirty" against what was just saved — otherwise
+      // reopening this same quotation later (without further edits) would
+      // still compare against the pre-edit snapshot from the original load
+      // and look dirty again.
+      setInitialSnapshot({ coverageStartAt, coveragePeriodDays, coverageSelections, sendPolicyToEmail });
+      setPreviewOpen(false);
       onSaved?.(updated);
       onClose();
     } catch (err) {
@@ -490,7 +687,7 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
   }
 
   return (
-    <Dialog open={Boolean(quotationId)} onClose={onClose} fullWidth maxWidth="sm" scroll="paper">
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm" scroll="paper" keepMounted>
       <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         {detail ? `Edit Quotation ${detail.quotation_number}` : "Edit Quotation"}
         <IconButton onClick={onClose} aria-label="Close">
@@ -554,12 +751,38 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
 
             <Divider />
 
+            {requiredCoverages.length > 0 && (
+              <Box>
+                <Typography variant="subtitle2" sx={{ fontWeight: 600, mb: 0.5 }}>
+                  Required Coverages
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                  These can't be removed. Tier-based coverages price automatically with no agent margin; seat-based
+                  ones still let you set your own premium.
+                </Typography>
+                <Stack spacing={1.5} divider={<Divider />}>
+                  {requiredCoverages.map((cov) => {
+                    const selection = coverageSelections[cov.id];
+                    const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue) : null;
+                    return (
+                      <Box key={cov.id}>
+                        <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                          {cov.coverage_name}
+                        </Typography>
+                        {renderCoverageDetails(cov, selection, resolved)}
+                      </Box>
+                    );
+                  })}
+                </Stack>
+              </Box>
+            )}
+
             <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
               Coverages
             </Typography>
 
             <Stack spacing={1.5} divider={<Divider />}>
-              {coverages.map((cov) => {
+              {optionalCoverages.map((cov) => {
                 const selection = coverageSelections[cov.id];
                 const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue) : null;
                 const periodAllowed = coverageAllowsPeriod(cov, coveragePeriodDays);
@@ -585,97 +808,7 @@ export function EditQuotationDialog({ quotationId, token, onClose, onSaved }) {
                             : "")
                       }
                     />
-                    {selection && (
-                      <Box sx={{ pl: 4, pb: 1 }}>
-                        {cov.pricing_mode === "PERCENTAGE" && (
-                          <Grid container spacing={2} sx={{ mb: 1 }}>
-                            <Grid size={6}>
-                              <NumberField
-                                label="Coverage amount"
-                                value={selection.coverage_amount}
-                                onChange={(v) => updateCoverageField(cov.id, "coverage_amount", v)}
-                                required
-                                fullWidth
-                                size="small"
-                                error={resolved.exceedsMax}
-                                helperText={resolved.exceedsMax ? "Exceeds the maximum for this coverage" : ""}
-                                slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
-                              />
-                            </Grid>
-                          </Grid>
-                        )}
-                        {cov.pricing_mode === "FLAT_TIER" && (
-                          <TextField
-                            select
-                            label="Insured value"
-                            value={resolved.pending ? "" : String(selection.coverage_amount)}
-                            onChange={(e) => updateCoverageField(cov.id, "coverage_amount", e.target.value)}
-                            required
-                            fullWidth
-                            size="small"
-                            sx={{ mb: 1 }}
-                          >
-                            {(cov.tier_based_prices || []).map((tier) => (
-                              <MenuItem key={tier.id} value={String(tier.coverage_amount)}>
-                                {formatPHP(tier.coverage_amount)} — {formatPHP(tier.coverage_price)}
-                              </MenuItem>
-                            ))}
-                          </TextField>
-                        )}
-                        {cov.pricing_mode === "VEHICLE_SEATS_BASED" && (
-                          <TextField
-                            select
-                            label="Insured amount for each occupant"
-                            value={
-                              (cov.seats_tier_prices || []).some(
-                                (t) => String(t.insured_amount_per_occupant) === String(selection.coverage_amount)
-                              )
-                                ? String(selection.coverage_amount)
-                                : ""
-                            }
-                            onChange={(e) => updateCoverageField(cov.id, "coverage_amount", e.target.value)}
-                            required
-                            fullWidth
-                            size="small"
-                            sx={{ mb: 1 }}
-                          >
-                            {(cov.seats_tier_prices || []).map((tier) => (
-                              <MenuItem
-                                key={tier.insured_amount_per_occupant}
-                                value={String(tier.insured_amount_per_occupant)}
-                              >
-                                {formatPHP(tier.insured_amount_per_occupant)}/occupant — {formatPHP(tier.rate_per_excess_seat)}/excess seat
-                              </MenuItem>
-                            ))}
-                          </TextField>
-                        )}
-                        {!resolved.pending && (
-                          <>
-                            <NumberField
-                              label="Premium amount (your price)"
-                              value={selection.premium_amount}
-                              onChange={(v) => updateCoverageField(cov.id, "premium_amount", v)}
-                              required
-                              fullWidth
-                              size="small"
-                              error={resolved.belowMinimum}
-                              helperText={
-                                resolved.belowMinimum
-                                  ? `Below the amount payable to Bethel of ${formatPHP(resolved.minPremiumPerVehicle)}`
-                                  : ""
-                              }
-                              slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
-                            />
-                            <Alert severity="success" sx={{ mt: 1 }}>
-                              Payable to Bethel: <strong>{formatPHP(resolved.payable_to_bethel)}</strong>
-                              {resolved.hasPremium && !resolved.belowMinimum && (
-                                <> &mdash; Your profit: <strong>{formatPHP(resolved.agentEarnings)}</strong></>
-                              )}
-                            </Alert>
-                          </>
-                        )}
-                      </Box>
-                    )}
+                    {renderCoverageDetails(cov, selection, resolved)}
                   </Box>
                 );
               })}

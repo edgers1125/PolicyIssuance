@@ -27,6 +27,7 @@ import {
 import SearchIcon from "@mui/icons-material/Search";
 import AddIcon from "@mui/icons-material/Add";
 import { useAuth } from "../context/AuthContext";
+import { useUnsavedChanges } from "../context/UnsavedChangesContext";
 import { listAccountingTransactions, listAccountingOverview, recordAgentPayment } from "../api/client";
 import { formatPHP } from "../utils/currency";
 import { NumberField } from "../components/NumberField";
@@ -61,7 +62,7 @@ const TRANSACTION_TYPE_COLORS = {
 // transaction_type isn't accepted from the client at all). Sources its own
 // Agent picker from GET /accounting/overview rather than GET /agents, since
 // a MANAGE_ACCOUNTING-only caller may not hold MANAGE_AGENTS.
-function RecordPaymentDialog({ onClose, onRecorded }) {
+function RecordPaymentDialog({ open, onClose, onRecorded }) {
   const { token } = useAuth();
   const [agents, setAgents] = useState([]);
   const [agent, setAgent] = useState(null);
@@ -76,6 +77,14 @@ function RecordPaymentDialog({ onClose, onRecorded }) {
       .catch((err) => setError(err.message));
   }, [token]);
 
+  // Registered app-wide so switching pages while this dialog holds
+  // in-progress input warns first — see CLAUDE.md's unsaved-changes
+  // convention. This dialog has no "record id" to key a draft off (it's
+  // always a fresh form), so closing (Cancel/X/backdrop) never resets it —
+  // only a successful record does, below.
+  const isDirty = Boolean(agent || amount || remarks);
+  useUnsavedChanges("record-payment-dialog", open && isDirty);
+
   async function handleSubmit(e) {
     e.preventDefault();
     setError("");
@@ -87,6 +96,10 @@ function RecordPaymentDialog({ onClose, onRecorded }) {
         remarks: remarks || undefined,
       });
       onRecorded();
+      setAgent(null);
+      setAmount("");
+      setRemarks("");
+      setError("");
       onClose();
     } catch (err) {
       setError(err.message);
@@ -96,7 +109,7 @@ function RecordPaymentDialog({ onClose, onRecorded }) {
   }
 
   return (
-    <Dialog open onClose={onClose} fullWidth maxWidth="sm">
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm" keepMounted>
       <DialogTitle>Record Payment</DialogTitle>
       <Box component="form" onSubmit={handleSubmit}>
         <DialogContent>
@@ -257,19 +270,28 @@ export function AccountingTransactions() {
                   <TableCell>Type</TableCell>
                   <TableCell>Policy #</TableCell>
                   <TableCell align="right">Amount</TableCell>
+                  <TableCell align="right">Remaining</TableCell>
                   <TableCell>Remarks</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {rows.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={6} align="center" sx={{ py: 4, color: "text.secondary" }}>
+                    <TableCell colSpan={7} align="center" sx={{ py: 4, color: "text.secondary" }}>
                       {hasActiveFilters ? "No transactions match your search/filters." : "No transactions yet."}
                     </TableCell>
                   </TableRow>
                 ) : (
                   rows.map((t) => {
                     const amount = Number(t.amount);
+                    // Only set on a "bucket" row (ISSUANCE, or an
+                    // ADD_COVERAGE ENDORSEMENT credit) — see
+                    // lib/agentPayables.js. Every other row (PAYMENT, a
+                    // REMOVE_CLAUSE/CANCELLED_POLICY debit) reduces someone
+                    // else's bucket instead of carrying its own remaining
+                    // balance, so this stays "—" for them.
+                    const hasRemaining = t.remaining_amount !== null && t.remaining_amount !== undefined;
+                    const remaining = hasRemaining ? Number(t.remaining_amount) : null;
                     return (
                       <TableRow key={t.id} hover>
                         <TableCell sx={{ whiteSpace: "nowrap" }}>{fmtDate(t.created_at)}</TableCell>
@@ -290,6 +312,25 @@ export function AccountingTransactions() {
                             {amount < 0 ? "-" : "+"}
                             {formatPHP(Math.abs(amount))}
                           </Typography>
+                        </TableCell>
+                        <TableCell align="right">
+                          {hasRemaining ? (
+                            <Stack spacing={0} sx={{ alignItems: "flex-end" }}>
+                              <Typography
+                                variant="body2"
+                                sx={{ fontWeight: 600, color: remaining > 0 ? "warning.main" : "text.primary" }}
+                              >
+                                {formatPHP(remaining)}
+                              </Typography>
+                              {t.due_date && (
+                                <Typography variant="caption" color="text.secondary">
+                                  Due {fmtDate(t.due_date)}
+                                </Typography>
+                              )}
+                            </Stack>
+                          ) : (
+                            "—"
+                          )}
                         </TableCell>
                         <TableCell>
                           {t.remarks || "—"}
@@ -321,7 +362,7 @@ export function AccountingTransactions() {
         </Paper>
       )}
 
-      {recording && <RecordPaymentDialog onClose={() => setRecording(false)} onRecorded={loadTransactions} />}
+      <RecordPaymentDialog open={recording} onClose={() => setRecording(false)} onRecorded={loadTransactions} />
     </>
   );
 }

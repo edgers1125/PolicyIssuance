@@ -25,11 +25,36 @@ const updateProductVariantSchema = z.object({
   variant_code: z.string().min(1, "variant_code cannot be empty").optional(),
   variant_name: z.string().min(1, "variant_name cannot be empty").optional(),
   deductible_rate: z.coerce.number().nonnegative("deductible_rate must be zero or greater").nullable().optional(),
+  // A floor under deductible_rate's own computed figure — see
+  // ProductVariant.minimum_deductible_amount's own schema comment.
+  minimum_deductible_amount: z.coerce
+    .number()
+    .nonnegative("minimum_deductible_amount must be zero or greater")
+    .nullable()
+    .optional(),
   misc_fee: z.coerce.number().nonnegative("misc_fee must be zero or greater").nullable().optional(),
+  // Which of this variant's own VALUE_PERCENTAGE coverages, if any, the
+  // intake wizards' "Solve from Gross Total" pricing mode solves backward —
+  // see ProductVariant.gross_target_coverage_id (catalog.prisma) and
+  // lib/coveragePricing.js's resolveCoverageRows. null explicitly clears it
+  // back to unconfigured (the wizard's toggle then stays unavailable); the
+  // route re-validates it's actually a VALUE_PERCENTAGE coverage belonging
+  // to this same variant, since a static schema can't check that.
+  gross_target_coverage_id: z.string().uuid("gross_target_coverage_id must be a valid UUID").nullable().optional(),
 });
 
 const insuranceClassIdParamSchema = z.object({
   id: z.string().uuid("id must be a valid UUID"),
+});
+
+// GET /insurance-classes' own status filter — "ACTIVE" (the default, same
+// as this route's previous hardcoded behavior) shows only live rows at
+// every tier, "INACTIVE" shows only soft-deleted ones, "ALL" shows both.
+// Applied uniformly at all three tiers (class/variant/coverage) rather than
+// independently per tier — a single admin-facing switch, not a per-tier
+// filter set.
+const listInsuranceClassesQuerySchema = z.object({
+  status: z.enum(["ACTIVE", "INACTIVE", "ALL"]).optional().default("ACTIVE"),
 });
 
 // Both optional — gated entirely behind MANAGE_SETTINGS.MANAGE_PRODUCTS.EDIT_DETAILS.
@@ -46,14 +71,17 @@ const createInsuranceClassSchema = z.object({
 
 // Settings → Manage Products' "Add Product Variant" action. Unlike
 // updateProductVariantSchema above (a PATCH that can clear either back to
-// null), deductible_rate/misc_fee are required on create — a new variant
-// must already be fully priced before it's usable for an application:
-// deductible_rate for the policy schedule's Section III Deductible/
-// Authorized Repair Limit line (the repair limit itself is just that
-// deductible plus a fixed towing amount — see pdf/theme.js's TOWING_AMOUNT —
-// so there's no second rate to require), and misc_fee as the flat
-// "Miscellaneous" charge every application/quotation filed under this
-// variant will carry (0 is a valid, deliberate choice).
+// null), deductible_rate/minimum_deductible_amount/misc_fee are required on
+// create — a new variant must already be fully priced before it's usable
+// for an application: deductible_rate and minimum_deductible_amount
+// together for the policy schedule's Section III Deductible/Authorized
+// Repair Limit line (the printed deductible is whichever of the two
+// produces the higher figure — see pdf/theme.js's computeDeductibleFigures();
+// the repair limit itself is just that deductible plus a fixed towing
+// amount — see TOWING_AMOUNT — so there's no second rate to require there),
+// and misc_fee as the flat "Miscellaneous" charge every application/
+// quotation filed under this variant will carry (0 is a valid, deliberate
+// choice for any of the three).
 const createProductVariantSchema = z.object({
   insurance_class_id: z.string().uuid("insurance_class_id must be a valid UUID"),
   variant_code: requiredString("variant_code"),
@@ -62,6 +90,9 @@ const createProductVariantSchema = z.object({
   deductible_rate: z.coerce
     .number({ error: "deductible_rate is required" })
     .nonnegative("deductible_rate must be zero or greater"),
+  minimum_deductible_amount: z.coerce
+    .number({ error: "minimum_deductible_amount is required" })
+    .nonnegative("minimum_deductible_amount must be zero or greater"),
   misc_fee: z.coerce.number({ error: "misc_fee is required" }).nonnegative("misc_fee must be zero or greater"),
 });
 
@@ -102,6 +133,7 @@ module.exports = {
   productVariantIdParamSchema,
   updateProductVariantSchema,
   insuranceClassIdParamSchema,
+  listInsuranceClassesQuerySchema,
   updateInsuranceClassSchema,
   createInsuranceClassSchema,
   createProductVariantSchema,

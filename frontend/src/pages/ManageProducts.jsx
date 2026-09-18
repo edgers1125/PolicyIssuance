@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Container,
@@ -28,6 +28,7 @@ import DeleteIcon from "@mui/icons-material/Delete";
 import RestoreFromTrashIcon from "@mui/icons-material/RestoreFromTrash";
 import EditIcon from "@mui/icons-material/Edit";
 import { useAuth } from "../context/AuthContext";
+import { useUnsavedChanges } from "../context/UnsavedChangesContext";
 import {
   listInsuranceClasses,
   createInsuranceClass,
@@ -59,7 +60,14 @@ function rateToPercentDisplay(rate) {
 }
 
 const emptyClassForm = { class_name: "", description: "" };
-const emptyVariantForm = { variant_code: "", variant_name: "", description: "", deductible_rate: "", misc_fee: "" };
+const emptyVariantForm = {
+  variant_code: "",
+  variant_name: "",
+  description: "",
+  deductible_rate: "",
+  minimum_deductible_amount: "",
+  misc_fee: "",
+};
 const emptyCoverageForm = {
   coverage_code: "",
   coverage_name: "",
@@ -68,6 +76,19 @@ const emptyCoverageForm = {
   pricing_mode: "PERCENTAGE",
   is_misc: false,
 };
+const emptyEditVariantForm = {
+  variant_code: "",
+  variant_name: "",
+  deductible_rate: "",
+  minimum_deductible_amount: "",
+  misc_fee: "",
+  gross_target_coverage_id: "",
+};
+const emptyEditCoverageForm = { coverage_code: "", coverage_name: "", clause: "", is_misc: false };
+
+function sameForm(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
 
 export function ManageProducts() {
   const { token, permissions } = useAuth();
@@ -105,38 +126,96 @@ export function ManageProducts() {
   const [pendingDeletePeriodIds, setPendingDeletePeriodIds] = useState(new Set());
   const [savingDeletes, setSavingDeletes] = useState(false);
 
-  // Create dialogs
+  // Create/edit dialogs — each one's `open` boolean is tracked separately
+  // from its "target" (the class/variant/coverage it's scoped to, or `null`
+  // for a page-level one like Add Insurance Class): closing a dialog
+  // (Cancel/X/backdrop) only ever flips `open` back to false — it never
+  // clears the target or the in-progress form, and every <Dialog> below is
+  // `keepMounted` so React never destroys that state either. Reopening the
+  // same dialog (even for the same record) shows whatever was last typed;
+  // the draft is only replaced when the openXxx() function below is called
+  // for a genuinely different target (tracked via a ref, since that
+  // decision has to happen once per click, not on every render), or cleared
+  // entirely after a successful save.
   const [classDialogOpen, setClassDialogOpen] = useState(false);
   const [classForm, setClassForm] = useState(emptyClassForm);
+
+  const [variantDialogOpen, setVariantDialogOpen] = useState(false);
   const [variantDialogClass, setVariantDialogClass] = useState(null);
   const [variantForm, setVariantForm] = useState(emptyVariantForm);
+  const lastVariantClassIdRef = useRef(null);
+
+  const [coverageDialogOpen, setCoverageDialogOpen] = useState(false);
   const [coverageDialogVariant, setCoverageDialogVariant] = useState(null);
   const [coverageForm, setCoverageForm] = useState(emptyCoverageForm);
+  const lastCoverageVariantIdRef = useRef(null);
 
   // One edit dialog per tier — the fields shown inside each are gated by
   // permission (`can.*` above), not the dialog itself: a caller with only
   // one of two applicable permissions still gets the same "Edit" dialog,
   // just with fewer fields in it.
+  const [editClassOpen, setEditClassOpen] = useState(false);
   const [editClassTarget, setEditClassTarget] = useState(null);
   const [editClassForm, setEditClassForm] = useState(emptyClassForm);
+  const [editClassOriginalForm, setEditClassOriginalForm] = useState(emptyClassForm);
+  const lastEditClassIdRef = useRef(null);
+
+  const [editVariantOpen, setEditVariantOpen] = useState(false);
   const [editVariantTarget, setEditVariantTarget] = useState(null);
-  const [editVariantForm, setEditVariantForm] = useState({
-    variant_code: "",
-    variant_name: "",
-    deductible_rate: "",
-    misc_fee: "",
-  });
+  const [editVariantForm, setEditVariantForm] = useState(emptyEditVariantForm);
+  const [editVariantOriginalForm, setEditVariantOriginalForm] = useState(emptyEditVariantForm);
+  const lastEditVariantIdRef = useRef(null);
+
+  // Edit Coverage — a single Save commits both the details/clause section
+  // and (if dirty) the embedded CoveragePricingEditor's own pricing section
+  // together, then closes; a single Cancel reverts both back to their
+  // last-loaded values, staying open; Close just leaves (draft kept).
+  const [editCoverageOpen, setEditCoverageOpen] = useState(false);
   const [editCoverageTarget, setEditCoverageTarget] = useState(null);
-  const [editCoverageForm, setEditCoverageForm] = useState({ coverage_code: "", coverage_name: "", clause: "", is_misc: false });
+  const [editCoverageForm, setEditCoverageForm] = useState(emptyEditCoverageForm);
+  const [editCoverageOriginalForm, setEditCoverageOriginalForm] = useState(emptyEditCoverageForm);
+  const lastEditCoverageIdRef = useRef(null);
+  const [pricingDirty, setPricingDirty] = useState(false);
+  const pricingEditorRef = useRef(null);
 
   // Adding an allowable period stays an immediate create (same as every
   // other "Add" action on this page) — only removal is staged, below.
+  const [addPeriodOpen, setAddPeriodOpen] = useState(false);
   const [addPeriodCoverage, setAddPeriodCoverage] = useState(null);
   const [addPeriodDraft, setAddPeriodDraft] = useState("");
+  const lastAddPeriodCoverageIdRef = useRef(null);
+
+  const isClassFormDirty = classDialogOpen && !sameForm(classForm, emptyClassForm);
+  const isVariantFormDirty = variantDialogOpen && !sameForm(variantForm, emptyVariantForm);
+  const isCoverageFormDirty = coverageDialogOpen && !sameForm(coverageForm, emptyCoverageForm);
+  const isEditClassDirty = editClassOpen && !sameForm(editClassForm, editClassOriginalForm);
+  const isEditVariantDirty = editVariantOpen && !sameForm(editVariantForm, editVariantOriginalForm);
+  const isEditCoverageDetailsDirty = !sameForm(editCoverageForm, editCoverageOriginalForm);
+  const isEditCoverageDirty = editCoverageOpen && (isEditCoverageDetailsDirty || pricingDirty);
+  const isAddPeriodDirty = addPeriodOpen && Boolean(addPeriodDraft);
+
+  // Registered with the app-wide unsaved-changes guard (see AppLayout's
+  // sidebar navigation) so switching pages while any of these dialogs has
+  // unsaved input warns first, same as a browser refresh/close-tab would.
+  useUnsavedChanges("manage-products", [
+    isClassFormDirty,
+    isVariantFormDirty,
+    isCoverageFormDirty,
+    isEditClassDirty,
+    isEditVariantDirty,
+    isEditCoverageDirty,
+    isAddPeriodDirty,
+  ].some(Boolean));
+
+  // Pre-filled to "Active Only" — INACTIVE rows are soft-deleted (see
+  // PATCH /manage-products/batch-delete), so hiding them by default matches
+  // this page's usual "manage what's currently offered" purpose; switching
+  // to "All"/"Inactive Only" is for auditing what's been removed.
+  const [statusFilter, setStatusFilter] = useState("ACTIVE");
 
   function loadClasses() {
     setLoading(true);
-    return listInsuranceClasses(token)
+    return listInsuranceClasses(token, statusFilter)
       .then(setClasses)
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
@@ -145,11 +224,13 @@ export function ManageProducts() {
   useEffect(() => {
     loadClasses();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
+  }, [token, statusFilter]);
 
   // --- Create: Insurance Class ---
+  // No target to key a draft off (this dialog is page-level, not scoped to
+  // any record) — the form is only ever reset after a successful create, so
+  // a Cancel/X/backdrop close and reopen always shows what was last typed.
   function openClassDialog() {
-    setClassForm(emptyClassForm);
     setDialogError("");
     setClassDialogOpen(true);
   }
@@ -162,6 +243,7 @@ export function ManageProducts() {
         description: classForm.description.trim() || undefined,
       });
       setClassDialogOpen(false);
+      setClassForm(emptyClassForm);
       await loadClasses();
     } catch (err) {
       setDialogError(err.message);
@@ -172,9 +254,19 @@ export function ManageProducts() {
 
   // --- Edit: Insurance Class (one form — only field group today is "details") ---
   function openEditClass(cls) {
-    setEditClassForm({ class_name: cls.class_name, description: cls.description || "" });
+    if (lastEditClassIdRef.current !== cls.id) {
+      const fresh = { class_name: cls.class_name, description: cls.description || "" };
+      setEditClassForm(fresh);
+      setEditClassOriginalForm(fresh);
+      lastEditClassIdRef.current = cls.id;
+    }
     setDialogError("");
     setEditClassTarget(cls);
+    setEditClassOpen(true);
+  }
+  function handleCancelEditClass() {
+    setEditClassForm(editClassOriginalForm);
+    setDialogError("");
   }
   async function handleEditClass() {
     setDialogSaving(true);
@@ -184,7 +276,7 @@ export function ManageProducts() {
         class_name: editClassForm.class_name.trim(),
         description: editClassForm.description.trim() || undefined,
       });
-      setEditClassTarget(null);
+      setEditClassOpen(false);
       await loadClasses();
     } catch (err) {
       setDialogError(err.message);
@@ -195,9 +287,13 @@ export function ManageProducts() {
 
   // --- Create: Product Variant ---
   function openVariantDialog(insuranceClass) {
-    setVariantForm(emptyVariantForm);
+    if (lastVariantClassIdRef.current !== insuranceClass.id) {
+      setVariantForm(emptyVariantForm);
+      lastVariantClassIdRef.current = insuranceClass.id;
+    }
     setDialogError("");
     setVariantDialogClass(insuranceClass);
+    setVariantDialogOpen(true);
   }
   async function handleCreateVariant() {
     setDialogSaving(true);
@@ -209,9 +305,11 @@ export function ManageProducts() {
         variant_name: variantForm.variant_name.trim(),
         description: variantForm.description.trim() || undefined,
         deductible_rate: percentDisplayToRate(variantForm.deductible_rate),
+        minimum_deductible_amount: Number(variantForm.minimum_deductible_amount),
         misc_fee: Number(variantForm.misc_fee),
       });
-      setVariantDialogClass(null);
+      setVariantDialogOpen(false);
+      setVariantForm(emptyVariantForm);
       await loadClasses();
     } catch (err) {
       setDialogError(err.message);
@@ -223,14 +321,29 @@ export function ManageProducts() {
   // --- Edit: Product Variant (one form — details section + rates section,
   // each shown only when the caller holds the matching permission) ---
   function openEditVariant(variant) {
-    setEditVariantForm({
-      variant_code: variant.variant_code,
-      variant_name: variant.variant_name,
-      deductible_rate: rateToPercentDisplay(variant.deductible_rate),
-      misc_fee: variant.misc_fee === null || variant.misc_fee === undefined ? "" : String(variant.misc_fee),
-    });
+    if (lastEditVariantIdRef.current !== variant.id) {
+      const fresh = {
+        variant_code: variant.variant_code,
+        variant_name: variant.variant_name,
+        deductible_rate: rateToPercentDisplay(variant.deductible_rate),
+        minimum_deductible_amount:
+          variant.minimum_deductible_amount === null || variant.minimum_deductible_amount === undefined
+            ? ""
+            : String(variant.minimum_deductible_amount),
+        misc_fee: variant.misc_fee === null || variant.misc_fee === undefined ? "" : String(variant.misc_fee),
+        gross_target_coverage_id: variant.gross_target_coverage_id || "",
+      };
+      setEditVariantForm(fresh);
+      setEditVariantOriginalForm(fresh);
+      lastEditVariantIdRef.current = variant.id;
+    }
     setDialogError("");
     setEditVariantTarget(variant);
+    setEditVariantOpen(true);
+  }
+  function handleCancelEditVariant() {
+    setEditVariantForm(editVariantOriginalForm);
+    setDialogError("");
   }
   async function handleEditVariant() {
     setDialogSaving(true);
@@ -243,10 +356,13 @@ export function ManageProducts() {
       }
       if (can.editPricing) {
         payload.deductible_rate = percentDisplayToRate(editVariantForm.deductible_rate);
+        payload.minimum_deductible_amount =
+          editVariantForm.minimum_deductible_amount === "" ? null : Number(editVariantForm.minimum_deductible_amount);
         payload.misc_fee = editVariantForm.misc_fee === "" ? null : Number(editVariantForm.misc_fee);
+        payload.gross_target_coverage_id = editVariantForm.gross_target_coverage_id || null;
       }
       await updateProductVariant(token, editVariantTarget.id, payload);
-      setEditVariantTarget(null);
+      setEditVariantOpen(false);
       await loadClasses();
     } catch (err) {
       setDialogError(err.message);
@@ -257,9 +373,13 @@ export function ManageProducts() {
 
   // --- Create: Coverage ---
   function openCoverageDialog(variant) {
-    setCoverageForm(emptyCoverageForm);
+    if (lastCoverageVariantIdRef.current !== variant.id) {
+      setCoverageForm(emptyCoverageForm);
+      lastCoverageVariantIdRef.current = variant.id;
+    }
     setDialogError("");
     setCoverageDialogVariant(variant);
+    setCoverageDialogOpen(true);
   }
   async function handleCreateCoverage() {
     setDialogSaving(true);
@@ -274,7 +394,8 @@ export function ManageProducts() {
         pricing_mode: coverageForm.pricing_mode,
         is_misc: coverageForm.is_misc,
       });
-      setCoverageDialogVariant(null);
+      setCoverageDialogOpen(false);
+      setCoverageForm(emptyCoverageForm);
       await loadClasses();
     } catch (err) {
       setDialogError(err.message);
@@ -283,37 +404,55 @@ export function ManageProducts() {
     }
   }
 
-  // --- Edit: Coverage (one form — details section, clause section, and the
-  // embedded pricing editor, each shown only when permitted). Details+clause
-  // share PATCH /coverages/:id and save together; pricing (period/mode/rate/
-  // tiers/maximum coverage) is its own self-contained save inside
-  // CoveragePricingEditor, since it's a multi-step, period-scoped flow. ---
+  // --- Edit: Coverage — one Save commits whichever of the details/clause
+  // section (PATCH /coverages/:id) and the embedded CoveragePricingEditor's
+  // own pricing section are actually dirty, then closes the whole dialog;
+  // one Cancel reverts both back to their last-loaded values and stays
+  // open; Close just leaves (the draft is kept, same as every dialog here). ---
   function openEditCoverage(cov, variant, cls) {
-    setEditCoverageForm({
-      coverage_code: cov.coverage_code,
-      coverage_name: cov.coverage_name,
-      clause: cov.clause || "",
-      is_misc: Boolean(cov.is_misc),
-    });
+    if (lastEditCoverageIdRef.current !== cov.id) {
+      const fresh = {
+        coverage_code: cov.coverage_code,
+        coverage_name: cov.coverage_name,
+        clause: cov.clause || "",
+        is_misc: Boolean(cov.is_misc),
+      };
+      setEditCoverageForm(fresh);
+      setEditCoverageOriginalForm(fresh);
+      lastEditCoverageIdRef.current = cov.id;
+    }
     setDialogError("");
     setEditCoverageTarget({ ...cov, __ctx: variant, __cls: cls });
+    setEditCoverageOpen(true);
   }
-  async function handleEditCoverageDetails() {
+  function handleCancelEditCoverage() {
+    setEditCoverageForm(editCoverageOriginalForm);
+    pricingEditorRef.current?.cancel();
+    setDialogError("");
+  }
+  async function handleSaveEditCoverage() {
     setDialogSaving(true);
     setDialogError("");
     try {
-      const payload = {};
-      if (can.editDetails) {
-        payload.coverage_code = editCoverageForm.coverage_code.trim();
-        payload.coverage_name = editCoverageForm.coverage_name.trim();
-        payload.is_misc = editCoverageForm.is_misc;
+      if ((can.editDetails || can.editClauses) && isEditCoverageDetailsDirty) {
+        const payload = {};
+        if (can.editDetails) {
+          payload.coverage_code = editCoverageForm.coverage_code.trim();
+          payload.coverage_name = editCoverageForm.coverage_name.trim();
+          payload.is_misc = editCoverageForm.is_misc;
+        }
+        if (can.editClauses) {
+          payload.clause = editCoverageForm.clause;
+        }
+        await updateCoverage(token, editCoverageTarget.id, payload);
+        setEditCoverageOriginalForm(editCoverageForm);
       }
-      if (can.editClauses) {
-        payload.clause = editCoverageForm.clause;
+      if (can.editPricing && pricingDirty) {
+        const ok = await pricingEditorRef.current?.save();
+        if (!ok) return;
       }
-      await updateCoverage(token, editCoverageTarget.id, payload);
       await loadClasses();
-      setEditCoverageTarget(null);
+      setEditCoverageOpen(false);
     } catch (err) {
       setDialogError(err.message);
     } finally {
@@ -323,9 +462,13 @@ export function ManageProducts() {
 
   // --- Allowable periods (row-level add/remove) ---
   function openAddPeriod(cov) {
-    setAddPeriodDraft("");
+    if (lastAddPeriodCoverageIdRef.current !== cov.id) {
+      setAddPeriodDraft("");
+      lastAddPeriodCoverageIdRef.current = cov.id;
+    }
     setDialogError("");
     setAddPeriodCoverage(cov);
+    setAddPeriodOpen(true);
   }
   async function handleAddPeriod() {
     const days = Number(addPeriodDraft);
@@ -337,7 +480,8 @@ export function ManageProducts() {
     setDialogError("");
     try {
       await createAllowablePeriod(token, addPeriodCoverage.id, days);
-      setAddPeriodCoverage(null);
+      setAddPeriodOpen(false);
+      setAddPeriodDraft("");
       await loadClasses();
     } catch (err) {
       setDialogError(err.message);
@@ -427,11 +571,25 @@ export function ManageProducts() {
         )}
       </Box>
 
-      <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
         Create, edit, or remove insurance classes, product variants, and coverages — each "Edit" opens one form
         whose fields depend on your own permissions. Deleting anything is staged: mark as many rows as you like,
         then Save to commit them all together.
       </Typography>
+
+      <TextField
+        select
+        label="Status"
+        value={statusFilter}
+        onChange={(e) => setStatusFilter(e.target.value)}
+        size="small"
+        sx={{ minWidth: 220, mb: 3 }}
+        helperText="Inactive rows are soft-deleted (Save Deletions) — shown here only for reference."
+      >
+        <MenuItem value="ACTIVE">Active only</MenuItem>
+        <MenuItem value="INACTIVE">Inactive only</MenuItem>
+        <MenuItem value="ALL">All</MenuItem>
+      </TextField>
 
       {error && (
         <Alert severity="error" sx={{ mb: 2 }}>
@@ -470,7 +628,8 @@ export function ManageProducts() {
             <Box sx={{ display: "flex", alignItems: "flex-start", gap: 0.5, flexWrap: "wrap" }}>
               <Box sx={{ flexGrow: 1, minWidth: 160 }}>
                 <Typography variant="h6" sx={{ fontWeight: 700, textDecoration: classPending ? "line-through" : "none" }}>
-                  {cls.class_name}
+                  {cls.class_name}{" "}
+                  {cls.status === "INACTIVE" && <Chip size="small" color="default" label="Inactive" />}
                 </Typography>
                 {cls.description && (
                   <Typography variant="body2" color="text.secondary">
@@ -530,6 +689,7 @@ export function ManageProducts() {
                           <Typography component="span" variant="body2" color="text.secondary">
                             ({variant.variant_code})
                           </Typography>
+                          {variant.status === "INACTIVE" && <Chip size="small" color="default" label="Inactive" sx={{ ml: 1 }} />}
                         </Typography>
                         <Stack direction="row" spacing={1} sx={{ mt: 0.5, flexWrap: "wrap", rowGap: 0.5 }}>
                           <Chip
@@ -538,8 +698,22 @@ export function ManageProducts() {
                           />
                           <Chip
                             size="small"
+                            label={`Min. deductible: ${variant.minimum_deductible_amount !== null ? formatPHP(variant.minimum_deductible_amount) : "not set"}`}
+                          />
+                          <Chip
+                            size="small"
                             label={`Misc. fee: ${variant.misc_fee !== null ? formatPHP(variant.misc_fee) : "not set"}`}
                           />
+                          {variant.gross_target_coverage_id && (
+                            <Chip
+                              size="small"
+                              color="info"
+                              label={`Gross target: ${
+                                variant.product_coverages.find((c) => c.id === variant.gross_target_coverage_id)
+                                  ?.coverage_name || "configured"
+                              }`}
+                            />
+                          )}
                         </Stack>
                         {variantPending && (
                           <Typography variant="caption" color="warning.main" sx={{ display: "block", mt: 0.5 }}>
@@ -612,6 +786,7 @@ export function ManageProducts() {
                                   <Typography component="span" variant="caption" color="text.secondary">
                                     ({cov.coverage_code})
                                   </Typography>
+                                  {cov.status === "INACTIVE" && <Chip size="small" color="default" label="Inactive" sx={{ ml: 1 }} />}
                                 </Typography>
                                 <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
                                   Max: {formatPHP(cov.maximum_coverage)} ·{" "}
@@ -689,7 +864,7 @@ export function ManageProducts() {
       </Stack>
 
       {/* Add Insurance Class */}
-      <Dialog open={classDialogOpen} onClose={() => setClassDialogOpen(false)} fullWidth maxWidth="xs">
+      <Dialog open={classDialogOpen} onClose={() => setClassDialogOpen(false)} fullWidth maxWidth="xs" keepMounted>
         <DialogTitle>Add Insurance Class</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
@@ -726,7 +901,7 @@ export function ManageProducts() {
       </Dialog>
 
       {/* Edit Insurance Class — one form, one permission group (EDIT_DETAILS) */}
-      <Dialog open={Boolean(editClassTarget)} onClose={() => setEditClassTarget(null)} fullWidth maxWidth="xs">
+      <Dialog open={editClassOpen} onClose={() => setEditClassOpen(false)} fullWidth maxWidth="xs" keepMounted>
         <DialogTitle>Edit Class{editClassTarget ? ` — ${editClassTarget.class_name}` : ""}</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
@@ -755,14 +930,19 @@ export function ManageProducts() {
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setEditClassTarget(null)} disabled={dialogSaving}>
-            Cancel
+          <Button onClick={() => setEditClassOpen(false)} disabled={dialogSaving}>
+            Close
           </Button>
+          {can.editDetails && isEditClassDirty && (
+            <Button onClick={handleCancelEditClass} disabled={dialogSaving}>
+              Cancel
+            </Button>
+          )}
           {can.editDetails && (
             <Button
               variant="contained"
               onClick={handleEditClass}
-              disabled={dialogSaving || !editClassForm.class_name.trim()}
+              disabled={dialogSaving || !isEditClassDirty || !editClassForm.class_name.trim()}
             >
               {dialogSaving ? "Saving..." : "Save"}
             </Button>
@@ -771,7 +951,7 @@ export function ManageProducts() {
       </Dialog>
 
       {/* Add Product Variant */}
-      <Dialog open={Boolean(variantDialogClass)} onClose={() => setVariantDialogClass(null)} fullWidth maxWidth="xs">
+      <Dialog open={variantDialogOpen} onClose={() => setVariantDialogOpen(false)} fullWidth maxWidth="xs" keepMounted>
         <DialogTitle>Add Product Variant{variantDialogClass ? ` — ${variantDialogClass.class_name}` : ""}</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
@@ -806,6 +986,14 @@ export function ManageProducts() {
               slotProps={{ input: { endAdornment: <InputAdornment position="end">%</InputAdornment> } }}
             />
             <NumberField
+              label="Minimum deductible amount"
+              value={variantForm.minimum_deductible_amount}
+              onChange={(value) => setVariantForm({ ...variantForm, minimum_deductible_amount: value })}
+              fullWidth
+              helperText="Floor under the deductible rate's own computed figure — the printed deductible is whichever is higher"
+              slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+            />
+            <NumberField
               label="Miscellaneous fee"
               value={variantForm.misc_fee}
               onChange={(value) => setVariantForm({ ...variantForm, misc_fee: value })}
@@ -816,7 +1004,7 @@ export function ManageProducts() {
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setVariantDialogClass(null)} disabled={dialogSaving}>
+          <Button onClick={() => setVariantDialogOpen(false)} disabled={dialogSaving}>
             Cancel
           </Button>
           <Button
@@ -827,6 +1015,7 @@ export function ManageProducts() {
               !variantForm.variant_code.trim() ||
               !variantForm.variant_name.trim() ||
               variantForm.deductible_rate === "" ||
+              variantForm.minimum_deductible_amount === "" ||
               variantForm.misc_fee === ""
             }
           >
@@ -838,7 +1027,7 @@ export function ManageProducts() {
       {/* Edit Product Variant — one form: details section (EDIT_DETAILS) +
           rates section (EDIT_PRICING or MANAGE_COVERAGE_PRICING), each shown
           only when held; saved together in one PATCH. */}
-      <Dialog open={Boolean(editVariantTarget)} onClose={() => setEditVariantTarget(null)} fullWidth maxWidth="xs">
+      <Dialog open={editVariantOpen} onClose={() => setEditVariantOpen(false)} fullWidth maxWidth="xs" keepMounted>
         <DialogTitle>Edit Variant{editVariantTarget ? ` — ${editVariantTarget.variant_name}` : ""}</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
@@ -872,6 +1061,14 @@ export function ManageProducts() {
                   slotProps={{ input: { endAdornment: <InputAdornment position="end">%</InputAdornment> } }}
                 />
                 <NumberField
+                  label="Minimum deductible amount"
+                  value={editVariantForm.minimum_deductible_amount}
+                  onChange={(value) => setEditVariantForm({ ...editVariantForm, minimum_deductible_amount: value })}
+                  fullWidth
+                  helperText="Floor under the deductible rate's own computed figure — the printed deductible is whichever is higher"
+                  slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                />
+                <NumberField
                   label="Miscellaneous fee"
                   value={editVariantForm.misc_fee}
                   onChange={(value) => setEditVariantForm({ ...editVariantForm, misc_fee: value })}
@@ -879,17 +1076,39 @@ export function ManageProducts() {
                   helperText="Flat charge every application/quotation filed under this variant carries — blank clears back to unconfigured (₱0)"
                   slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
                 />
+                <TextField
+                  select
+                  label="Gross Target Coverage (optional)"
+                  value={editVariantForm.gross_target_coverage_id}
+                  onChange={(e) => setEditVariantForm({ ...editVariantForm, gross_target_coverage_id: e.target.value })}
+                  fullWidth
+                  helperText="Lets the intake wizards solve this coverage's premium backward from an agent-entered target gross total, instead of it being entered directly. Only vehicle-value-based coverages are eligible."
+                >
+                  <MenuItem value="">None — always priced/entered normally</MenuItem>
+                  {(editVariantTarget?.product_coverages || [])
+                    .filter((c) => c.pricing_mode === "VALUE_PERCENTAGE")
+                    .map((c) => (
+                      <MenuItem key={c.id} value={c.id}>
+                        {c.coverage_name}
+                      </MenuItem>
+                    ))}
+                </TextField>
               </>
             )}
             {!canEditVariant && <Alert severity="info">You don't have permission to edit any fields on this variant.</Alert>}
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setEditVariantTarget(null)} disabled={dialogSaving}>
-            Cancel
+          <Button onClick={() => setEditVariantOpen(false)} disabled={dialogSaving}>
+            Close
           </Button>
+          {canEditVariant && isEditVariantDirty && (
+            <Button onClick={handleCancelEditVariant} disabled={dialogSaving}>
+              Cancel
+            </Button>
+          )}
           {canEditVariant && (
-            <Button variant="contained" onClick={handleEditVariant} disabled={dialogSaving}>
+            <Button variant="contained" onClick={handleEditVariant} disabled={dialogSaving || !isEditVariantDirty}>
               {dialogSaving ? "Saving..." : "Save"}
             </Button>
           )}
@@ -897,7 +1116,7 @@ export function ManageProducts() {
       </Dialog>
 
       {/* Add Coverage */}
-      <Dialog open={Boolean(coverageDialogVariant)} onClose={() => setCoverageDialogVariant(null)} fullWidth maxWidth="xs">
+      <Dialog open={coverageDialogOpen} onClose={() => setCoverageDialogOpen(false)} fullWidth maxWidth="xs" keepMounted>
         <DialogTitle>Add Coverage{coverageDialogVariant ? ` — ${coverageDialogVariant.variant_name}` : ""}</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
@@ -956,7 +1175,7 @@ export function ManageProducts() {
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setCoverageDialogVariant(null)} disabled={dialogSaving}>
+          <Button onClick={() => setCoverageDialogOpen(false)} disabled={dialogSaving}>
             Cancel
           </Button>
           <Button
@@ -976,13 +1195,15 @@ export function ManageProducts() {
       </Dialog>
 
       {/* Edit Coverage — one dialog: details section (EDIT_DETAILS) + clause
-          section (EDIT_CLAUSES) share a single "Save" (both PATCH the same
-          endpoint); pricing — maximum coverage, allowable periods, pricing
-          mode, rate/tiers (EDIT_PRICING or MANAGE_COVERAGE_PRICING) — is the
-          embedded CoveragePricingEditor with its own self-contained save,
-          since it's a multi-step, period-scoped flow that can't collapse
-          into one plain PATCH the way details/clause can. */}
-      <Dialog open={Boolean(editCoverageTarget)} onClose={() => setEditCoverageTarget(null)} fullWidth maxWidth="sm">
+          section (EDIT_CLAUSES) share a single PATCH; pricing — maximum
+          coverage, allowable periods, pricing mode, rate/tiers (EDIT_PRICING
+          or MANAGE_COVERAGE_PRICING) — is the embedded CoveragePricingEditor,
+          driven here via its own ref rather than its own Save/Cancel row
+          (`hideActions`), since this dialog now has a single, unified
+          Save/Cancel/Close bar at the bottom for both sections together —
+          Save commits whichever section(s) are dirty and closes, Cancel
+          reverts both and stays open, Close just leaves (draft kept). */}
+      <Dialog open={editCoverageOpen} onClose={() => setEditCoverageOpen(false)} fullWidth maxWidth="sm" keepMounted>
         <DialogTitle>Edit Coverage{editCoverageTarget ? ` — ${editCoverageTarget.coverage_name}` : ""}</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
@@ -1026,19 +1247,6 @@ export function ManageProducts() {
                     helperText="Printed on the policy schedule's 'Warranties and Clauses' page whenever this coverage is selected."
                   />
                 )}
-                <Box sx={{ display: "flex", justifyContent: "flex-end" }}>
-                  <Button
-                    variant="contained"
-                    onClick={handleEditCoverageDetails}
-                    disabled={
-                      dialogSaving ||
-                      (can.editDetails &&
-                        (!editCoverageForm.coverage_code.trim() || !editCoverageForm.coverage_name.trim()))
-                    }
-                  >
-                    {dialogSaving ? "Saving..." : "Save details"}
-                  </Button>
-                </Box>
               </>
             )}
 
@@ -1050,11 +1258,14 @@ export function ManageProducts() {
                   Pricing
                 </Typography>
                 <CoveragePricingEditor
+                  ref={pricingEditorRef}
                   key={editCoverageTarget.id}
                   token={token}
                   coverage={editCoverageTarget}
                   contextLabel={`Insurance class: ${editCoverageTarget.__cls?.class_name} · Product variant: ${editCoverageTarget.__ctx?.variant_name} · Coverage: ${editCoverageTarget.coverage_name}`}
                   onChanged={loadClasses}
+                  onDirtyChange={setPricingDirty}
+                  hideActions
                 />
               </Box>
             )}
@@ -1065,12 +1276,34 @@ export function ManageProducts() {
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setEditCoverageTarget(null)}>Close</Button>
+          <Button onClick={() => setEditCoverageOpen(false)} disabled={dialogSaving}>
+            Close
+          </Button>
+          {canEditCoverage && isEditCoverageDirty && (
+            <Button onClick={handleCancelEditCoverage} disabled={dialogSaving}>
+              Cancel
+            </Button>
+          )}
+          {canEditCoverage && (
+            <Button
+              variant="contained"
+              onClick={handleSaveEditCoverage}
+              disabled={
+                dialogSaving ||
+                !isEditCoverageDirty ||
+                (can.editDetails &&
+                  isEditCoverageDetailsDirty &&
+                  (!editCoverageForm.coverage_code.trim() || !editCoverageForm.coverage_name.trim()))
+              }
+            >
+              {dialogSaving ? "Saving..." : "Save"}
+            </Button>
+          )}
         </DialogActions>
       </Dialog>
 
       {/* Add Allowable Period — the row-level "+" chip's dialog */}
-      <Dialog open={Boolean(addPeriodCoverage)} onClose={() => setAddPeriodCoverage(null)} fullWidth maxWidth="xs">
+      <Dialog open={addPeriodOpen} onClose={() => setAddPeriodOpen(false)} fullWidth maxWidth="xs" keepMounted>
         <DialogTitle>Add Allowable Period{addPeriodCoverage ? ` — ${addPeriodCoverage.coverage_name}` : ""}</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
@@ -1086,7 +1319,7 @@ export function ManageProducts() {
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setAddPeriodCoverage(null)} disabled={dialogSaving}>
+          <Button onClick={() => setAddPeriodOpen(false)} disabled={dialogSaving}>
             Cancel
           </Button>
           <Button variant="contained" onClick={handleAddPeriod} disabled={dialogSaving || !addPeriodDraft}>

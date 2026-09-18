@@ -1,10 +1,16 @@
 const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { requirePermission, requireAnyPermission, INTAKE_PERMISSIONS } = require("../middleware/permissions");
+const { requireAnyPermission, ensureAnyPermission, getUserPermissionCodes, INTAKE_PERMISSIONS } = require("../middleware/permissions");
 const { validateBody, validateParams } = require("../middleware/validate");
 const { getCurrentAgentId } = require("../lib/agent");
-const { customerInputSchema, agentIdParamSchema } = require("../schemas/customers");
+const { customerInputSchema, createCustomerSchema, agentIdParamSchema } = require("../schemas/customers");
+
+// Callers allowed to create a brand-new customer under an agent other than
+// their own — same two "choose an agent" permissions POST /policy-quotations
+// and POST /policy-approval/admin-applications already gate their own
+// cross-agent picker on.
+const ADMIN_CREATE_PERMISSIONS = ["QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION", "APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION"];
 
 const router = express.Router();
 
@@ -63,11 +69,29 @@ router.get("/", requireAnyPermission(INTAKE_PERMISSIONS), async (req, res, next)
   }
 });
 
-router.post("/", requireAnyPermission(INTAKE_PERMISSIONS), validateBody(customerInputSchema), async (req, res, next) => {
+router.post("/", requireAnyPermission(INTAKE_PERMISSIONS), validateBody(createCustomerSchema), async (req, res, next) => {
   try {
-    const agentId = await getCurrentAgentId(req.user.userId);
-    if (!agentId) {
-      return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+    // agent_id (optional): lets a caller filing on behalf of a different
+    // agent (QuotationCreator.jsx's/PolicyApplication.jsx's own "Filing
+    // Agent" picker) create a brand-new customer linked to THAT agent
+    // instead of always the caller's own — the caller's own agent has no
+    // bearing on who the customer is actually being filed for in that case,
+    // and may not even exist (an approver isn't necessarily an agent at
+    // all). Omitted, this is unchanged from before agent_id existed.
+    let agentId;
+    if (req.body.agent_id) {
+      const actingPermissions = await getUserPermissionCodes(req.user.userId);
+      if (!ensureAnyPermission(res, actingPermissions, ADMIN_CREATE_PERMISSIONS)) return;
+      const agent = await prisma.agent.findUnique({ where: { id: req.body.agent_id } });
+      if (!agent) {
+        return res.status(400).json({ error: "agent_id does not match an existing agent" });
+      }
+      agentId = agent.id;
+    } else {
+      agentId = await getCurrentAgentId(req.user.userId);
+      if (!agentId) {
+        return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+      }
     }
 
     const { first_name, last_name, middle_name, birthday, gender, email, mobile_number } = req.body;
@@ -141,11 +165,14 @@ router.patch("/:id", requireAnyPermission(INTAKE_PERMISSIONS), validateBody(cust
 // Customers connected to a *chosen* agent, not the caller's own — the New
 // Quotation form's cross-agent customer picker, shown only once
 // QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION is held (see routes/policyQuotations.js's
-// GET /agents, the matching agent picker). Same response shape as GET /
+// GET /agents, the matching agent picker), and, for the same reason, the
+// admin Policy Application form's own cross-agent picker once
+// APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION is held (see
+// routes/policyApproval.js's own GET /agents). Same response shape as GET /
 // above, just scoped to :agentId instead of getCurrentAgentId(req.user.userId).
 router.get(
   "/agent/:agentId",
-  requirePermission("QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION"),
+  requireAnyPermission(["QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION", "APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION"]),
   validateParams(agentIdParamSchema),
   async (req, res, next) => {
     try {

@@ -6,23 +6,15 @@ import { Chip } from "@mui/material";
 // STATUS_LABELS is also exported so both pages' own status-filter dropdown
 // can list the same options/labels instead of a third duplicated map.
 export const STATUS_LABELS = {
-  DRAFT: "Draft",
   SUBMITTED: "Submitted",
-  FOR_EDIT_MANAGER: "For Edit (Manager)",
-  FOR_EDIT_UNDERWRITING: "For Edit (Underwriting)",
-  PENDING_MANAGER_APPROVAL: "Pending Manager Approval",
-  PENDING_UNDERWRITING_APPROVAL: "Pending Underwriting Approval",
+  UNDER_REVIEW: "Under Review",
   APPROVED: "Approved",
   REJECTED: "Rejected",
 };
 
 const STATUS_COLORS = {
-  DRAFT: "default",
   SUBMITTED: "info",
-  FOR_EDIT_MANAGER: "warning",
-  FOR_EDIT_UNDERWRITING: "warning",
-  PENDING_MANAGER_APPROVAL: "info",
-  PENDING_UNDERWRITING_APPROVAL: "info",
+  UNDER_REVIEW: "warning",
   APPROVED: "success",
   REJECTED: "error",
 };

@@ -61,6 +61,12 @@ export function ClientPoliciesTable() {
   const [rowsPerPage, setRowsPerPage] = useState(10);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  // Split "which policy" from "is the dialog open" so PolicyDetailDialog
+  // (rendered unconditionally, keepMounted below) keeps its in-progress
+  // endorsement composer draft across a Cancel/X/backdrop close — only
+  // re-fetching when a genuinely different policy is opened. See
+  // UnsavedChangesContext.jsx.
+  const [detailOpen, setDetailOpen] = useState(false);
   const [selected, setSelected] = useState(null);
   // Which row's "Resend to client" is in flight, and the outcome of the last
   // one — a top-level Alert rather than a per-row one, since only one resend
@@ -211,7 +217,10 @@ export function ClientPoliciesTable() {
                     <TableRow
                       key={p.id}
                       hover
-                      onClick={() => setSelected({ id: p.id, policyNumber: p.policy_number })}
+                      onClick={() => {
+                        setSelected({ id: p.id, policyNumber: p.policy_number });
+                        setDetailOpen(true);
+                      }}
                       sx={{ cursor: "pointer" }}
                     >
                       <TableCell sx={{ fontFamily: "monospace", whiteSpace: "nowrap" }}>{p.policy_number}</TableCell>
@@ -275,14 +284,13 @@ export function ClientPoliciesTable() {
         </Paper>
       )}
 
-      {selected && (
-        <PolicyDetailDialog
-          policyId={selected.id}
-          policyNumber={selected.policyNumber}
-          token={token}
-          onClose={() => setSelected(null)}
-        />
-      )}
+      <PolicyDetailDialog
+        open={detailOpen}
+        policyId={selected?.id ?? null}
+        policyNumber={selected?.policyNumber}
+        token={token}
+        onClose={() => setDetailOpen(false)}
+      />
     </>
   );
 }

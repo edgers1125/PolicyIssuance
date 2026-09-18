@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   Paper,
   Table,
@@ -18,13 +19,17 @@ import {
   Stack,
   Button,
   Typography,
+  Dialog,
+  DialogContent,
 } from "@mui/material";
 import SearchIcon from "@mui/icons-material/Search";
+import AddIcon from "@mui/icons-material/Add";
 import { useAuth } from "../context/AuthContext";
-import { listApplicationsForApproval } from "../api/client";
+import { listApplicationsForApproval, getApplicationForApproval } from "../api/client";
 import { formatPHP } from "../utils/currency";
 import { StatusChip, STATUS_LABELS } from "../components/StatusChip";
 import { ApplicationReviewDialog } from "../components/ApplicationReviewDialog";
+import { PolicyApplication } from "./PolicyApplication";
 
 function fmtDate(value) {
   if (!value) return "—";
@@ -49,14 +54,32 @@ const POLICY_TYPE_COLORS = { NEW_POLICY: "default", RENEWAL: "info" };
 // shared page chrome + horizontal Tabs above both it and EndorsementApproval.jsx
 // (same relationship as MyClients.jsx's own two tabs).
 export function PolicyApproval() {
-  const { token } = useAuth();
+  const { token, permissions } = useAuth();
+  const [searchParams, setSearchParams] = useSearchParams();
+  // Gates the "New Admin Application" action below — files an application
+  // under a chosen agent and immediately approves it (POST
+  // /policy-approval/admin-applications), rather than a regular CREATE_APPLICATION
+  // filing into the ordinary queue. Lives here rather than on
+  // PolicyApplications.jsx/the Policy Applications page because
+  // APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION is a sub-permission of
+  // APPROVE_APPLICATION, not CREATE_APPLICATION — a caller could hold it
+  // without holding CREATE_APPLICATION at all (an approver isn't necessarily
+  // a filing agent), so that other page's own CREATE_APPLICATION gate would
+  // block them from ever reaching it there.
+  const canAdminCreate = permissions?.includes("APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION");
   const [rows, setRows] = useState([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(10);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [reviewing, setReviewing] = useState(null);
+  // Split "which application" from "is the dialog open" so ApplicationReviewDialog
+  // (rendered unconditionally, keepMounted below) keeps its in-progress draft
+  // across a Cancel/X/backdrop close — only re-fetching when a genuinely
+  // different application is opened. See UnsavedChangesContext.jsx.
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewingApp, setReviewingApp] = useState(null);
+  const [creatingAdmin, setCreatingAdmin] = useState(false);
 
   // Search/filter bar — server-side (see listAllApplicationsQuerySchema),
   // search debounced so it doesn't re-fetch on every keystroke. Search also
@@ -114,8 +137,45 @@ export function PolicyApproval() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, page, rowsPerPage, debouncedSearch, statusFilter, policyTypeFilter]);
 
+  // Mirrors PolicyApplications.jsx's own ?open= deep link — Quotations.jsx's
+  // own "For Issuance" status chip routes here instead of to that other
+  // (agent-scoped) tracker, since this is where the application is actually
+  // waiting on a decision. The number isn't in the URL, so this fetches the
+  // one application's detail for the dialog title rather than waiting on/
+  // searching the (possibly different-paginated) table rows.
+  useEffect(() => {
+    const openId = searchParams.get("open");
+    if (!openId) return;
+    let cancelled = false;
+    getApplicationForApproval(token, openId)
+      .then((app) => {
+        if (cancelled) return;
+        setReviewingApp({ id: app.id, applicationNumber: app.application_number });
+        setReviewOpen(true);
+      })
+      .catch((err) => !cancelled && setError(err.message))
+      .finally(() => {
+        if (cancelled) return;
+        const next = new URLSearchParams(searchParams);
+        next.delete("open");
+        setSearchParams(next, { replace: true });
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
+
   return (
     <>
+      {canAdminCreate && (
+        <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}>
+          <Button variant="contained" startIcon={<AddIcon />} onClick={() => setCreatingAdmin(true)}>
+            New Admin Application
+          </Button>
+        </Box>
+      )}
+
       <Paper sx={{ p: 2, borderRadius: 3, mb: 2 }}>
         <Stack direction={{ xs: "column", sm: "row" }} spacing={2} sx={{ alignItems: { xs: "stretch", sm: "center" } }}>
           <TextField
@@ -203,7 +263,10 @@ export function PolicyApproval() {
                     <TableRow
                       key={a.id}
                       hover
-                      onClick={() => setReviewing({ id: a.id, applicationNumber: a.application_number })}
+                      onClick={() => {
+                        setReviewingApp({ id: a.id, applicationNumber: a.application_number });
+                        setReviewOpen(true);
+                      }}
                       sx={{ cursor: "pointer" }}
                     >
                       <TableCell sx={{ fontFamily: "monospace", whiteSpace: "nowrap" }}>{a.application_number}</TableCell>
@@ -251,15 +314,27 @@ export function PolicyApproval() {
         </Paper>
       )}
 
-      {reviewing && (
-        <ApplicationReviewDialog
-          applicationId={reviewing.id}
-          applicationNumber={reviewing.applicationNumber}
-          token={token}
-          onClose={() => setReviewing(null)}
-          onApproved={loadApplications}
-        />
-      )}
+      <ApplicationReviewDialog
+        open={reviewOpen}
+        applicationId={reviewingApp?.id ?? null}
+        applicationNumber={reviewingApp?.applicationNumber}
+        token={token}
+        onClose={() => setReviewOpen(false)}
+        onApproved={loadApplications}
+      />
+
+      <Dialog open={creatingAdmin} onClose={() => setCreatingAdmin(false)} fullWidth maxWidth="sm" scroll="paper" keepMounted>
+        <DialogContent>
+          <PolicyApplication
+            adminMode
+            onClose={() => setCreatingAdmin(false)}
+            onCreated={() => {
+              setCreatingAdmin(false);
+              loadApplications();
+            }}
+          />
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

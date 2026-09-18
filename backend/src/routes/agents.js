@@ -6,6 +6,7 @@ const { validateBody, validateQuery } = require("../middleware/validate");
 const { computeAgentPremiumTotals } = require("../lib/agentPerformance");
 const {
   createAgentSchema,
+  updateAgentDetailsSchema,
   getAgentRatesQuerySchema,
   updateNetratesSchema,
   updateAgentValueTiersSchema,
@@ -48,6 +49,7 @@ router.get("/", async (req, res, next) => {
         company: { select: { agent_name: true } },
         linked_company_id: true,
         linked_company: { select: { company_name: true } },
+        payment_terms_days: true,
       },
     });
 
@@ -98,6 +100,7 @@ router.get("/", async (req, res, next) => {
         company_name: a.company?.agent_name || null,
         linked_company_id: a.linked_company_id,
         linked_company_name: a.linked_company?.company_name || null,
+        payment_terms_days: a.payment_terms_days,
         ...(canViewPremiums
           ? {
               premiums_generated: totalsByAgentId.get(a.id)?.allTime || 0,
@@ -121,7 +124,7 @@ router.get("/", async (req, res, next) => {
 // record it's backed by — see Agent.linked_company_id's own schema comment.
 router.post("/", requirePermission("MANAGE_AGENTS.ADD_AGENT"), validateBody(createAgentSchema), async (req, res, next) => {
   try {
-    const { agent_type, company_id, linked_company_id, new_company } = req.body;
+    const { agent_type, company_id, linked_company_id, new_company, payment_terms_days } = req.body;
     let { agent_code, agent_name, work_email } = req.body;
 
     if (company_id) {
@@ -201,6 +204,7 @@ router.post("/", requirePermission("MANAGE_AGENTS.ADD_AGENT"), validateBody(crea
           agent_code,
           agent_name,
           work_email,
+          payment_terms_days,
           status: "ACTIVE",
           company_id: agent_type === "INDIVIDUAL" ? company_id || null : null,
           linked_company_id: agent_type === "CORPORATE" ? finalLinkedCompanyId : null,
@@ -214,6 +218,7 @@ router.post("/", requirePermission("MANAGE_AGENTS.ADD_AGENT"), validateBody(crea
           agent_type: true,
           company_id: true,
           linked_company_id: true,
+          payment_terms_days: true,
         },
       });
 
@@ -228,6 +233,27 @@ router.post("/", requirePermission("MANAGE_AGENTS.ADD_AGENT"), validateBody(crea
 
     res.status(201).json(agent);
   } catch (err) {
+    next(err);
+  }
+});
+
+// The only edit path for an already-created agent's own basic fields today —
+// scoped to just payment_terms_days for now (agent_code/agent_name/
+// work_email/company links have no edit path at all yet; see this route's
+// own schema for why). My Agents' own small "Edit" affordance next to a
+// row's payment terms.
+router.patch("/:id", validateBody(updateAgentDetailsSchema), async (req, res, next) => {
+  try {
+    const agent = await prisma.agent.update({
+      where: { id: req.params.id },
+      data: { payment_terms_days: req.body.payment_terms_days },
+      select: { id: true, agent_code: true, agent_name: true, payment_terms_days: true },
+    });
+    res.json(agent);
+  } catch (err) {
+    if (err.code === "P2025") {
+      return res.status(404).json({ error: "Agent not found" });
+    }
     next(err);
   }
 });
@@ -292,10 +318,12 @@ router.get("/:id/netrates", validateQuery(getAgentRatesQuerySchema), async (req,
               where: { agent_id: effectiveAgentId },
               orderBy: { coverage_amount: "asc" },
             },
-            seats_based_pricing: { select: { threshold_seats: true } },
+            seats_based_pricing: {
+              select: { threshold_amount: true, exceed_threshold_amount: true, exceed_threshold_price: true },
+            },
             agent_seats_based_pricing: {
               where: { agent_id: effectiveAgentId },
-              select: { threshold_seats: true },
+              select: { threshold_amount: true, exceed_threshold_amount: true, exceed_threshold_price: true },
             },
             seats_tier_prices: { orderBy: { insured_amount_per_occupant: "asc" } },
             agent_seats_tier_prices: {
@@ -501,12 +529,13 @@ router.put(
   }
 );
 
-// Replaces (or, sending threshold_seats null, clears) this agent's seat
-// -threshold override for one coverage — a single scalar per (agent,
-// coverage, period), same contract as AgentNetrate rather than the
-// replace-all tier-list routes above. The tier menu itself (insured amount
-// per occupant + rate) is overridden separately, via the seats-tiers route
-// right below.
+// Replaces (or, sending threshold_amount/exceed_threshold_amount/
+// exceed_threshold_price null, clears) this agent's excess-of-value bracket
+// charge override for one coverage — three scalars per (agent, coverage,
+// period), always sent/cleared together, same contract as AgentNetrate
+// rather than the replace-all tier-list routes above. The tier menu itself
+// (insured amount per occupant) is overridden separately, via the
+// seats-tiers route right below.
 router.put(
   "/:id/seats-based-pricing/:coverageId",
   validateBody(updateAgentSeatsBasedPricingSchema),
@@ -516,7 +545,7 @@ router.put(
       if (!ensurePermission(res, actingPermissions, "MANAGE_AGENTS.MANAGE_AGENT_RATES")) return;
 
       const { id, coverageId } = req.params;
-      const { coverage_in_days, threshold_seats } = req.body;
+      const { coverage_in_days, threshold_amount, exceed_threshold_amount, exceed_threshold_price } = req.body;
 
       const agent = await prisma.agent.findUnique({
         where: { id },
@@ -533,15 +562,15 @@ router.put(
         return res.status(400).json({ error: `This coverage is not offered for a ${coverage_in_days}-day period` });
       }
 
-      if (threshold_seats === null) {
+      if (threshold_amount === null) {
         await prisma.agentSeatsBasedPricing.deleteMany({
           where: { agent_id: id, coverage_allowable_period_id: period.id },
         });
       } else {
         await prisma.agentSeatsBasedPricing.upsert({
           where: { agent_id_coverage_allowable_period_id: { agent_id: id, coverage_allowable_period_id: period.id } },
-          update: { threshold_seats },
-          create: { agent_id: id, coverage_allowable_period_id: period.id, threshold_seats },
+          update: { threshold_amount, exceed_threshold_amount, exceed_threshold_price },
+          create: { agent_id: id, coverage_allowable_period_id: period.id, threshold_amount, exceed_threshold_amount, exceed_threshold_price },
         });
       }
 
@@ -595,7 +624,6 @@ router.put(
               agent_id: id,
               coverage_allowable_period_id: period.id,
               insured_amount_per_occupant: t.insured_amount_per_occupant,
-              rate_per_excess_seat: t.rate_per_excess_seat,
             })),
           });
         }

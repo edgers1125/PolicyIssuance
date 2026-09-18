@@ -1,5 +1,6 @@
 const { z } = require("zod");
-const { APPLICATION_STATUSES } = require("./policyApplications");
+const { APPLICATION_STATUSES, createApplicationSchema } = require("./policyApplications");
+const { requiredString } = require("./common");
 
 // Pagination + search/filters for GET /policy-approval — same shape as
 // listApplicationsQuerySchema (reuses its APPLICATION_STATUSES), plus an
@@ -52,4 +53,26 @@ const rejectApplicationSchema = z.object({
     .max(1000, "remarks must be at most 1000 characters"),
 });
 
-module.exports = { listAllApplicationsQuerySchema, approveApplicationSchema, rejectApplicationSchema };
+// POST /admin-applications' body — exactly createApplicationSchema's shape
+// (the same PolicyApplication wizard intake a normal filing agent fills out)
+// plus a required agent_id: this route always files under a chosen agent,
+// never the caller's own (the approver filing it isn't necessarily an agent
+// at all), so unlike policyQuotations.js's own optional-with-fallback
+// agent_id override, there's no sensible default to fall back to here.
+// .and() (intersection) rather than createApplicationSchema.extend(...)
+// because createApplicationSchema is already a refined (ZodEffects) schema
+// by this point, not a plain ZodObject — .extend() isn't available on it,
+// but .and() layers the extra required field on top while still enforcing
+// every one of createApplicationSchema's own refinements.
+const createAdminApplicationSchema = createApplicationSchema.and(
+  z.object({
+    agent_id: requiredString("agent_id"),
+  })
+);
+
+module.exports = {
+  listAllApplicationsQuerySchema,
+  approveApplicationSchema,
+  rejectApplicationSchema,
+  createAdminApplicationSchema,
+};

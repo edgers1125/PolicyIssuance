@@ -5,6 +5,7 @@ const { requirePermission } = require("../middleware/permissions");
 const { validateBody, validateQuery } = require("../middleware/validate");
 const { listPayableTransactionsQuerySchema, recordPaymentSchema } = require("../schemas/agentPayables");
 const { computeAgentPremiumTotals } = require("../lib/agentPerformance");
+const { computeAgentPayableBalances, allocatePaymentFifo } = require("../lib/agentPayables");
 
 const router = express.Router();
 
@@ -19,20 +20,21 @@ router.use(requireAuth, requirePermission("MANAGE_ACCOUNTING"));
 // one row per agent: identity, premium production (the same computation
 // routes/agents.js's own GET / uses for My Agents' premium columns — see
 // lib/agentPerformance.js, shared so the two can never disagree), and the
-// agent's current payable balance. Reads Agent.payable directly — a
-// denormalized running total kept in sync by every AgentPayableTransaction
-// write (see that column's own schema comment) — rather than summing the
-// whole ledger live, specifically so this page stays fast regardless of how
-// long an agent's own transaction history grows; the ledger itself
+// agent's payable balance, split into total_payable (Agent.payable's own
+// cached running total, kept in sync by every AgentPayableTransaction write
+// — see that column's own schema comment) and overdue_payable (the portion
+// of it whose own payable-aging bucket is already past due — see
+// lib/agentPayables.js's computeAgentPayableBalances). The ledger itself
 // (GET /transactions below) remains the source of truth for auditing.
 router.get("/overview", async (req, res, next) => {
   try {
-    const [agents, totalsByAgentId] = await Promise.all([
+    const [agents, totalsByAgentId, balancesByAgentId] = await Promise.all([
       prisma.agent.findMany({
         orderBy: { agent_name: "asc" },
         select: { id: true, agent_code: true, agent_name: true, agent_type: true, payable: true },
       }),
       computeAgentPremiumTotals(prisma),
+      computeAgentPayableBalances(prisma),
     ]);
 
     res.json(
@@ -41,7 +43,8 @@ router.get("/overview", async (req, res, next) => {
         agent_code: a.agent_code,
         agent_name: a.agent_name,
         agent_type: a.agent_type,
-        payable: a.payable,
+        total_payable: a.payable,
+        overdue_payable: balancesByAgentId.get(a.id)?.overduePayable || 0,
         premiums_generated: totalsByAgentId.get(a.id)?.allTime || 0,
         premiums_generated_30d: totalsByAgentId.get(a.id)?.last30Days || 0,
       }))
@@ -88,6 +91,8 @@ router.get("/transactions", validateQuery(listPayableTransactionsQuerySchema), a
           amount: true,
           remarks: true,
           created_at: true,
+          due_date: true,
+          remaining_amount: true,
           agent: { select: { agent_code: true, agent_name: true } },
           policy: { select: { policy_number: true } },
           created_by_user: { select: { full_name: true, email: true } },
@@ -106,6 +111,11 @@ router.get("/transactions", validateQuery(listPayableTransactionsQuerySchema), a
         agent_name: r.agent.agent_name,
         policy_number: r.policy?.policy_number || null,
         created_by_name: r.created_by_user?.full_name || r.created_by_user?.email || null,
+        // Only ever set on a "bucket" row (ISSUANCE, or an ADD_COVERAGE
+        // ENDORSEMENT credit) — see lib/agentPayables.js. null for every
+        // other row, so the table can render "—" for them.
+        due_date: r.due_date,
+        remaining_amount: r.remaining_amount,
       })),
       total,
       page,
@@ -135,8 +145,8 @@ router.post(
       }
 
       const signedAmount = -amount;
-      const [transaction] = await prisma.$transaction([
-        prisma.agentPayableTransaction.create({
+      const transaction = await prisma.$transaction(async (tx) => {
+        const created = await tx.agentPayableTransaction.create({
           data: {
             agent_id,
             transaction_type: "PAYMENT",
@@ -144,9 +154,15 @@ router.post(
             remarks: remarks || null,
             created_by_user_id: req.user.userId,
           },
-        }),
-        prisma.agent.update({ where: { id: agent_id }, data: { payable: { increment: signedAmount } } }),
-      ]);
+        });
+        await tx.agent.update({ where: { id: agent_id }, data: { payable: { increment: signedAmount } } });
+        // Applies this payment automatically, oldest-due-first, across the
+        // agent's own outstanding payable-aging buckets — see
+        // lib/agentPayables.js's own note on this accepted design (no picker
+        // UI; a single payment may end up settling more than one bucket).
+        await allocatePaymentFifo(tx, agent_id, amount);
+        return created;
+      });
 
       res.status(201).json(transaction);
     } catch (err) {

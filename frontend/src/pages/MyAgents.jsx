@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useUnsavedChanges } from "../context/UnsavedChangesContext";
 import {
   Container,
   Typography,
@@ -36,10 +37,12 @@ import {
 import TuneIcon from "@mui/icons-material/Tune";
 import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
+import EditIcon from "@mui/icons-material/Edit";
 import { useAuth } from "../context/AuthContext";
 import {
   listAgents,
   createAgent,
+  updateAgent,
   listCoverages,
   listCompaniesForAgentLinking,
   getAgentNetrates,
@@ -74,7 +77,6 @@ function toFlatTierForm(tiers) {
 function toSeatTierForm(tiers) {
   return (tiers || []).map((t) => ({
     insured_amount_per_occupant: String(t.insured_amount_per_occupant),
-    rate_per_excess_seat: String(t.rate_per_excess_seat),
   }));
 }
 
@@ -96,12 +98,21 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
   // resolution) and editing here is disabled; the company's own row is
   // where these actually get changed.
   const [inheritedFrom, setInheritedFrom] = useState(null);
+  // Snapshot of `overrides` right after it's (re)loaded from the server —
+  // "dirty" is whatever has since diverged from this, not "overrides has any
+  // entries at all" (an agent can legitimately already have saved overrides
+  // on file). Kept in sync after a successful save too, so reopening the
+  // same agent/period afterward doesn't look dirty against stale data.
+  const [loadedOverrides, setLoadedOverrides] = useState({});
 
-  // Every allowable period across every coverage, loaded once per dialog
-  // open — rates/tiers below are only ever edited one period at a time, same
-  // as the Manage Coverage Pricing page. Defaults to the 1-year period.
+  // Every allowable period across every coverage — keyed on the AGENT
+  // changing (via `agent?.id`, not the dialog's own `open` toggling), so
+  // reopening the SAME agent shows whatever was last typed instead of
+  // re-fetching and clobbering it. Rates/tiers are only ever edited one
+  // period at a time, same as the Manage Coverage Pricing page. Defaults to
+  // the 1-year period.
   useEffect(() => {
-    if (!open) return;
+    if (!agent) return;
     listCoverages(token)
       .then((data) => {
         const days = Array.from(
@@ -111,10 +122,15 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
         setCoveragePeriodDays((prev) => (days.includes(prev) ? prev : (days.includes(365) ? 365 : days[0]) ?? ""));
       })
       .catch((err) => setError(err.message));
-  }, [open, token]);
+  }, [agent?.id, token]);
 
+  // Same "key off the agent id, not `open`" reasoning as above — this one
+  // also legitimately re-runs when `coveragePeriodDays` itself changes
+  // (switching periods for the same agent has to load that period's own
+  // overrides), just never merely because the dialog was closed and reopened
+  // for the same agent+period.
   useEffect(() => {
-    if (!open || !agent || !coveragePeriodDays) return;
+    if (!agent || !coveragePeriodDays) return;
     setLoading(true);
     setError("");
     getAgentNetrates(token, agent.id, coveragePeriodDays)
@@ -135,16 +151,21 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
             initial[cov.id] = { tiers: toFlatTierForm(cov.flat_tier_override) };
           } else if (cov.pricing_mode === "VEHICLE_SEATS_BASED" && (cov.seats_pricing_override || cov.seat_tier_override)) {
             initial[cov.id] = {
-              threshold_seats: cov.seats_pricing_override ? String(cov.seats_pricing_override.threshold_seats) : "",
+              threshold_amount: cov.seats_pricing_override ? String(cov.seats_pricing_override.threshold_amount) : "",
+              exceed_threshold_amount: cov.seats_pricing_override ? String(cov.seats_pricing_override.exceed_threshold_amount) : "",
+              exceed_threshold_price: cov.seats_pricing_override ? String(cov.seats_pricing_override.exceed_threshold_price) : "",
               tiers: toSeatTierForm(cov.seat_tier_override),
             };
           }
         }
         setOverrides(initial);
+        setLoadedOverrides(initial);
       })
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
-  }, [open, agent, coveragePeriodDays, token]);
+  }, [agent?.id, coveragePeriodDays, token]);
+
+  useUnsavedChanges("rates-dialog", open && JSON.stringify(overrides) !== JSON.stringify(loadedOverrides));
 
   function toggleOverride(cov) {
     setOverrides((prev) => {
@@ -154,7 +175,7 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
       } else if (cov.pricing_mode === "PERCENTAGE") {
         next[cov.id] = { netrate_percent: "", maximum_coverage: "" };
       } else if (cov.pricing_mode === "VEHICLE_SEATS_BASED") {
-        next[cov.id] = { threshold_seats: "", tiers: [] };
+        next[cov.id] = { threshold_amount: "", exceed_threshold_amount: "", exceed_threshold_price: "", tiers: [] };
       } else {
         next[cov.id] = { tiers: [] };
       }
@@ -175,8 +196,11 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
         setError("Enter a net rate for every custom-rate coverage, or uncheck it.");
         return;
       }
-      if (cov.pricing_mode === "VEHICLE_SEATS_BASED" && o.threshold_seats === "") {
-        setError(`Enter a seat threshold for ${cov.coverage_name}, or uncheck it.`);
+      if (
+        cov.pricing_mode === "VEHICLE_SEATS_BASED" &&
+        (o.threshold_amount === "" || o.exceed_threshold_amount === "" || o.exceed_threshold_price === "")
+      ) {
+        setError(`Enter a threshold, bracket amount, and bracket price for ${cov.coverage_name}, or uncheck it.`);
         return;
       }
       if (cov.pricing_mode !== "PERCENTAGE" && (!o.tiers || o.tiers.length === 0)) {
@@ -204,16 +228,24 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
         if (cov.pricing_mode === "PERCENTAGE") continue;
 
         if (cov.pricing_mode === "VEHICLE_SEATS_BASED") {
-          const currentThreshold = overrides[cov.id]?.threshold_seats ?? null;
-          const originalThreshold = cov.seats_pricing_override ? String(cov.seats_pricing_override.threshold_seats) : null;
-          if (currentThreshold !== originalThreshold) {
-            await updateAgentSeatsBasedPricing(
-              token,
-              agent.id,
-              cov.id,
-              coveragePeriodDays,
-              currentThreshold === null || currentThreshold === "" ? null : Number(currentThreshold)
-            );
+          const current = overrides[cov.id] || {};
+          const currentThreshold = current.threshold_amount ?? null;
+          const currentExceedAmount = current.exceed_threshold_amount ?? null;
+          const currentExceedPrice = current.exceed_threshold_price ?? null;
+          const originalThreshold = cov.seats_pricing_override ? String(cov.seats_pricing_override.threshold_amount) : null;
+          const originalExceedAmount = cov.seats_pricing_override ? String(cov.seats_pricing_override.exceed_threshold_amount) : null;
+          const originalExceedPrice = cov.seats_pricing_override ? String(cov.seats_pricing_override.exceed_threshold_price) : null;
+          if (
+            currentThreshold !== originalThreshold ||
+            currentExceedAmount !== originalExceedAmount ||
+            currentExceedPrice !== originalExceedPrice
+          ) {
+            const cleared = currentThreshold === null || currentThreshold === "";
+            await updateAgentSeatsBasedPricing(token, agent.id, cov.id, coveragePeriodDays, {
+              threshold_amount: cleared ? null : Number(currentThreshold),
+              exceed_threshold_amount: cleared ? null : Number(currentExceedAmount),
+              exceed_threshold_price: cleared ? null : Number(currentExceedPrice),
+            });
           }
 
           const currentTiers = overrides[cov.id]?.tiers || [];
@@ -221,7 +253,6 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
           if (!sameTiers(currentTiers, originalTiers)) {
             const tiers = currentTiers.map((t) => ({
               insured_amount_per_occupant: Number(t.insured_amount_per_occupant),
-              rate_per_excess_seat: Number(t.rate_per_excess_seat),
             }));
             const amounts = tiers.map((t) => t.insured_amount_per_occupant);
             if (new Set(amounts).size !== amounts.length) {
@@ -256,6 +287,7 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
         }
       }
 
+      setLoadedOverrides(overrides);
       onSaved();
       onClose();
     } catch (err) {
@@ -270,7 +302,7 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
   const groups = groupCoverages(coverages);
 
   return (
-    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm" keepMounted>
       <DialogTitle>Product Access &amp; Rates — {agent.agent_name}</DialogTitle>
       <DialogContent>
         {loading ? (
@@ -340,8 +372,8 @@ function RatesDialog({ open, onClose, agent, token, onSaved }) {
                                     "Priced by fixed insured-value tiers — check to give this agent a custom tier menu"}
                                   {cov.pricing_mode === "VEHICLE_SEATS_BASED" &&
                                     (cov.standard_seats_pricing
-                                      ? `${cov.standard_seats_pricing.threshold_seats}-seat threshold, ${formatPHP(cov.standard_seats_pricing.rate_per_excess_seat)}/excess seat`
-                                      : "Priced by vehicle seat count — check to give this agent a custom threshold/rate")}
+                                      ? `${formatPHP(cov.standard_seats_pricing.threshold_amount)} threshold, ${formatPHP(cov.standard_seats_pricing.exceed_threshold_price)} per ${formatPHP(cov.standard_seats_pricing.exceed_threshold_amount)} excess`
+                                      : "Priced by vehicle seat count — check to give this agent a custom threshold/bracket charge")}
                                 </Typography>
                               </>
                             }
@@ -414,10 +446,7 @@ function OverrideFields({ cov, override, onChange, disabled }) {
           { key: "rate_percentage", label: "Rate", adornment: "%", position: "end" },
         ]
       : cov.pricing_mode === "VEHICLE_SEATS_BASED"
-        ? [
-            { key: "insured_amount_per_occupant", label: "Insured amount/occupant", adornment: "₱", position: "start" },
-            { key: "rate_per_excess_seat", label: "Rate per excess seat", adornment: "₱", position: "start" },
-          ]
+        ? [{ key: "insured_amount_per_occupant", label: "Insured amount/occupant", adornment: "₱", position: "start" }]
         : [
             { key: "coverage_amount", label: "Insured value", adornment: "₱", position: "start" },
             { key: "coverage_price", label: "Price", adornment: "₱", position: "start" },
@@ -444,14 +473,35 @@ function OverrideFields({ cov, override, onChange, disabled }) {
   return (
     <Stack spacing={1.5} sx={{ pl: 4, mt: 1.5 }}>
       {cov.pricing_mode === "VEHICLE_SEATS_BASED" && (
-        <NumberField
-          label="Seat threshold"
-          value={override.threshold_seats}
-          onChange={(v) => onChange(cov.id, "threshold_seats", v)}
-          size="small"
-          disabled={disabled}
-          slotProps={{ input: { endAdornment: <InputAdornment position="end">seats</InputAdornment> } }}
-        />
+        <Stack direction="row" spacing={1}>
+          <NumberField
+            label="Threshold"
+            value={override.threshold_amount}
+            onChange={(v) => onChange(cov.id, "threshold_amount", v)}
+            size="small"
+            fullWidth
+            disabled={disabled}
+            slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+          />
+          <NumberField
+            label="Bracket amount"
+            value={override.exceed_threshold_amount}
+            onChange={(v) => onChange(cov.id, "exceed_threshold_amount", v)}
+            size="small"
+            fullWidth
+            disabled={disabled}
+            slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+          />
+          <NumberField
+            label="Bracket price"
+            value={override.exceed_threshold_price}
+            onChange={(v) => onChange(cov.id, "exceed_threshold_price", v)}
+            size="small"
+            fullWidth
+            disabled={disabled}
+            slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+          />
+        </Stack>
       )}
       {override.tiers.map((tier, index) => (
         <Stack key={index} direction="row" spacing={1} alignItems="center">
@@ -497,6 +547,7 @@ function AddAgentDialog({ open, onClose, agents, token, onCreated }) {
   const [agentCode, setAgentCode] = useState("");
   const [agentName, setAgentName] = useState("");
   const [workEmail, setWorkEmail] = useState("");
+  const [paymentTermsDays, setPaymentTermsDays] = useState("30");
   const [company, setCompany] = useState(null);
   // Only meaningful for agentType CORPORATE — whether (and how) this agency
   // is backed by a real insured-party Company record (Agent.linked_company_id).
@@ -526,6 +577,7 @@ function AddAgentDialog({ open, onClose, agents, token, onCreated }) {
     setAgentCode("");
     setAgentName("");
     setWorkEmail("");
+    setPaymentTermsDays("30");
     setCompany(null);
     setCompanyLinkMode("existing");
     setLinkedCompany(null);
@@ -533,10 +585,27 @@ function AddAgentDialog({ open, onClose, agents, token, onCreated }) {
     setError("");
   }
 
+  // Closing (Cancel/X/backdrop) never discards the in-progress draft — only
+  // a successful create does (see handleSubmit below). See CLAUDE.md's
+  // unsaved-changes convention.
   function handleClose() {
-    reset();
     onClose();
   }
+
+  const isDirty =
+    agentType !== "INDIVIDUAL" ||
+    agentCode !== "" ||
+    agentName !== "" ||
+    workEmail !== "" ||
+    paymentTermsDays !== "30" ||
+    company !== null ||
+    companyLinkMode !== "existing" ||
+    linkedCompany !== null ||
+    newCompanyForm.company_code !== "" ||
+    newCompanyForm.company_name !== "" ||
+    newCompanyForm.tin_no !== "" ||
+    newCompanyForm.email !== "";
+  useUnsavedChanges("add-agent-dialog", open && isDirty);
 
   // A CORPORATE agent is always backed by a real Company record now (either
   // branch — select existing or create new, no "none" option) and takes its
@@ -565,6 +634,7 @@ function AddAgentDialog({ open, onClose, agents, token, onCreated }) {
         agent_code: isCompanyBacked ? undefined : agentCode,
         agent_name: isCompanyBacked ? undefined : agentName,
         work_email: isCompanyBacked ? undefined : workEmail,
+        payment_terms_days: Number(paymentTermsDays),
         company_id: agentType === "INDIVIDUAL" && company ? company.id : undefined,
         linked_company_id:
           agentType === "CORPORATE" && companyLinkMode === "existing" && linkedCompany ? linkedCompany.id : undefined,
@@ -579,7 +649,8 @@ function AddAgentDialog({ open, onClose, agents, token, onCreated }) {
             : undefined,
       });
       onCreated();
-      handleClose();
+      reset();
+      onClose();
     } catch (err) {
       setError(err.message);
     } finally {
@@ -588,7 +659,7 @@ function AddAgentDialog({ open, onClose, agents, token, onCreated }) {
   }
 
   return (
-    <Dialog open={open} onClose={handleClose} fullWidth maxWidth="sm">
+    <Dialog open={open} onClose={handleClose} fullWidth maxWidth="sm" keepMounted>
       <DialogTitle>Add Agent</DialogTitle>
       <Box component="form" onSubmit={handleSubmit}>
         <DialogContent>
@@ -636,6 +707,16 @@ function AddAgentDialog({ open, onClose, agents, token, onCreated }) {
               disabled={isCompanyBacked}
               helperText={isCompanyBacked ? "Taken from the company record below" : undefined}
               fullWidth
+            />
+            <TextField
+              label="Payment terms (days)"
+              type="number"
+              value={paymentTermsDays}
+              onChange={(e) => setPaymentTermsDays(e.target.value)}
+              required
+              fullWidth
+              helperText="How many days after a policy is issued (or a coverage-adding endorsement is approved) its own commission becomes overdue for payment."
+              slotProps={{ htmlInput: { min: 0, step: 1 } }}
             />
 
             {agentType === "INDIVIDUAL" && (
@@ -733,6 +814,72 @@ function AddAgentDialog({ open, onClose, agents, token, onCreated }) {
   );
 }
 
+// My Agents' small "Edit" affordance next to a row's payment terms — the
+// only edit path for an already-created agent's own basic fields today (see
+// PATCH /agents/:id's own note). Deliberately its own tiny dialog rather
+// than folded into AddAgentDialog, which is create-only.
+function EditPaymentTermsDialog({ open, onClose, agent, token, onSaved }) {
+  const [paymentTermsDays, setPaymentTermsDays] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (agent) setPaymentTermsDays(String(agent.payment_terms_days ?? ""));
+  }, [agent]);
+
+  const isDirty = agent && paymentTermsDays !== String(agent.payment_terms_days ?? "");
+  useUnsavedChanges(`edit-agent-payment-terms-${agent?.id || "none"}`, open && Boolean(isDirty));
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError("");
+    setSubmitting(true);
+    try {
+      await updateAgent(token, agent.id, { payment_terms_days: Number(paymentTermsDays) });
+      onSaved();
+      onClose();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="xs" keepMounted>
+      <DialogTitle>Edit Payment Terms</DialogTitle>
+      <Box component="form" onSubmit={handleSubmit}>
+        <DialogContent>
+          <Stack spacing={2}>
+            {agent && (
+              <Typography variant="body2" color="text.secondary">
+                {agent.agent_name} ({agent.agent_code})
+              </Typography>
+            )}
+            <TextField
+              label="Payment terms (days)"
+              type="number"
+              value={paymentTermsDays}
+              onChange={(e) => setPaymentTermsDays(e.target.value)}
+              required
+              fullWidth
+              autoFocus
+              slotProps={{ htmlInput: { min: 0, step: 1 } }}
+            />
+            {error && <Alert severity="error">{error}</Alert>}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={onClose}>Cancel</Button>
+          <Button type="submit" variant="contained" disabled={submitting || !isDirty}>
+            {submitting ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Box>
+    </Dialog>
+  );
+}
+
 export function MyAgents() {
   const { token, permissions } = useAuth();
   const canViewPremiums = permissions?.includes("MANAGE_AGENTS.VIEW_AGENT_PREMIUMS");
@@ -741,8 +888,14 @@ export function MyAgents() {
   const [agents, setAgents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  // Split from `ratesOpen` so closing the dialog never loses which agent it
+  // was open for — RatesDialog itself is what decides whether to reload data
+  // for the (possibly unchanged) agent, see its own effects above.
   const [managingAgent, setManagingAgent] = useState(null);
+  const [ratesOpen, setRatesOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  const [editingTermsAgent, setEditingTermsAgent] = useState(null);
+  const [editTermsOpen, setEditTermsOpen] = useState(false);
 
   function loadAgents() {
     return listAgents(token).then(setAgents);
@@ -789,6 +942,7 @@ export function MyAgents() {
                 <TableCell>Type</TableCell>
                 <TableCell>Work email</TableCell>
                 <TableCell>Status</TableCell>
+                <TableCell align="right">Payment Terms</TableCell>
                 {canViewPremiums && (
                   <>
                     <TableCell align="right">Premiums generated</TableCell>
@@ -828,6 +982,21 @@ export function MyAgents() {
                       color={a.status === "ACTIVE" ? "success" : "default"}
                     />
                   </TableCell>
+                  <TableCell align="right">
+                    <Stack direction="row" spacing={0.5} sx={{ alignItems: "center", justifyContent: "flex-end" }}>
+                      <Typography variant="body2">{a.payment_terms_days} days</Typography>
+                      <IconButton
+                        size="small"
+                        onClick={() => {
+                          setEditingTermsAgent(a);
+                          setEditTermsOpen(true);
+                        }}
+                        title="Edit payment terms"
+                      >
+                        <EditIcon fontSize="inherit" />
+                      </IconButton>
+                    </Stack>
+                  </TableCell>
                   {canViewPremiums && (
                     <>
                       <TableCell align="right">{formatPHP(a.premiums_generated)}</TableCell>
@@ -855,7 +1024,14 @@ export function MyAgents() {
                   )}
                   <TableCell align="right">
                     {canManageRates ? (
-                      <IconButton size="small" onClick={() => setManagingAgent(a)} title="Manage product access & rates">
+                      <IconButton
+                        size="small"
+                        onClick={() => {
+                          setManagingAgent(a);
+                          setRatesOpen(true);
+                        }}
+                        title="Manage product access & rates"
+                      >
                         <TuneIcon fontSize="small" />
                       </IconButton>
                     ) : (
@@ -870,8 +1046,8 @@ export function MyAgents() {
       )}
 
       <RatesDialog
-        open={Boolean(managingAgent)}
-        onClose={() => setManagingAgent(null)}
+        open={ratesOpen}
+        onClose={() => setRatesOpen(false)}
         agent={managingAgent}
         token={token}
         onSaved={loadAgents}
@@ -883,6 +1059,14 @@ export function MyAgents() {
         agents={agents}
         token={token}
         onCreated={loadAgents}
+      />
+
+      <EditPaymentTermsDialog
+        open={editTermsOpen}
+        onClose={() => setEditTermsOpen(false)}
+        agent={editingTermsAgent}
+        token={token}
+        onSaved={loadAgents}
       />
     </Container>
   );

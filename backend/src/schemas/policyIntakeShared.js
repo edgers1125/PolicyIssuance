@@ -24,7 +24,12 @@ const addressInputSchema = z.object({
 const vehicleInputSchema = z.object({
   plate_number: requiredString("plate_number"),
   mv_file_no: requiredString("mv_file_no"),
-  engine_number: requiredString("engine_number"),
+  // The one vehicle identifier deliberately left optional — a real-world
+  // engine number (this schedule's own "Authentication No." — see
+  // "Scheduled Vehicle table" under PDF generation) is often illegible or
+  // simply unavailable off a Philippine OR/CR, unlike every other vehicle
+  // field below, which are all now required.
+  engine_number: z.string().optional(),
   chassis_number: requiredString("chassis_number"),
   // The Motor ProductVariant this vehicle is (or, for a brand-new one, is
   // about to be) insured under — see Vehicle.product_variant_id. Always sent
@@ -37,19 +42,24 @@ const vehicleInputSchema = z.object({
   // own product_variant_id — checked by the route, since it needs a DB
   // lookup a schema can't do.
   product_variant_id: z.string().uuid("product_variant_id must be a valid UUID"),
-  make: z.string().optional(),
-  model: z.string().optional(),
-  // The UI sends "" for a blank year field — treat that as omitted rather
-  // than an invalid number.
-  year_model: z.preprocess((v) => (v === "" ? undefined : v), z.coerce.number().int().optional()),
-  vehicle_type: z.string().optional(),
-  color: z.string().optional(),
+  make: requiredString("make"),
+  model: requiredString("model"),
+  // The UI sends "" for a blank year field — treated the same way an empty
+  // string is everywhere else (never a valid value to coerce), so it fails
+  // the same "required" message rather than a confusing NaN/type error.
+  year_model: z.preprocess(
+    (v) => (v === "" ? undefined : v),
+    z.coerce.number({ error: "year_model is required" }).int()
+  ),
+  vehicle_type: requiredString("vehicle_type"),
+  color: requiredString("color"),
   // Required — feeds the policy schedule's "1 DRIVER AND N OCCUPANTS OR
   // PASSENGERS" endorsement line (N = no_of_seats - 1).
   no_of_seats: z.coerce.number({ error: "no_of_seats is required" }).int().positive("no_of_seats must be a positive whole number"),
   // The UI sends "" for a blank value field — treat that as omitted.
-  // initial_assessment_date is deliberately not accepted here — it's stamped
-  // automatically by the route the first time a value is recorded.
+  // initial_assessment_date is deliberately not accepted here — it's only
+  // ever finalized once a policy for this vehicle is actually approved (see
+  // routes/policyApproval.js's approveApplicationRecord), never at intake.
   estimated_value: z.preprocess((v) => (v === "" ? undefined : v), z.coerce.number().nonnegative().optional()),
   existing_vehicle_id: z.string().nullable().optional(),
   // Set once the agent has confirmed a plate match against a vehicle on file
@@ -123,6 +133,28 @@ const bethelPaymentMethodRefinement = {
   path: ["bethel_payment_method_id"],
 };
 
+// Shared by createApplicationSchema and createQuotationSchema — the
+// "Solve from Gross Total" pricing mode (see lib/coveragePricing.js's
+// resolveCoverageRows). "PER_COVERAGE" (the default) is every coverage's
+// premium_amount taken exactly as entered, same as before this mode
+// existed. "TARGET_GROSS" instead requires target_gross_amount and solves
+// the product variant's own configured Gross Target Coverage's premium
+// backward from it (400s server-side if that variant has none configured,
+// or if that coverage isn't among the ones selected) — every other selected
+// coverage's premium_amount is still taken as entered.
+const PRICING_INPUT_MODES = ["PER_COVERAGE", "TARGET_GROSS"];
+const pricingModeFieldsSchema = z.object({
+  pricing_input_mode: z.enum(PRICING_INPUT_MODES).optional().default("PER_COVERAGE"),
+  target_gross_amount: z.coerce.number().positive("target_gross_amount must be greater than 0").optional(),
+});
+function refineTargetGrossAmount(data) {
+  return data.pricing_input_mode !== "TARGET_GROSS" || typeof data.target_gross_amount === "number";
+}
+const targetGrossAmountRefinement = {
+  message: "target_gross_amount is required when pricing_input_mode is TARGET_GROSS",
+  path: ["target_gross_amount"],
+};
+
 // Shared by both /policy-quotations/preview-pdf and
 // /policy-applications/preview-pdf — the exact prop shape
 // frontend/src/components/PolicySchedulePreview.jsx already takes (isPreview
@@ -176,6 +208,11 @@ const documentPreviewPropsSchema = z.object({
   // that deductible plus a fixed towing amount — see pdf/theme.js's
   // TOWING_AMOUNT). Omitted/undefined whenever the variant hasn't configured one.
   deductibleRate: z.coerce.number().nonnegative().optional(),
+  // A floor under deductibleRate's own computed figure — see
+  // ProductVariant.minimum_deductible_amount and
+  // pdf/theme.js's computeDeductibleFigures(), which takes both and prints
+  // whichever produces the higher deductible.
+  minimumDeductibleAmount: z.coerce.number().nonnegative().optional(),
   totalPremium: z.coerce.number().optional().default(0),
   docStamps: z.coerce.number().optional().default(0),
   vat: z.coerce.number().optional().default(0),
@@ -202,4 +239,8 @@ module.exports = {
   refineBethelPaymentMethod,
   bethelPaymentMethodRefinement,
   documentPreviewPropsSchema,
+  PRICING_INPUT_MODES,
+  pricingModeFieldsSchema,
+  refineTargetGrossAmount,
+  targetGrossAmountRefinement,
 };

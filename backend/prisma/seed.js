@@ -79,6 +79,12 @@ const PERMISSIONS = [
     description: "Approve or reject policy applications",
   },
   {
+    code: "APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION",
+    name: "Admin Policy Application",
+    description:
+      "File a policy application under a chosen agent that is created and approved immediately, with the filer recorded as the approver",
+  },
+  {
     code: "APPROVE_ENDORSEMENT",
     name: "Endorsement Approval",
     description: "Review, amend, approve, or reject endorsement requests against issued policies",

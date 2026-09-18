@@ -45,6 +45,7 @@ import {
 import { PdfViewer } from "./PdfViewer";
 import { NumberField } from "./NumberField";
 import { formatPHP } from "../utils/currency";
+import { useUnsavedChanges } from "../context/UnsavedChangesContext";
 
 // Mirrors ApplicationReviewDialog.jsx's own CHANGE_TYPE_LABELS. CANCEL_POLICY
 // is deliberately not listed here — it's never addable/editable as a
@@ -67,6 +68,7 @@ export const CHANGE_TYPE_LABELS = {
   ADD_COVERAGE: "Add Coverage",
   EDIT_CLAUSE: "Edit Clause",
   REMOVE_CLAUSE: "Remove Coverage",
+  VEHICLE_ESTIMATED_VALUE: "Vehicle Estimated Value",
 };
 // Used only to render an already-saved CANCEL_POLICY row's own Type chip.
 const CANCEL_POLICY_LABEL = "Cancel Policy";
@@ -80,6 +82,10 @@ export const VEHICLE_FIELD_BY_CHANGE_TYPE = {
   VEHICLE_COLOR: "color",
   VEHICLE_ENGINE_NO: "engine_number",
   VEHICLE_CHASSIS_NO: "chassis_number",
+  // Financial (see backend's EndorsementChangeType comment) — needs
+  // policy_vehicle_id like every other vehicle field here, but currentValueFor()
+  // below formats it as currency rather than the plain string these others are.
+  VEHICLE_ESTIMATED_VALUE: "estimated_value",
 };
 export const VEHICLE_CHANGE_TYPES = new Set(Object.keys(VEHICLE_FIELD_BY_CHANGE_TYPE));
 // Both target an existing PolicyCoverage line — EDIT_CLAUSE amends its
@@ -121,7 +127,7 @@ function toDateInput(value) {
 // CANCEL_POLICY line can't be edited/removed/added-to — see backend's own
 // note) — approve or reject it as filed. Never touches the underlying Policy
 // directly — see backend/src/routes/endorsements.js.
-export function EndorsementReviewDialog({ endorsementId, endorsementNumber, token, onClose, onDecided }) {
+export function EndorsementReviewDialog({ open, endorsementId, endorsementNumber, token, onClose, onDecided }) {
   const [pdfUrl, setPdfUrl] = useState(null);
   const [pdfLoading, setPdfLoading] = useState(true);
   const [pdfError, setPdfError] = useState("");
@@ -147,6 +153,12 @@ export function EndorsementReviewDialog({ endorsementId, endorsementNumber, toke
   const [deletingId, setDeletingId] = useState(null);
 
   const [confirmApprove, setConfirmApprove] = useState(false);
+  // Whether ADD_COVERAGE/REMOVE_CLAUSE/VEHICLE_ESTIMATED_VALUE lines' own
+  // ledger effect is prorated against how much of the coverage period
+  // remains from this endorsement's own effective_date (the default) or
+  // posted in full — the approver's own call, made here rather than at
+  // filing (see backend's approveEndorsementSchema).
+  const [doNotProrate, setDoNotProrate] = useState(false);
   const [approving, setApproving] = useState(false);
   const [approveError, setApproveError] = useState("");
   const [approvedFlag, setApprovedFlag] = useState(false);
@@ -200,6 +212,7 @@ export function EndorsementReviewDialog({ endorsementId, endorsementNumber, toke
     if (!endorsementId) return;
     setApprovedFlag(false);
     setConfirmApprove(false);
+    setDoNotProrate(false);
     setApproveError("");
     setFormOpen(false);
     setRejectOpen(false);
@@ -252,7 +265,10 @@ export function EndorsementReviewDialog({ endorsementId, endorsementNumber, toke
       setNewValue("");
     } else if (c.change_type === "POLICY_EFFECTIVE_DATE") {
       setNewValue(toDateInput(c.change_to));
-    } else if (c.change_type === "REMOVE_CLAUSE" || c.change_type === "ADD_COVERAGE") {
+    } else if (c.change_type === "REMOVE_CLAUSE" || c.change_type === "ADD_COVERAGE" || c.change_type === "VEHICLE_ESTIMATED_VALUE") {
+      // change_to is a pre-formatted descriptive string for these three
+      // financial types (see priceAddCoverageChange/priceVehicleValueChange),
+      // not the raw new_value input — nothing sane to prefill from it.
       setNewValue("");
     } else {
       setNewValue(c.change_type === "EDIT_CLAUSE" ? "" : c.change_to || "");
@@ -261,6 +277,10 @@ export function EndorsementReviewDialog({ endorsementId, endorsementNumber, toke
 
   function currentValueFor() {
     if (!detail || !changeType) return "";
+    if (changeType === "VEHICLE_ESTIMATED_VALUE") {
+      const vehicle = detail.vehicles.find((v) => v.id === vehicleId);
+      return vehicle ? formatPHP(vehicle.estimated_value || 0) : "";
+    }
     if (VEHICLE_CHANGE_TYPES.has(changeType)) {
       const vehicle = detail.vehicles.find((v) => v.id === vehicleId);
       return vehicle ? vehicle[VEHICLE_FIELD_BY_CHANGE_TYPE[changeType]] || "—" : "";
@@ -337,6 +357,12 @@ export function EndorsementReviewDialog({ endorsementId, endorsementNumber, toke
         postal_code: addressFields.postal_code.trim(),
         country: addressFields.country.trim(),
       };
+    } else if (changeType === "VEHICLE_ESTIMATED_VALUE") {
+      if (newValue === "" || Number.isNaN(Number(newValue)) || Number(newValue) < 0) {
+        setChangeError("Enter a valid, non-negative estimated value");
+        return;
+      }
+      payload.new_value = String(newValue);
     } else {
       if (!newValue.trim()) {
         setChangeError("Enter the new value");
@@ -381,7 +407,7 @@ export function EndorsementReviewDialog({ endorsementId, endorsementNumber, toke
     setApproving(true);
     setApproveError("");
     try {
-      await approveEndorsement(token, endorsementId);
+      await approveEndorsement(token, endorsementId, { prorate: !doNotProrate });
       setApprovedFlag(true);
       setPdfReloadKey((k) => k + 1);
       onDecided?.();
@@ -430,8 +456,27 @@ export function EndorsementReviewDialog({ endorsementId, endorsementNumber, toke
   const isCoverageTargetType = COVERAGE_TARGET_CHANGE_TYPES.has(changeType);
   const isAddCoverageType = changeType === "ADD_COVERAGE";
 
+  // Unsaved-input tracking (see context/UnsavedChangesContext.jsx) — this
+  // dialog stays mounted (keepMounted below, split open+id state on the host
+  // page) and keeps its draft across a Cancel/X/backdrop close, so the
+  // sidebar/refresh guard needs to know whenever the "Add/Edit Change" form
+  // or an open reject-reason panel actually has something to lose.
+  const changeFormHasInput = Boolean(
+    changeType ||
+      vehicleId ||
+      coverageId ||
+      productCoverageId ||
+      coverageAmount ||
+      premiumAmount ||
+      newValue.trim() ||
+      Object.values(addressFields).some((v) => v.trim()) ||
+      remarks.trim()
+  );
+  const rejectFormHasInput = rejectOpen && Boolean(rejectRemarks.trim());
+  useUnsavedChanges("endorsement-review-dialog", open && ((formOpen && changeFormHasInput) || rejectFormHasInput));
+
   return (
-    <Dialog open={Boolean(endorsementId)} onClose={onClose} fullWidth maxWidth="xl" scroll="paper">
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="xl" scroll="paper" keepMounted>
       <DialogTitle>{endorsementNumber ? `Review Endorsement ${endorsementNumber}` : "Review Endorsement"}</DialogTitle>
       <DialogContent dividers>
         <Box sx={{ display: "flex", gap: 3, flexDirection: { xs: "column", md: "row" } }}>
@@ -721,6 +766,15 @@ export function EndorsementReviewDialog({ endorsementId, endorsementNumber, toke
                             />
                             <NumberField label="Premium Amount" value={premiumAmount} onChange={setPremiumAmount} size="small" fullWidth />
                           </Stack>
+                        ) : changeType === "VEHICLE_ESTIMATED_VALUE" ? (
+                          <NumberField
+                            label="New estimated value"
+                            value={newValue}
+                            onChange={setNewValue}
+                            size="small"
+                            fullWidth
+                            helperText="Recomputes this vehicle's value-based coverage on this policy, preserving the agent's own margin"
+                          />
                         ) : (
                           changeType && (
                             <TextField
@@ -765,6 +819,12 @@ export function EndorsementReviewDialog({ endorsementId, endorsementNumber, toke
                         <Alert severity="error" sx={{ mb: 1 }}>
                           {approveError}
                         </Alert>
+                      )}
+                      {!isCancellation && (
+                        <FormControlLabel
+                          control={<Checkbox checked={doNotProrate} onChange={(e) => setDoNotProrate(e.target.checked)} />}
+                          label="Do not apply pro-rated (charge/credit the full amount for any coverage added, removed, or value-corrected on this endorsement, rather than only the portion of the remaining coverage period)"
+                        />
                       )}
                       <FormControlLabel
                         control={<Checkbox checked={confirmApprove} onChange={(e) => setConfirmApprove(e.target.checked)} />}

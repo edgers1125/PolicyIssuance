@@ -49,9 +49,23 @@ model PartyAddress {
 
 model Vehicle {
   id                      String    @id @default(uuid()) @db.Uuid
-  plate_number            String?   @db.VarChar(50)
+  // Unique at the DB level now too, alongside mv_file_no/engine_number/
+  // chassis_number below — every route that creates or edits a vehicle's
+  // plate_number already pre-checks this case-insensitively (see
+  // routes/policyApplications.js's/policyQuotations.js's own plate-uniqueness
+  // note and routes/vehicles.js's PATCH /:id), but this is the real
+  // constraint backing that, same as the other three identifiers always had.
+  // Still nullable — multiple NULLs don't collide under Postgres's own
+  // unique-index semantics.
+  plate_number            String?   @unique @db.VarChar(50)
   mv_file_no              String    @unique @db.VarChar(100)
-  engine_number           String    @unique @db.VarChar(100)
+  // Nullable — a real-world engine number (this schedule's own "Authentication
+  // No." — see pdf's "Scheduled Vehicle table") is often illegible or simply
+  // unavailable off a Philippine OR/CR, unlike every other vehicle
+  // identifier here, which stayed required (see vehicleInputSchema). Multiple
+  // NULLs don't collide under Postgres's own unique-index semantics, so the
+  // @unique constraint still holds for every vehicle that does have one.
+  engine_number           String?   @unique @db.VarChar(100)
   chassis_number          String    @unique @db.VarChar(100)
   make                    String?   @db.VarChar(100)
   model                   String?   @db.VarChar(100)

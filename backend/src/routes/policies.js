@@ -36,6 +36,7 @@ const policyDetailSelect = {
   class_name_snapshot: true,
   variant_name_snapshot: true,
   deductible_rate_snapshot: true,
+  minimum_deductible_amount_snapshot: true,
   renewed_policy_number_snapshot: true,
   issue_date: true,
   effective_date: true,
@@ -64,6 +65,11 @@ const policyDetailSelect = {
       vehicle_type_snapshot: true,
       color_snapshot: true,
       no_of_seats_snapshot: true,
+      // Live, not a snapshot — a VEHICLE_ESTIMATED_VALUE endorsement's own
+      // "current value" placeholder (routes/endorsements.js's
+      // toPolicyContext/priceVehicleValueChange) needs whatever this vehicle
+      // is actually assessed at right now, same as no other field here.
+      vehicle: { select: { estimated_value: true } },
     },
   },
   addresses: {
@@ -286,6 +292,7 @@ function toPolicyPdfProps(policy) {
       pricing_mode: c.pricing_mode_snapshot,
     })),
     deductibleRate: policy.deductible_rate_snapshot,
+    minimumDeductibleAmount: policy.minimum_deductible_amount_snapshot,
     renewingPolicyNumber: policy.renewed_policy_number_snapshot || undefined,
     totalPremium: policy.total_premium,
     docStamps: policy.doc_stamps,

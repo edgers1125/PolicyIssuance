@@ -143,8 +143,10 @@ export function listCoverages(token) {
 
 // Nested class -> variant -> coverage tree for Settings -> Manage Products
 // (MANAGE_SETTINGS.MANAGE_PRODUCTS) — create/delete each tier of the catalog.
-export function listInsuranceClasses(token) {
-  return request("/insurance-classes", { token });
+// status is "ACTIVE" (the default), "INACTIVE", or "ALL" — applied uniformly
+// at every tier server-side (see GET /insurance-classes).
+export function listInsuranceClasses(token, status) {
+  return request(`/insurance-classes${status ? `?status=${status}` : ""}`, { token });
 }
 
 export function createInsuranceClass(token, payload) {
@@ -408,18 +410,40 @@ export function rejectApplication(token, id, payload) {
   return request(`/policy-approval/${id}/reject`, { method: "POST", token, body: payload });
 }
 
+// Every active agent — APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION's "File
+// under agent" picker on the admin Policy Application form (PolicyApplication's
+// own adminMode). 403s without that permission.
+export function listAgentsForAdminApplication(token) {
+  return request("/policy-approval/agents", { token });
+}
+
+// Files a policy application under a chosen agent and immediately approves
+// it, returning the issued Policy — PolicyApplication's adminMode submit
+// path (in place of createPolicyApplication). payload is the exact same
+// shape createPolicyApplication takes, plus a required agent_id.
+export function createAdminPolicyApplication(token, payload) {
+  return request("/policy-approval/admin-applications", { method: "POST", token, body: payload });
+}
+
 export function listAgents(token) {
   return request("/agents", { token });
 }
 
 // My Agents' "Add Agent"/"Add Company" action — payload is
-// { agent_type, agent_code, agent_name, work_email, company_id?,
-// linked_company_id?, new_company? }. company_id links an INDIVIDUAL to an
-// existing CORPORATE agency; linked_company_id/new_company instead back a
-// CORPORATE agent with a real insured-party Company record (pick one
-// existing, or create a new one in the same request) — never both.
+// { agent_type, agent_code, agent_name, work_email, payment_terms_days,
+// company_id?, linked_company_id?, new_company? }. company_id links an
+// INDIVIDUAL to an existing CORPORATE agency; linked_company_id/new_company
+// instead back a CORPORATE agent with a real insured-party Company record
+// (pick one existing, or create a new one in the same request) — never both.
 export function createAgent(token, payload) {
   return request("/agents", { method: "POST", token, body: payload });
+}
+
+// My Agents' small "Edit" affordance next to a row's payment terms — the
+// only edit path for an already-created agent's own basic fields today.
+// payload is { payment_terms_days }.
+export function updateAgent(token, agentId, payload) {
+  return request(`/agents/${agentId}`, { method: "PATCH", token, body: payload });
 }
 
 // My Agents' "Add Agent" (Company type) dialog's "link an existing company"
@@ -451,14 +475,15 @@ export function updateAgentValueTiers(token, agentId, coverageId, coverageInDays
   });
 }
 
-// payload is { threshold_seats } — null clears the override back to the
-// coverage's own default. The tier menu itself (insured amount per
-// occupant + rate) is a separate override — see updateAgentSeatTiers below.
-export function updateAgentSeatsBasedPricing(token, agentId, coverageId, coverageInDays, threshold_seats) {
+// payload is { threshold_amount, exceed_threshold_amount, exceed_threshold_price }
+// — all three null clears the override back to the coverage's own default.
+// The tier menu itself (insured amount per occupant) is a separate override
+// — see updateAgentSeatTiers below.
+export function updateAgentSeatsBasedPricing(token, agentId, coverageId, coverageInDays, seatsBasedPricing) {
   return request(`/agents/${agentId}/seats-based-pricing/${coverageId}`, {
     method: "PUT",
     token,
-    body: { coverage_in_days: coverageInDays, threshold_seats },
+    body: { coverage_in_days: coverageInDays, ...seatsBasedPricing },
   });
 }
 
@@ -497,9 +522,10 @@ export function getCoveragePricing(token, coverageId, coverageInDays) {
   return request(`/coverages/${coverageId}/pricing?coverage_in_days=${coverageInDays}`, { token });
 }
 
-// payload is { pricing_mode, coverage_in_days, standard_rate?, threshold_seats? }
-// — standard_rate only applies when pricing_mode is PERCENTAGE;
-// threshold_seats only applies when it's VEHICLE_SEATS_BASED (the tier menu
+// payload is { pricing_mode, coverage_in_days, standard_rate?,
+// threshold_amount?, exceed_threshold_amount?, exceed_threshold_price? } —
+// standard_rate only applies when pricing_mode is PERCENTAGE; the
+// threshold_* trio only applies when it's VEHICLE_SEATS_BASED (the tier menu
 // itself is a separate replace-all call — see updateSeatTiers below).
 export function updateCoveragePricingMode(token, coverageId, payload) {
   return request(`/coverages/${coverageId}/pricing`, { method: "PATCH", token, body: payload });
@@ -513,8 +539,8 @@ export function updateValuePercentageTiers(token, coverageId, coverageInDays, ti
   });
 }
 
-// tiers is [{ insured_amount_per_occupant, rate_per_excess_seat }] — the
-// VEHICLE_SEATS_BASED "Insured amount for each occupant" dropdown's options.
+// tiers is [{ insured_amount_per_occupant }] — the VEHICLE_SEATS_BASED
+// "Insured amount for each occupant" dropdown's options.
 export function updateSeatTiers(token, coverageId, coverageInDays, tiers) {
   return request(`/coverages/${coverageId}/seats-tiers`, {
     method: "PUT",
@@ -689,8 +715,11 @@ export function deleteEndorsementChange(token, id, changeId) {
   return request(`/endorsements/${id}/changes/${changeId}`, { method: "DELETE", token });
 }
 
-export function approveEndorsement(token, id) {
-  return request(`/endorsements/${id}/approve`, { method: "POST", token });
+// payload is optional { prorate? } — defaults true server-side (prorate the
+// ledger effect of any ADD_COVERAGE/REMOVE_CLAUSE/VEHICLE_ESTIMATED_VALUE
+// line against the coverage period remaining); false posts the full amount.
+export function approveEndorsement(token, id, payload = {}) {
+  return request(`/endorsements/${id}/approve`, { method: "POST", token, body: payload });
 }
 
 // payload is { remarks } (required).

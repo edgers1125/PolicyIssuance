@@ -40,13 +40,15 @@ enum AgentType {
   CORPORATE
 }
 
+// Single-stage: SUBMITTED -> UNDER_REVIEW (set automatically the moment an
+// approver opens it — routes/policyApproval.js's GET /:id) -> APPROVED or
+// REJECTED, both terminal. The old multi-step DRAFT/FOR_EDIT_*/
+// PENDING_*_APPROVAL values were removed — nothing ever walked an
+// application through them, any caller with APPROVE_APPLICATION always
+// approved directly.
 enum ApplicationStatus {
-  DRAFT
   SUBMITTED
-  FOR_EDIT_MANAGER
-  FOR_EDIT_UNDERWRITING
-  PENDING_MANAGER_APPROVAL
-  PENDING_UNDERWRITING_APPROVAL
+  UNDER_REVIEW
   APPROVED
   REJECTED
 }
@@ -100,11 +102,13 @@ enum AddressRole {
 //    agent-entered amount or margin.
 //  - FLAT_TIER: the agent picks one of this coverage's fixed
 //    coverage-amount/price pairs — also no agent margin.
-//  - VEHICLE_SEATS_BASED: fully computed from the targeted vehicle's own
-//    no_of_seats against this coverage's threshold_seats/rate_per_excess_seat
-//    — charges nothing at or below the threshold, then rate_per_excess_seat
-//    for every seat beyond it. No agent-entered amount or margin, same as
-//    VALUE_PERCENTAGE.
+//  - VEHICLE_SEATS_BASED: the agent picks an insured-amount-per-occupant
+//    tier; coverage_amount is the targeted vehicle's own no_of_seats times
+//    that amount. The premium floor is an excess-of-value bracket charge
+//    against that total: nothing owed up to threshold_amount, and the
+//    excess above it is split into exceed_threshold_amount-sized brackets,
+//    each charged exceed_threshold_price. The agent can still mark up their
+//    own premium_amount above that floor, same margin model as PERCENTAGE.
 enum CoveragePricingMode {
   PERCENTAGE
   VALUE_PERCENTAGE
@@ -200,8 +204,20 @@ enum EndorsementRequestType {
 //    EndorsementRequestType) — sets Policy.policy_status to CANCELLED and
 //    debits the agent's payable ledger with a day-prorated refund of the
 //    commission already earned on this policy.
+//  - VEHICLE_ESTIMATED_VALUE: corrects one policy vehicle's assessed value,
+//    then recomputes the margin (premium minus payable-to-Bethel) of
+//    whichever single VALUE_PERCENTAGE PolicyCoverage row is priced off that
+//    vehicle and updates it in place — never add/removed, always the same
+//    row. Credits/debits the agent's payable ledger with the resulting
+//    margin *delta* (not the full new margin), same
+//    prorate-unless-told-otherwise treatment ADD_COVERAGE/REMOVE_CLAUSE now
+//    get (see routes/endorsements.js's computeProrationFactor and
+//    POST /:id/approve's own prorate flag). 400s at filing time if this
+//    vehicle has none or more than one such coverage on this policy — see
+//    routes/endorsements.js's priceVehicleValueChange.
 // See EndorsementChange (endorsements.prisma) for the extra columns
-// ADD_COVERAGE/REMOVE_CLAUSE need to carry their own pricing.
+// ADD_COVERAGE/REMOVE_CLAUSE/VEHICLE_ESTIMATED_VALUE need to carry their own
+// pricing.
 enum EndorsementChangeType {
   POLICY_EFFECTIVE_DATE
   INSURED_NAME_DETAILS
@@ -218,6 +234,7 @@ enum EndorsementChangeType {
   REMOVE_CLAUSE
   ADD_COVERAGE
   CANCEL_POLICY
+  VEHICLE_ESTIMATED_VALUE
 }
 
 // What kind of entry sits in an agent's payable ledger — see

@@ -314,13 +314,11 @@ export function PolicyApplications() {
 
       <Dialog
         open={createOpen}
-        onClose={() => {
-          setCreateOpen(false);
-          setRenewalPrefill(null);
-        }}
+        onClose={() => setCreateOpen(false)}
         fullWidth
         maxWidth="sm"
         scroll="paper"
+        keepMounted
       >
         <DialogContent>
           <PolicyApplicationCreator
@@ -329,12 +327,14 @@ export function PolicyApplications() {
             // already open) — a fresh instance rather than trying to patch
             // renewalPrefill onto a wizard that may already be mid-filled,
             // which could otherwise leave a stale mix of the abandoned
-            // attempt and the new prefill.
+            // attempt and the new prefill. Closing (Cancel/X/backdrop) only
+            // ever flips createOpen off — renewalPrefill is deliberately
+            // left alone so the wizard's in-progress draft (this same
+            // component instance, kept alive by the Dialog's own
+            // keepMounted) survives a close/reopen; only the explicit "New
+            // Application" button and a fresh ?renew= deep link reset it.
             key={renewalPrefill?.renewed_policy_id || "new"}
-            onClose={() => {
-              setCreateOpen(false);
-              setRenewalPrefill(null);
-            }}
+            onClose={() => setCreateOpen(false)}
             onCreated={loadApplications}
             renewalPrefill={renewalPrefill}
             onRenewalRequested={openRenewalPrefill}

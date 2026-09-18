@@ -128,7 +128,9 @@ router.get("/coverages/:id/pricing", ...guard, validateQuery(getPricingQuerySche
       standard_rate: percentagePricing?.standard_rate ?? null,
       value_percentage_tiers: valuePercentageTiers,
       tier_based_prices: flatTiers,
-      threshold_seats: seatsBasedPricing?.threshold_seats ?? null,
+      threshold_amount: seatsBasedPricing?.threshold_amount ?? null,
+      exceed_threshold_amount: seatsBasedPricing?.exceed_threshold_amount ?? null,
+      exceed_threshold_price: seatsBasedPricing?.exceed_threshold_price ?? null,
       seat_tier_prices: seatTiers,
     });
   } catch (err) {
@@ -142,7 +144,7 @@ router.patch("/coverages/:id/pricing", ...guard, validateBody(updatePricingModeS
     const coverage = await findCoverageOr404(res, id);
     if (!coverage) return;
 
-    const { pricing_mode, coverage_in_days, standard_rate, threshold_seats } = req.body;
+    const { pricing_mode, coverage_in_days, standard_rate, threshold_amount, exceed_threshold_amount, exceed_threshold_price } = req.body;
     const period = await findAllowablePeriodOr400(res, id, coverage_in_days);
     if (!period) return;
 
@@ -162,11 +164,16 @@ router.patch("/coverages/:id/pricing", ...guard, validateBody(updatePricingModeS
       });
     }
 
-    if (pricing_mode === "VEHICLE_SEATS_BASED" && threshold_seats !== undefined) {
+    if (
+      pricing_mode === "VEHICLE_SEATS_BASED" &&
+      threshold_amount !== undefined &&
+      exceed_threshold_amount !== undefined &&
+      exceed_threshold_price !== undefined
+    ) {
       await prisma.coverageSeatsBasedPricing.upsert({
         where: { coverage_allowable_period_id: period.id },
-        update: { threshold_seats },
-        create: { coverage_allowable_period_id: period.id, threshold_seats },
+        update: { threshold_amount, exceed_threshold_amount, exceed_threshold_price },
+        create: { coverage_allowable_period_id: period.id, threshold_amount, exceed_threshold_amount, exceed_threshold_price },
       });
     }
 
@@ -295,7 +302,6 @@ router.put(
             data: tiers.map((t) => ({
               coverage_allowable_period_id: period.id,
               insured_amount_per_occupant: t.insured_amount_per_occupant,
-              rate_per_excess_seat: t.rate_per_excess_seat,
             })),
           });
         }

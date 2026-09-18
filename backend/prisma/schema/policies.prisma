@@ -32,6 +32,11 @@ model Policy {
   // separate rate); a later change via Settings → Vehicle Rates must never
   // alter what an already-issued policy's re-exported PDF shows.
   deductible_rate_snapshot Decimal? @db.Decimal(7, 4)
+  // Frozen off ProductVariant.minimum_deductible_amount at the same moment
+  // as deductible_rate_snapshot above — see that column's own comment and
+  // pdf/theme.js's computeDeductibleFigures(), which takes both snapshots
+  // together and prints whichever produces the higher deductible.
+  minimum_deductible_amount_snapshot Decimal? @db.Decimal(18, 2)
   // Frozen off the source PolicyApplication's own renewed_policy relation at
   // approval time (its own policy_number, if the application was filed as a
   // RENEWAL) — feeds the "Renewing/Replacing:" line printed above the Period

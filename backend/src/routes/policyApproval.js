@@ -8,9 +8,11 @@ const {
   listAllApplicationsQuerySchema,
   approveApplicationSchema,
   rejectApplicationSchema,
+  createAdminApplicationSchema,
 } = require("../schemas/policyApproval");
 const { resolveVehicleRenewal, resolveRiskAddressRenewal } = require("../lib/policyConflicts");
 const { fetchByPriority } = require("../lib/priorityPagination");
+const { computeDueDate } = require("../lib/agentPayables");
 const { applicationIdParamSchema } = require("../schemas/policyApplications");
 const {
   VEHICLE_CHANGE_TYPES,
@@ -24,6 +26,7 @@ const {
   applyChangesToDetail,
   formatInsuredName,
   formatAddress,
+  createApplicationRecord,
 } = require("./policyApplications");
 const { buildPolicyApplicationPdf } = require("../pdf/policyApplicationPdf");
 const { buildPolicyPdf } = require("../pdf/policyPdf");
@@ -79,10 +82,9 @@ router.use(requireAuth, requirePermission("APPROVE_APPLICATION"));
 
 // Every application in the system, from every agent. Priority-sorted, not a
 // plain date sort: a still-undecided application (anything short of
-// APPROVED/REJECTED — in practice, always SUBMITTED, since this app never
-// actually walks an application through FOR_EDIT_*/PENDING_*_APPROVAL today)
-// always ranks above a decided one, so the queue always surfaces what still
-// needs a decision first. Within the undecided bucket, oldest `submission_date`
+// APPROVED/REJECTED — SUBMITTED or UNDER_REVIEW) always ranks above a
+// decided one, so the queue always surfaces what still needs a decision
+// first. Within the undecided bucket, oldest `submission_date`
 // first (the one that's been waiting longest gets handled first); within the
 // decided bucket, newest `created_at` first (a recent decision is more likely
 // to still be relevant/referenced than an old one) — see lib/priorityPagination.js
@@ -171,6 +173,66 @@ router.get("/", validateQuery(listAllApplicationsQuerySchema), async (req, res, 
   }
 });
 
+// Every active agent — APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION's "File
+// under agent" picker on the admin application form (see POST
+// /admin-applications below). Deliberately its own minimal route rather than
+// reusing GET /agents (routes/agents.js), which needs MANAGE_AGENTS — a
+// different permission an approver filing on an agent's behalf may not hold
+// — and returns premium/rate data this picker has no business seeing. Same
+// shape/reasoning as routes/policyQuotations.js's own GET /agents. Registered
+// before GET /:id below so Express doesn't try to parse "agents" as an
+// application id.
+router.get("/agents", requirePermission("APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION"), async (req, res, next) => {
+  try {
+    const agents = await prisma.agent.findMany({
+      where: { status: "ACTIVE" },
+      orderBy: { agent_name: "asc" },
+      select: { id: true, agent_code: true, agent_name: true },
+    });
+    res.json(agents);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Files a policy application under a chosen agent and immediately approves
+// it — the same PolicyApplication wizard/intake workflow as POST
+// /policy-applications (reusing its own createApplicationRecord()), chained
+// straight into the exact same approve workflow as POST /:id/approve
+// (reusing approveApplicationRecord() below) rather than leaving the new
+// application sitting in the ordinary SUBMITTED queue. The acting user (the
+// approver filing this) is recorded as the one who approved it, same
+// approver_id column POST /:id/approve itself writes. No coc_number/
+// sa_number here — those are approve-time-only fields the PolicyApplication
+// wizard this reuses never collects. Unlike POST /policy-applications, this
+// never fires the "now under approval, please settle payment" submission
+// email (send_policy_to_email is still stored on the row, just not acted on
+// here) — the application never actually sits under approval, so that
+// notice would misstate what just happened; only the "your policy has been
+// approved" email (send_policy_to_email_on_approval, fired from inside
+// approveApplicationRecord()) is honored.
+router.post(
+  "/admin-applications",
+  requirePermission("APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION"),
+  validateBody(createAdminApplicationSchema),
+  async (req, res, next) => {
+    try {
+      const agent = await prisma.agent.findUnique({ where: { id: req.body.agent_id } });
+      if (!agent) {
+        return res.status(400).json({ error: "agent_id does not match an existing agent" });
+      }
+
+      const application = await createApplicationRecord({ agent, body: req.body });
+      const policy = await approveApplicationRecord({ applicationId: application.id, approverUserId: req.user.userId });
+
+      res.status(201).json(policy);
+    } catch (err) {
+      if (sendIfHttpError(err, res)) return;
+      next(err);
+    }
+  }
+);
+
 // Full JSON detail for one application, not scoped to the caller's own agent
 // — mirrors GET /policy-applications/:id, plus folds in any recorded changes
 // (see applyChangesToDetail above) so an approver always sees the corrected
@@ -178,12 +240,26 @@ router.get("/", validateQuery(listAllApplicationsQuerySchema), async (req, res, 
 // vehicle/coverage ids to reference) and its change list.
 router.get("/:id", validateParams(applicationIdParamSchema), async (req, res, next) => {
   try {
-    const application = await prisma.policyApplication.findUnique({
+    let application = await prisma.policyApplication.findUnique({
       where: { id: req.params.id },
       select: applicationDetailSelect,
     });
     if (!application) {
       return res.status(404).json({ error: "Application not found" });
+    }
+
+    // Opening an application for review is what actually moves it out of the
+    // plain "Submitted" queue — this route is what the Policy Approval
+    // table's row-click always hits, so it's the one place this transition
+    // can happen without a dedicated "start review" action. Only ever
+    // advances forward (SUBMITTED -> UNDER_REVIEW, once); an application
+    // already under review or already decided is left exactly as-is.
+    if (application.status === "SUBMITTED") {
+      application = await prisma.policyApplication.update({
+        where: { id: req.params.id },
+        data: { status: "UNDER_REVIEW" },
+        select: applicationDetailSelect,
+      });
     }
 
     const changes = await prisma.policyApplicationChange.findMany({
@@ -429,9 +505,35 @@ router.post(
   validateParams(applicationIdParamSchema),
   validateBody(approveApplicationSchema),
   async (req, res, next) => {
-  try {
+    try {
+      const policy = await approveApplicationRecord({
+        applicationId: req.params.id,
+        approverUserId: req.user.userId,
+        coc_number: req.body.coc_number,
+        sa_number: req.body.sa_number,
+      });
+      res.status(201).json(policy);
+    } catch (err) {
+      if (sendIfHttpError(err, res)) return;
+      next(err);
+    }
+  }
+);
+
+// The actual "issue the Policy" logic behind POST /:id/approve above —
+// pulled into its own function so routes/policyApproval.js's own admin
+// create-and-auto-approve flow (POST /admin-applications) can run the exact
+// same approve workflow right after createApplicationRecord()
+// (routes/policyApplications.js) creates the application, with
+// approverUserId set to whichever user is actually filing (the current
+// caller either way — a human approver here, or the admin creating the
+// application there). Every business-rule rejection throws HttpError
+// instead of writing directly to `res` (which this function no longer has)
+// — both call sites already wrap their own call in a try/catch ending with
+// sendIfHttpError(err, res).
+async function approveApplicationRecord({ applicationId, approverUserId, coc_number, sa_number }) {
     const application = await prisma.policyApplication.findUnique({
-      where: { id: req.params.id },
+      where: { id: applicationId },
       select: {
         id: true,
         status: true,
@@ -463,11 +565,12 @@ router.post(
         // (see schema/policies.prisma) so the printed "Renewing/Replacing:"
         // line never needs a live join back to that other Policy row.
         renewed_policy: { select: { policy_number: true } },
-        agent: { select: { agent_code: true } },
+        agent: { select: { agent_code: true, payment_terms_days: true } },
         product_variant: {
           select: {
             variant_name: true,
             deductible_rate: true,
+            minimum_deductible_amount: true,
             insurance_class: { select: { class_name: true } },
           },
         },
@@ -487,6 +590,10 @@ router.post(
                 vehicle_type: true,
                 color: true,
                 no_of_seats: true,
+                // Needed to finalize the assessment date below — see the
+                // vehicle-finalization block right after policyVehicle rows
+                // are created.
+                initial_assessment_date: true,
               },
             },
           },
@@ -525,13 +632,13 @@ router.post(
       },
     });
     if (!application) {
-      return res.status(404).json({ error: "Application not found" });
+      throw new HttpError(404, "Application not found");
     }
     if (application.status === "APPROVED") {
-      return res.status(409).json({ error: "This application has already been approved" });
+      throw new HttpError(409, "This application has already been approved");
     }
     if (application.status === "REJECTED") {
-      return res.status(409).json({ error: "This application has been rejected and can no longer be approved" });
+      throw new HttpError(409, "This application has been rejected and can no longer be approved");
     }
 
     const changes = await prisma.policyApplicationChange.findMany({
@@ -609,8 +716,8 @@ router.post(
       const createdPolicy = await tx.policy.create({
         data: {
           policy_number: generatePolicyNumber(),
-          coc_number: req.body.coc_number ?? null,
-          sa_number: req.body.sa_number ?? null,
+          coc_number: coc_number ?? null,
+          sa_number: sa_number ?? null,
           application_id: application.id,
           customer_id: application.customer_id,
           customer_name_snapshot: customerNameSnapshot,
@@ -623,6 +730,7 @@ router.post(
           class_name_snapshot: application.product_variant.insurance_class.class_name,
           variant_name_snapshot: application.product_variant.variant_name,
           deductible_rate_snapshot: application.product_variant.deductible_rate,
+          minimum_deductible_amount_snapshot: application.product_variant.minimum_deductible_amount,
           renewed_policy_number_snapshot: application.renewed_policy?.policy_number ?? null,
           issue_date: new Date(),
           effective_date: effectiveDate,
@@ -643,7 +751,7 @@ router.post(
       // Policy.added_to_inlease boolean. Created unaccomplished; who
       // eventually uploads it isn't necessarily this approver, so
       // accomplished_by_user_id is deliberately left null here rather than
-      // set to req.user.userId.
+      // set to approverUserId.
       await tx.inLeaseBacklog.create({
         data: { policy_id: createdPolicy.id, type: "FOR_UPLOAD" },
       });
@@ -665,6 +773,25 @@ router.post(
             no_of_seats_snapshot: v.vehicle.no_of_seats,
           })),
         });
+
+        // Finalizes each not-yet-assessed vehicle's initial_assessment_date
+        // to this policy's own effective_date — the real date of inception —
+        // rather than whenever the application happened to be filed, so a
+        // later renewal's depreciation always ticks a full year from the
+        // true anniversary. A vehicle that already has one (from an earlier
+        // approved policy) is left untouched — see lib/vehicleValue.js and
+        // the reassign_owner/create branches in
+        // policyApplications.js/policyQuotations.js/vehicles.js, which all
+        // leave it null until this moment.
+        const vehicleIdsToFinalize = application.vehicles
+          .filter((v) => !v.vehicle.initial_assessment_date)
+          .map((v) => v.vehicle_id);
+        if (vehicleIdsToFinalize.length) {
+          await tx.vehicle.updateMany({
+            where: { id: { in: vehicleIdsToFinalize } },
+            data: { initial_assessment_date: effectiveDate },
+          });
+        }
       }
       if (application.addresses.length) {
         await tx.policyAddress.createMany({
@@ -699,12 +826,19 @@ router.post(
       // running-balance cache the Accounting Overview page reads) is
       // incremented in the same transaction so it can never drift from the
       // ledger it's summarizing.
+      // This ISSUANCE row is the policy's own original payable-aging bucket
+      // (see AgentPayableTransaction.due_date/remaining_amount's own schema
+      // comments and lib/agentPayables.js) — due_date is frozen off the
+      // agent's payment_terms_days as of right now, never recomputed if that
+      // value changes later.
       await tx.agentPayableTransaction.create({
         data: {
           agent_id: application.agent_id,
           policy_id: createdPolicy.id,
           transaction_type: "ISSUANCE",
           amount: agentCommission,
+          due_date: computeDueDate(createdPolicy.issue_date, application.agent.payment_terms_days),
+          remaining_amount: agentCommission,
         },
       });
       await tx.agent.update({
@@ -717,7 +851,7 @@ router.post(
       await tx.approvalHistory.create({
         data: {
           application_id: application.id,
-          approver_id: req.user.userId,
+          approver_id: approverUserId,
           decision: "APPROVED",
           decision_date: new Date(),
         },
@@ -764,12 +898,8 @@ router.post(
       }
     }
 
-    res.status(201).json(policy);
-  } catch (err) {
-    if (sendIfHttpError(err, res)) return;
-    next(err);
-  }
-});
+  return policy;
+}
 
 // Rejects the application — the approval dialog's "Reject" action. Never
 // issues a Policy; just marks the application REJECTED and logs an

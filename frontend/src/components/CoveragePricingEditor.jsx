@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useState } from "react";
 import {
   Typography,
   Box,
@@ -40,7 +40,7 @@ const PRICING_MODES = [
   { value: "PERCENTAGE", label: "Percentage of coverage amount", description: "Agent enters a coverage amount and premium, floored by the net rate." },
   { value: "VALUE_PERCENTAGE", label: "Percentage of vehicle value", description: "A tiered rate is applied automatically based on the vehicle's current (depreciated) value." },
   { value: "FLAT_TIER", label: "Fixed insured-value tiers", description: "The agent picks from a fixed menu of insured values, each with its own fixed price." },
-  { value: "VEHICLE_SEATS_BASED", label: "Vehicle seat count", description: "The agent picks an insured amount per occupant; coverage_amount is seats × that amount, and the premium floor is (seats beyond a threshold) × that tier's own rate." },
+  { value: "VEHICLE_SEATS_BASED", label: "Vehicle seat count", description: "The agent picks an insured amount per occupant; coverage_amount is seats × that amount, and the premium floor charges the insured value in excess of a threshold, in fixed-size brackets." },
 ];
 
 function toValueTierForm(tiers) {
@@ -54,7 +54,6 @@ function toFlatTierForm(tiers) {
 function toSeatTierForm(tiers) {
   return tiers.map((t) => ({
     insured_amount_per_occupant: String(t.insured_amount_per_occupant),
-    rate_per_excess_seat: String(t.rate_per_excess_seat),
   }));
 }
 
@@ -78,7 +77,16 @@ function isAddNewOption(option) {
 // the class→variant→coverage tree. `onChanged` fires after any successful
 // save (maximum_coverage, pricing mode/rate/tiers, or a newly added period)
 // so the caller can refresh its own copy of the coverage list/tree.
-export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged }) {
+// `onDirtyChange(isDirty)` reports this editor's own dirty state upward —
+// the Edit Coverage dialog folds it into its own single Save/Cancel bar.
+// `hideActions`, when true, skips rendering this editor's own Save/Cancel
+// row (and "Saved." alert) entirely — the caller drives saving/cancelling
+// instead, via the imperative handle (`save()`/`cancel()`/`isDirty`) this
+// component exposes through `ref` either way.
+export const CoveragePricingEditor = forwardRef(function CoveragePricingEditor(
+  { token, coverage, contextLabel, onChanged, onDirtyChange, hideActions },
+  ref
+) {
   const [allowablePeriods, setAllowablePeriods] = useState(coverage.allowable_periods || []);
   const [coveragePeriodDays, setCoveragePeriodDays] = useState("");
   const [pricingLoading, setPricingLoading] = useState(false);
@@ -101,8 +109,12 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
   const [originalValueTiers, setOriginalValueTiers] = useState([]);
   const [flatTiers, setFlatTiers] = useState([]);
   const [originalFlatTiers, setOriginalFlatTiers] = useState([]);
-  const [thresholdSeats, setThresholdSeats] = useState("");
-  const [originalThresholdSeats, setOriginalThresholdSeats] = useState("");
+  const [thresholdAmount, setThresholdAmount] = useState("");
+  const [originalThresholdAmount, setOriginalThresholdAmount] = useState("");
+  const [exceedThresholdAmount, setExceedThresholdAmount] = useState("");
+  const [originalExceedThresholdAmount, setOriginalExceedThresholdAmount] = useState("");
+  const [exceedThresholdPrice, setExceedThresholdPrice] = useState("");
+  const [originalExceedThresholdPrice, setOriginalExceedThresholdPrice] = useState("");
   const [seatTiers, setSeatTiers] = useState([]);
   const [originalSeatTiers, setOriginalSeatTiers] = useState([]);
 
@@ -141,9 +153,15 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
         setOriginalValueTiers(vTiers);
         setFlatTiers(fTiers);
         setOriginalFlatTiers(fTiers);
-        const threshold = data.threshold_seats !== null ? String(data.threshold_seats) : "";
-        setThresholdSeats(threshold);
-        setOriginalThresholdSeats(threshold);
+        const threshold = data.threshold_amount !== null ? String(data.threshold_amount) : "";
+        setThresholdAmount(threshold);
+        setOriginalThresholdAmount(threshold);
+        const exceedAmount = data.exceed_threshold_amount !== null ? String(data.exceed_threshold_amount) : "";
+        setExceedThresholdAmount(exceedAmount);
+        setOriginalExceedThresholdAmount(exceedAmount);
+        const exceedPrice = data.exceed_threshold_price !== null ? String(data.exceed_threshold_price) : "";
+        setExceedThresholdPrice(exceedPrice);
+        setOriginalExceedThresholdPrice(exceedPrice);
         const sTiers = toSeatTierForm(data.seat_tier_prices || []);
         setSeatTiers(sTiers);
         setOriginalSeatTiers(sTiers);
@@ -191,7 +209,9 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
       standardRatePercent !== originalStandardRatePercent ||
       !sameTiers(valueTiers, originalValueTiers) ||
       !sameTiers(flatTiers, originalFlatTiers) ||
-      thresholdSeats !== originalThresholdSeats ||
+      thresholdAmount !== originalThresholdAmount ||
+      exceedThresholdAmount !== originalExceedThresholdAmount ||
+      exceedThresholdPrice !== originalExceedThresholdPrice ||
       !sameTiers(seatTiers, originalSeatTiers),
     [
       maximumCoverage,
@@ -204,12 +224,21 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
       originalValueTiers,
       flatTiers,
       originalFlatTiers,
-      thresholdSeats,
-      originalThresholdSeats,
+      thresholdAmount,
+      originalThresholdAmount,
+      exceedThresholdAmount,
+      originalExceedThresholdAmount,
+      exceedThresholdPrice,
+      originalExceedThresholdPrice,
       seatTiers,
       originalSeatTiers,
     ]
   );
+
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDirty]);
 
   function handleCancel() {
     setMaximumCoverage(originalMaximumCoverage);
@@ -217,7 +246,9 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
     setStandardRatePercent(originalStandardRatePercent);
     setValueTiers(originalValueTiers);
     setFlatTiers(originalFlatTiers);
-    setThresholdSeats(originalThresholdSeats);
+    setThresholdAmount(originalThresholdAmount);
+    setExceedThresholdAmount(originalExceedThresholdAmount);
+    setExceedThresholdPrice(originalExceedThresholdPrice);
     setSeatTiers(originalSeatTiers);
     setError("");
   }
@@ -247,7 +278,7 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
   }
 
   function addSeatTier() {
-    setSeatTiers((prev) => [...prev, { insured_amount_per_occupant: "", rate_per_excess_seat: "" }]);
+    setSeatTiers((prev) => [...prev, { insured_amount_per_occupant: "" }]);
   }
 
   function updateSeatTier(index, field, value) {
@@ -284,7 +315,6 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
       if (pricingMode === "VEHICLE_SEATS_BASED") {
         const tiers = seatTiers.map((t) => ({
           insured_amount_per_occupant: Number(t.insured_amount_per_occupant),
-          rate_per_excess_seat: Number(t.rate_per_excess_seat),
         }));
         const amounts = tiers.map((t) => t.insured_amount_per_occupant);
         if (new Set(amounts).size !== amounts.length) {
@@ -294,19 +324,29 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
       }
       const modeChanged = pricingMode !== originalPricingMode;
       const rateChanged = pricingMode === "PERCENTAGE" && standardRatePercent !== originalStandardRatePercent;
-      const thresholdChanged = pricingMode === "VEHICLE_SEATS_BASED" && thresholdSeats !== originalThresholdSeats;
+      const thresholdChanged =
+        pricingMode === "VEHICLE_SEATS_BASED" &&
+        (thresholdAmount !== originalThresholdAmount ||
+          exceedThresholdAmount !== originalExceedThresholdAmount ||
+          exceedThresholdPrice !== originalExceedThresholdPrice);
       if (modeChanged || rateChanged || thresholdChanged) {
         if (pricingMode === "PERCENTAGE" && !standardRatePercent) {
           throw new Error("Enter a standard rate for this coverage");
         }
-        if (pricingMode === "VEHICLE_SEATS_BASED" && thresholdSeats === "") {
-          throw new Error("Enter a seat threshold for this coverage");
+        if (pricingMode === "VEHICLE_SEATS_BASED" && (thresholdAmount === "" || exceedThresholdAmount === "" || exceedThresholdPrice === "")) {
+          throw new Error("Enter a threshold, bracket amount, and bracket price for this coverage");
         }
         await updateCoveragePricingMode(token, coverage.id, {
           pricing_mode: pricingMode,
           coverage_in_days: coveragePeriodDays,
           ...(pricingMode === "PERCENTAGE" ? { standard_rate: Number(standardRatePercent) / 100 } : {}),
-          ...(pricingMode === "VEHICLE_SEATS_BASED" ? { threshold_seats: Number(thresholdSeats) } : {}),
+          ...(pricingMode === "VEHICLE_SEATS_BASED"
+            ? {
+                threshold_amount: Number(thresholdAmount),
+                exceed_threshold_amount: Number(exceedThresholdAmount),
+                exceed_threshold_price: Number(exceedThresholdPrice),
+              }
+            : {}),
         });
       }
 
@@ -323,20 +363,30 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
       setOriginalValueTiers(vTiers);
       setFlatTiers(fTiers);
       setOriginalFlatTiers(fTiers);
-      const threshold = refreshed.threshold_seats !== null ? String(refreshed.threshold_seats) : "";
-      setThresholdSeats(threshold);
-      setOriginalThresholdSeats(threshold);
+      const threshold = refreshed.threshold_amount !== null ? String(refreshed.threshold_amount) : "";
+      setThresholdAmount(threshold);
+      setOriginalThresholdAmount(threshold);
+      const exceedAmount = refreshed.exceed_threshold_amount !== null ? String(refreshed.exceed_threshold_amount) : "";
+      setExceedThresholdAmount(exceedAmount);
+      setOriginalExceedThresholdAmount(exceedAmount);
+      const exceedPrice = refreshed.exceed_threshold_price !== null ? String(refreshed.exceed_threshold_price) : "";
+      setExceedThresholdPrice(exceedPrice);
+      setOriginalExceedThresholdPrice(exceedPrice);
       const sTiers = toSeatTierForm(refreshed.seat_tier_prices || []);
       setSeatTiers(sTiers);
       setOriginalSeatTiers(sTiers);
       setSaved(true);
       onChanged?.();
+      return true;
     } catch (err) {
       setError(err.message);
+      return false;
     } finally {
       setSaving(false);
     }
   }
+
+  useImperativeHandle(ref, () => ({ save: handleSave, cancel: handleCancel, isDirty }));
 
   return (
     <Stack spacing={2}>
@@ -517,27 +567,46 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
           {pricingMode === "VEHICLE_SEATS_BASED" && (
             <Paper variant="outlined" sx={{ p: 2 }}>
               <Typography variant="subtitle2" sx={{ mb: 1.5 }}>
-                Seat threshold — {formatPeriodLabel(coveragePeriodDays)}
+                Excess-of-value threshold — {formatPeriodLabel(coveragePeriodDays)}
               </Typography>
               <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 2 }}>
-                No charge for seats at or below the threshold — only seats beyond it are charged, at whichever tier's
-                rate the agent picks below (e.g. a 7-seat threshold on a 15-seater charges for 8 seats).
+                No charge for insured value at or below the threshold — the excess above it is split into
+                bracket-sized amounts, each charged the bracket price (e.g. a ₱700,000 insured amount against a
+                ₱350,000 threshold, ₱50,000 brackets and ₱50/bracket floors the premium at ₱350).
               </Typography>
-              <NumberField
-                label="Seat threshold"
-                value={thresholdSeats}
-                onChange={setThresholdSeats}
-                fullWidth
-                slotProps={{ input: { endAdornment: <InputAdornment position="end">seats</InputAdornment> } }}
-              />
+              <Stack spacing={1.5}>
+                <NumberField
+                  label="Threshold"
+                  value={thresholdAmount}
+                  onChange={setThresholdAmount}
+                  fullWidth
+                  helperText="Insured value up to this amount is never charged."
+                  slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                />
+                <NumberField
+                  label="Bracket amount"
+                  value={exceedThresholdAmount}
+                  onChange={setExceedThresholdAmount}
+                  fullWidth
+                  helperText="The excess above the threshold is divided into brackets of this size."
+                  slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                />
+                <NumberField
+                  label="Bracket price"
+                  value={exceedThresholdPrice}
+                  onChange={setExceedThresholdPrice}
+                  fullWidth
+                  helperText="Charged once per bracket of excess insured value."
+                  slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                />
+              </Stack>
               <Divider sx={{ my: 2 }} />
               <Typography variant="subtitle2" sx={{ mb: 1.5 }}>
                 Insured amount per occupant — {formatPeriodLabel(coveragePeriodDays)}
               </Typography>
               <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 2 }}>
-                The agent picks one of these amounts; coverage_amount becomes seats × that amount, and the premium
-                floor is (seats beyond the threshold) × this tier's own rate — e.g. 15 seats at ₱100,000/occupant
-                with a 7-seat threshold insures ₱1,500,000 and floors the premium at 8 × this tier's rate.
+                The agent picks one of these amounts; coverage_amount becomes seats × that amount, then the
+                threshold/bracket charge above is applied to that total insured value.
               </Typography>
               <Stack spacing={1.5}>
                 {seatTiers.map((tier, index) => (
@@ -546,13 +615,6 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
                       label="Insured amount per occupant"
                       value={tier.insured_amount_per_occupant}
                       onChange={(v) => updateSeatTier(index, "insured_amount_per_occupant", v)}
-                      fullWidth
-                      slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
-                    />
-                    <NumberField
-                      label="Rate per excess seat"
-                      value={tier.rate_per_excess_seat}
-                      onChange={(v) => updateSeatTier(index, "rate_per_excess_seat", v)}
                       fullWidth
                       slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
                     />
@@ -568,20 +630,24 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
             </Paper>
           )}
 
-          <Divider />
+          {!hideActions && (
+            <>
+              <Divider />
 
-          <Box sx={{ display: "flex", gap: 2 }}>
-            <Button variant="contained" onClick={handleSave} disabled={!isDirty || saving}>
-              {saving ? "Saving..." : "Save"}
-            </Button>
-            {isDirty && (
-              <Button onClick={handleCancel} disabled={saving}>
-                Cancel
-              </Button>
-            )}
-          </Box>
+              <Box sx={{ display: "flex", gap: 2 }}>
+                <Button variant="contained" onClick={handleSave} disabled={!isDirty || saving}>
+                  {saving ? "Saving..." : "Save"}
+                </Button>
+                {isDirty && (
+                  <Button onClick={handleCancel} disabled={saving}>
+                    Cancel
+                  </Button>
+                )}
+              </Box>
 
-          {saved && !isDirty && <Alert severity="success">Saved.</Alert>}
+              {saved && !isDirty && <Alert severity="success">Saved.</Alert>}
+            </>
+          )}
           {error && <Alert severity="error">{error}</Alert>}
         </>
       ))}
@@ -617,4 +683,4 @@ export function CoveragePricingEditor({ token, coverage, contextLabel, onChanged
       </Dialog>
     </Stack>
   );
-}
+});

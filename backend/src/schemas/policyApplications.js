@@ -11,6 +11,9 @@ const {
   paymentFieldsSchema,
   refineBethelPaymentMethod,
   bethelPaymentMethodRefinement,
+  pricingModeFieldsSchema,
+  refineTargetGrossAmount,
+  targetGrossAmountRefinement,
 } = require("./policyIntakeShared");
 
 // Whether each class needs a vehicle, a risk address, etc. depends on a DB
@@ -47,23 +50,20 @@ const createApplicationSchema = z
     renewed_policy_id: z.string().uuid().optional(),
   })
   .merge(paymentFieldsSchema)
+  .merge(pricingModeFieldsSchema)
   .refine(refineExactlyOneParty, exactlyOnePartyRefinement)
   .refine(refineWholeDayPeriod, wholeDayPeriodRefinement)
-  .refine(refineBethelPaymentMethod, bethelPaymentMethodRefinement);
+  .refine(refineBethelPaymentMethod, bethelPaymentMethodRefinement)
+  .refine(refineTargetGrossAmount, targetGrossAmountRefinement);
 
 // Every ApplicationStatus value (enums.prisma) — kept as a plain array here,
 // same "no generated-enum import" precedent as
 // schemas/policyApplicationChanges.js's own APPLICATION_CHANGE_TYPES.
-const APPLICATION_STATUSES = [
-  "DRAFT",
-  "SUBMITTED",
-  "FOR_EDIT_MANAGER",
-  "FOR_EDIT_UNDERWRITING",
-  "PENDING_MANAGER_APPROVAL",
-  "PENDING_UNDERWRITING_APPROVAL",
-  "APPROVED",
-  "REJECTED",
-];
+// UNDER_REVIEW is set automatically the moment an approver opens a
+// SUBMITTED application (see routes/policyApproval.js's GET /:id) — there's
+// no client-facing way to set it directly, but it's still a real value this
+// status field can hold and filter on.
+const APPLICATION_STATUSES = ["SUBMITTED", "UNDER_REVIEW", "APPROVED", "REJECTED"];
 
 // Pagination + search/filters for GET /policy-applications — same shape/cap
 // (and, from here, same optional filter fields) as listQuotationsQuerySchema/

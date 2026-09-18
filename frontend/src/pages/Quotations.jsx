@@ -49,14 +49,18 @@ import { SubmitQuotationDialog } from "./SubmitQuotationDialog";
 // `policy_number` fields). Each state renders as a short, fixed-width chip —
 // the actual application/policy number (which can run long) moves into a
 // Tooltip instead of the chip's own label, so the column never stretches the
-// row to fit it. FOR_ISSUANCE/POLICY_ISSUED are both clickable, linking
-// straight to the resulting application on the Policy Applications page
+// row to fit it. FOR_ISSUANCE/POLICY_ISSUED are both clickable. POLICY_ISSUED
+// links to the resulting application on the Policy Applications page
 // (?open=<id>, which that page reads to auto-open the same detail popup a
-// row click would) so an agent/approver can jump from "what was quoted" to
-// "what it's actually become" in one click — POLICY_ISSUED still opens the
-// same application popup (the issued Policy's own detail has no dedicated
-// deep link yet), just naming the Policy number instead in both the tooltip
-// and (via the application's own detail) the popup itself.
+// row click would) since the issued Policy's own detail has no dedicated
+// deep link yet, just naming the Policy number instead in both the tooltip
+// and (via the application's own detail) the popup itself. FOR_ISSUANCE
+// instead links to the Approvals page's own Policy Approval tab
+// (?open=<id>, read by PolicyApproval.jsx the same way) — that status means
+// the application is still sitting in that exact queue waiting on a
+// decision, so an admin viewing the Quotation Tracker jumps straight to
+// where they'd actually act on it rather than to the (agent-scoped) Policy
+// Applications tracker they may not even be the filing agent for.
 function QuotationStatus({ row }) {
   if (row.status === "SUBMITTED") {
     return <Chip size="small" label="Submitted" color="default" variant="outlined" />;
@@ -66,7 +70,11 @@ function QuotationStatus({ row }) {
     <Tooltip title={isIssued ? `Policy ${row.policy_number}` : `Application ${row.converted_application_number}`}>
       <Chip
         component={RouterLink}
-        to={`/policy-application?open=${row.converted_application_id}`}
+        to={
+          isIssued
+            ? `/policy-application?open=${row.converted_application_id}`
+            : `/approvals?open=${row.converted_application_id}`
+        }
         onClick={(e) => e.stopPropagation()}
         clickable
         size="small"
@@ -202,8 +210,14 @@ export function Quotations() {
   const [error, setError] = useState("");
   const [selected, setSelected] = useState(null);
   const [createOpen, setCreateOpen] = useState(false);
+  // Each pair splits "which quotation" from "is the dialog open" — closing
+  // (Cancel/X/backdrop) only ever flips the *Open flag, never nulls the id,
+  // so the dialog's own in-progress draft survives a close/reopen of the
+  // same quotation. See CLAUDE.md's unsaved-changes convention.
   const [editingId, setEditingId] = useState(null);
+  const [editOpen, setEditOpen] = useState(false);
   const [submittingId, setSubmittingId] = useState(null);
+  const [submitOpen, setSubmitOpen] = useState(false);
 
   // Search/filter bar — server-side (see listQuotationsQuerySchema), search
   // debounced so it doesn't re-fetch on every keystroke.
@@ -375,7 +389,10 @@ export function Quotations() {
                             <IconButton
                               size="small"
                               disabled={q.converted || !canCreate}
-                              onClick={() => setEditingId(q.id)}
+                              onClick={() => {
+                                setEditingId(q.id);
+                                setEditOpen(true);
+                              }}
                               aria-label="Edit quotation"
                             >
                               <EditIcon fontSize="small" />
@@ -397,7 +414,10 @@ export function Quotations() {
                             <IconButton
                               size="small"
                               disabled={q.converted || !canCreate || !canIssue}
-                              onClick={() => setSubmittingId(q.id)}
+                              onClick={() => {
+                                setSubmittingId(q.id);
+                                setSubmitOpen(true);
+                              }}
                               aria-label="Submit as policy application"
                             >
                               <PublishIcon fontSize="small" />
@@ -435,29 +455,27 @@ export function Quotations() {
         />
       )}
 
-      <Dialog open={createOpen} onClose={() => setCreateOpen(false)} fullWidth maxWidth="sm" scroll="paper">
+      <Dialog open={createOpen} onClose={() => setCreateOpen(false)} fullWidth maxWidth="sm" scroll="paper" keepMounted>
         <DialogContent>
           <QuotationCreator onClose={() => setCreateOpen(false)} onCreated={loadQuotations} />
         </DialogContent>
       </Dialog>
 
-      {editingId && (
-        <EditQuotationDialog
-          quotationId={editingId}
-          token={token}
-          onClose={() => setEditingId(null)}
-          onSaved={loadQuotations}
-        />
-      )}
+      <EditQuotationDialog
+        open={editOpen}
+        quotationId={editingId}
+        token={token}
+        onClose={() => setEditOpen(false)}
+        onSaved={loadQuotations}
+      />
 
-      {submittingId && (
-        <SubmitQuotationDialog
-          quotationId={submittingId}
-          token={token}
-          onClose={() => setSubmittingId(null)}
-          onSubmitted={loadQuotations}
-        />
-      )}
+      <SubmitQuotationDialog
+        open={submitOpen}
+        quotationId={submittingId}
+        token={token}
+        onClose={() => setSubmitOpen(false)}
+        onSubmitted={loadQuotations}
+      />
     </Container>
   );
 }

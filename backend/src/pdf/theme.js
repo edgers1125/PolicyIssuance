@@ -227,16 +227,25 @@ const TOWING_AMOUNT = 500;
 // Section III's Deductible/Authorized Repair Limit figures for one
 // VALUE_PERCENTAGE coverage row. `amount` is that row's own coverage_amount
 // (already the targeted vehicle's current depreciated value — see
-// lib/coveragePricing.js's VALUE_PERCENTAGE branch); deductibleRate comes
-// from the filed ProductVariant (catalog.prisma). Authorized repair limit is
-// simply the deductible plus the fixed TOWING_AMOUNT — there's no separate
-// rate for it any more. Returns null for both figures whenever
-// deductibleRate isn't configured, rather than silently computing off an
-// assumed-0 rate.
-function computeDeductibleFigures(amount, deductibleRate) {
+// lib/coveragePricing.js's VALUE_PERCENTAGE branch); deductibleRate and
+// minimumDeductibleAmount both come from the filed ProductVariant
+// (catalog.prisma) — the printed deductible is whichever of the two
+// produces the higher figure (a minimum floor under the percentage-computed
+// one, e.g. for a cheaply-valued vehicle), never their sum. Authorized
+// repair limit is simply that deductible plus the fixed TOWING_AMOUNT —
+// there's no separate rate for it any more. Returns null for both figures
+// only when NEITHER deductibleRate nor minimumDeductibleAmount is
+// configured, rather than silently computing off an assumed-0 rate.
+function computeDeductibleFigures(amount, deductibleRate, minimumDeductibleAmount) {
   const hasDeductibleRate = deductibleRate !== null && deductibleRate !== undefined;
-  const deductible = hasDeductibleRate ? Number(amount) * Number(deductibleRate) : null;
-  const authorizedRepairLimit = deductible !== null ? deductible + TOWING_AMOUNT : null;
+  const hasMinimum = minimumDeductibleAmount !== null && minimumDeductibleAmount !== undefined;
+  if (!hasDeductibleRate && !hasMinimum) {
+    return { deductible: null, authorizedRepairLimit: null };
+  }
+  const rateComputed = hasDeductibleRate ? Number(amount) * Number(deductibleRate) : 0;
+  const minimum = hasMinimum ? Number(minimumDeductibleAmount) : 0;
+  const deductible = Math.max(rateComputed, minimum);
+  const authorizedRepairLimit = deductible + TOWING_AMOUNT;
   return { deductible, authorizedRepairLimit };
 }
 

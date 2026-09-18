@@ -18,26 +18,22 @@
 //     approved application always has a corresponding Policy row (see
 //     Policy.application_id), so condition 2 is what governs it from then on.
 //  2. The single most-recently-issued Policy already on file for the same
-//     vehicle/address (if any), regardless of status. When enforcing (a
-//     real commitment — creating an application, or submitting a quotation
-//     into one), an ACTIVE policy whose own expiry_date is on or after the
-//     new coverage's start blocks outright: coverage must start on or after
-//     that date. A policy that's already EXPIRED/CANCELLED/LAPSED never
-//     blocks, but is still surfaced as the renewal target so continuity is
-//     tracked. When not enforcing (a quotation's own creation — a
-//     non-binding preview), this is computed but never thrown on; the real
-//     enforcement happens later at submit time, recomputed fresh.
+//     vehicle/address (if any), regardless of status. When enforcing (the
+//     default, and every current caller — creating or editing an
+//     application or a quotation, or submitting a quotation into one), an
+//     ACTIVE policy whose own expiry_date is on or after the new coverage's
+//     start blocks outright: coverage must start on or after that date. A
+//     policy that's already EXPIRED/CANCELLED/LAPSED never blocks, but is
+//     still surfaced as the renewal target so continuity is tracked. The
+//     `enforce` option still exists for a caller that only wants to compute
+//     (never throw on) this — no current caller passes `enforce: false`,
+//     but a quotation's own creation/edit once did, before it was made to
+//     enforce the same as an application; see routes/policyQuotations.js's
+//     own comment for why.
 const prisma = require("./prisma");
 const { HttpError } = require("./httpError");
 
-const PENDING_APPLICATION_STATUSES = [
-  "DRAFT",
-  "SUBMITTED",
-  "FOR_EDIT_MANAGER",
-  "FOR_EDIT_UNDERWRITING",
-  "PENDING_MANAGER_APPROVAL",
-  "PENDING_UNDERWRITING_APPROVAL",
-];
+const PENDING_APPLICATION_STATUSES = ["SUBMITTED", "UNDER_REVIEW"];
 
 // Groups a list of {key, policy} rows (already ordered latest-issued-first)
 // down to one (the latest) per key — used for both vehicles (keyed by
