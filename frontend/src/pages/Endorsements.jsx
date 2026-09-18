@@ -151,12 +151,13 @@ function PolicyPickerDialog({ open, onClose, onSelect }) {
               label="Policy number"
               autoFocus
               slotProps={{
+                ...params.slotProps,
                 input: {
-                  ...params.InputProps,
+                  ...params.slotProps.input,
                   endAdornment: (
                     <>
                       {loading && <CircularProgress size={18} />}
-                      {params.InputProps.endAdornment}
+                      {params.slotProps.input.endAdornment}
                     </>
                   ),
                 },
