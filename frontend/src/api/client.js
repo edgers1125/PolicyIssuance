@@ -214,6 +214,31 @@ export function updateCustomer(token, id, payload) {
   return request(`/customers/${id}`, { method: "PATCH", token, body: payload });
 }
 
+// Finds an existing customer by exact email or mobile number (both unique)
+// regardless of which agent already services them — the Insured Party
+// picker's "search by email/mobile" flow. Same 404-resolves-to-null
+// convention as lookupVehicleByPlate below (no match is an expected outcome,
+// not an error).
+export async function lookupCustomerByContact(token, query) {
+  const headers = { Authorization: `Bearer ${token}` };
+  const res = await fetch(`${API_URL}/customers/lookup?query=${encodeURIComponent(query)}`, { headers });
+  if (res.status === 404) {
+    return null;
+  }
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(data?.error || `Request failed with status ${res.status}`);
+  }
+  return data;
+}
+
+// Links the caller's own agent (or, with agent_id, a chosen one) to a
+// customer found via lookupCustomerByContact above but not yet connected to
+// them — idempotent, see routes/customers.js's own POST /:id/connect.
+export function connectCustomer(token, id, payload = {}) {
+  return request(`/customers/${id}/connect`, { method: "POST", token, body: payload });
+}
+
 export function listMyCompanies(token) {
   return request("/companies", { token });
 }
@@ -229,6 +254,26 @@ export function listCompaniesByAgent(token, agentId) {
 
 export function updateCompany(token, id, payload) {
   return request(`/companies/${id}`, { method: "PATCH", token, body: payload });
+}
+
+// Same as lookupCustomerByContact above, for companies (matched by email
+// only — Company has no phone field).
+export async function lookupCompanyByContact(token, query) {
+  const headers = { Authorization: `Bearer ${token}` };
+  const res = await fetch(`${API_URL}/companies/lookup?query=${encodeURIComponent(query)}`, { headers });
+  if (res.status === 404) {
+    return null;
+  }
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(data?.error || `Request failed with status ${res.status}`);
+  }
+  return data;
+}
+
+// Same as connectCustomer above, for companies.
+export function connectCompany(token, id, payload = {}) {
+  return request(`/companies/${id}/connect`, { method: "POST", token, body: payload });
 }
 
 export function updateVehicle(token, id, payload) {
@@ -696,6 +741,14 @@ export function resendEndorsementEmail(token, id) {
 export function listEndorsementsForApproval(token, page = 1, pageSize = 20, filters = {}) {
   const qs = buildQueryString({ page, page_size: pageSize, ...filters });
   return request(`/endorsements?${qs}`, { token });
+}
+
+// The Endorsements page's own "New Admin Endorsement" policy-search
+// Autocomplete (VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT only) — every policy
+// in the system, not scoped to any one agent.
+export function listPoliciesForEndorsement(token, search = "", page = 1, pageSize = 20) {
+  const qs = buildQueryString({ page, page_size: pageSize, search });
+  return request(`/endorsements/policies?${qs}`, { token });
 }
 
 // Endorsement Approval review dialog's "Create Change" action — adds one

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
+  Container,
   Paper,
   Table,
   TableHead,
@@ -49,10 +50,14 @@ const POLICY_TYPE_COLORS = { NEW_POLICY: "default", RENEWAL: "info" };
 // it). Row click opens ApplicationReviewDialog — one wide popup with the
 // PDF on the left and the change-history/"Create Change"/"Approve" panel on
 // the right, side by side, rather than a separate Actions-column button
-// opening its own dialog. The "Policy Approval" tab of pages/Approvals.jsx —
-// no outer Container/heading of its own, since that page supplies the
-// shared page chrome + horizontal Tabs above both it and EndorsementApproval.jsx
-// (same relationship as MyClients.jsx's own two tabs).
+// opening its own dialog. Rendered directly by PolicyApplications.jsx (the
+// /policy-application route, "Policy Issuance" in the sidebar) whenever the
+// caller holds APPROVE_APPLICATION — that page picks exactly one of this or
+// its own agent-scoped tracker/"New Application" flow to show, never both
+// (own Container/heading here, same as that other view, since either one is
+// this route's entire page now — previously this was Approvals.jsx's own
+// "Policy Approval" tab, before that page was narrowed down to
+// Endorsements.jsx and this got absorbed here instead).
 export function PolicyApproval() {
   const { token, permissions } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -167,14 +172,17 @@ export function PolicyApproval() {
   }, [token]);
 
   return (
-    <>
-      {canAdminCreate && (
-        <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}>
+    <Container maxWidth="xl" sx={{ py: { xs: 3, sm: 6 } }}>
+      <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 3 }}>
+        <Typography variant="h5" sx={{ fontWeight: 700 }}>
+          Policy Applications
+        </Typography>
+        {canAdminCreate && (
           <Button variant="contained" startIcon={<AddIcon />} onClick={() => setCreatingAdmin(true)}>
             New Admin Application
           </Button>
-        </Box>
-      )}
+        )}
+      </Box>
 
       <Paper sx={{ p: 2, borderRadius: 3, mb: 2 }}>
         <Stack direction={{ xs: "column", sm: "row" }} spacing={2} sx={{ alignItems: { xs: "stretch", sm: "center" } }}>
@@ -335,6 +343,6 @@ export function PolicyApproval() {
           />
         </DialogContent>
       </Dialog>
-    </>
+    </Container>
   );
 }

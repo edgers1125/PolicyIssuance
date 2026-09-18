@@ -49,18 +49,16 @@ import { SubmitQuotationDialog } from "./SubmitQuotationDialog";
 // `policy_number` fields). Each state renders as a short, fixed-width chip —
 // the actual application/policy number (which can run long) moves into a
 // Tooltip instead of the chip's own label, so the column never stretches the
-// row to fit it. FOR_ISSUANCE/POLICY_ISSUED are both clickable. POLICY_ISSUED
-// links to the resulting application on the Policy Applications page
-// (?open=<id>, which that page reads to auto-open the same detail popup a
-// row click would) since the issued Policy's own detail has no dedicated
-// deep link yet, just naming the Policy number instead in both the tooltip
-// and (via the application's own detail) the popup itself. FOR_ISSUANCE
-// instead links to the Approvals page's own Policy Approval tab
-// (?open=<id>, read by PolicyApproval.jsx the same way) — that status means
-// the application is still sitting in that exact queue waiting on a
-// decision, so an admin viewing the Quotation Tracker jumps straight to
-// where they'd actually act on it rather than to the (agent-scoped) Policy
-// Applications tracker they may not even be the filing agent for.
+// row to fit it. FOR_ISSUANCE/POLICY_ISSUED are both clickable, linking to
+// the same /policy-application?open=<id> deep link — that page reads it to
+// auto-open the right detail popup, whichever of its two views (see
+// PolicyApplications.jsx's own note) actually renders for the caller: an
+// approver's own PolicyApproval.jsx (relevant for FOR_ISSUANCE, still
+// sitting in that exact queue awaiting a decision) or the agent tracker's
+// own ApplicationDetailDialog (POLICY_ISSUED — the issued Policy's own
+// detail has no dedicated deep link yet, so this reuses the same application
+// popup, just naming the Policy number instead in both the tooltip and, via
+// the application's own detail, the popup itself).
 function QuotationStatus({ row }) {
   if (row.status === "SUBMITTED") {
     return <Chip size="small" label="Submitted" color="default" variant="outlined" />;
@@ -70,11 +68,7 @@ function QuotationStatus({ row }) {
     <Tooltip title={isIssued ? `Policy ${row.policy_number}` : `Application ${row.converted_application_number}`}>
       <Chip
         component={RouterLink}
-        to={
-          isIssued
-            ? `/policy-application?open=${row.converted_application_id}`
-            : `/approvals?open=${row.converted_application_id}`
-        }
+        to={`/policy-application?open=${row.converted_application_id}`}
         onClick={(e) => e.stopPropagation()}
         clickable
         size="small"

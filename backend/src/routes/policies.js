@@ -1,7 +1,7 @@
 const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { requirePermission } = require("../middleware/permissions");
+const { requirePermission, requireAnyPermission, getUserPermissionCodes } = require("../middleware/permissions");
 const { validateQuery, validateParams } = require("../middleware/validate");
 const { getCurrentAgentId } = require("../lib/agent");
 const { listPoliciesQuerySchema, policyIdParamSchema, listClientsQuerySchema } = require("../schemas/policies");
@@ -343,11 +343,17 @@ function toPolicyDetail(policy) {
 // The Client Policies page — an agent's own book of already-issued policies
 // (across every one of their clients), scoped to the caller's own agent_id
 // the same way GET /policy-applications is (own-agent-only, no admin tier —
-// nothing in this request asked for a cross-agent view the way Policy
-// Approval has one).
-router.use(requireAuth, requirePermission("VIEW_POLICIES"));
+// nothing asked for a cross-agent view here the way Policy Approval has
+// one). requireAuth only at router level now — GET /:id, GET /:id/pdf, and
+// POST /:id/resend-email each apply their own requireAnyPermission below,
+// since VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT (the Endorsements page's own
+// admin-endorsement flow — see routes/endorsements.js) needs to reach those
+// three for any policy in the system, not just the caller's own agent's; the
+// other routes below (GET /, GET /clients, GET /:id/renewal-prefill) stay
+// VIEW_POLICIES-only, own-agent-scoped, same as always.
+router.use(requireAuth);
 
-router.get("/", validateQuery(listPoliciesQuerySchema), async (req, res, next) => {
+router.get("/", requirePermission("VIEW_POLICIES"), validateQuery(listPoliciesQuerySchema), async (req, res, next) => {
   try {
     const agentId = await getCurrentAgentId(req.user.userId);
     if (!agentId) {
@@ -432,7 +438,7 @@ router.get("/", validateQuery(listPoliciesQuerySchema), async (req, res, next) =
 // "an agent's own book" scoping/permission as GET / above, just grouped by
 // party instead of by policy. Registered before GET /:id so Express doesn't
 // try to parse "clients" as a policy id.
-router.get("/clients", validateQuery(listClientsQuerySchema), async (req, res, next) => {
+router.get("/clients", requirePermission("VIEW_POLICIES"), validateQuery(listClientsQuerySchema), async (req, res, next) => {
   try {
     const agentId = await getCurrentAgentId(req.user.userId);
     if (!agentId) {
@@ -538,14 +544,36 @@ router.get("/clients", validateQuery(listClientsQuerySchema), async (req, res, n
   }
 });
 
-router.get("/:id", validateParams(policyIdParamSchema), async (req, res, next) => {
+// Shared by GET /:id, GET /:id/pdf, and POST /:id/resend-email — the three
+// routes routes/endorsements.js's own admin-endorsement flow needs against
+// *any* policy (see PolicyDetailDialog.jsx, reused as-is by the Endorsements
+// page's own admin picker). VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT resolves
+// to { agentId: null } (no agent filter — any policy); an ordinary
+// VIEW_POLICIES holder resolves to their own { agentId }, same 400-then-null
+// contract as routes/endorsements.js's own resolveCreateAccess.
+async function resolvePolicyViewAccess(req, res) {
+  const codes = await getUserPermissionCodes(req.user.userId);
+  if (codes.has("VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT")) {
+    return { agentId: null };
+  }
+  const agentId = await getCurrentAgentId(req.user.userId);
+  if (!agentId) {
+    res.status(400).json({ error: "No agent is linked to this account" });
+    return null;
+  }
+  return { agentId };
+}
+
+router.get(
+  "/:id",
+  requireAnyPermission(["VIEW_POLICIES", "VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT"]),
+  validateParams(policyIdParamSchema),
+  async (req, res, next) => {
   try {
-    const agentId = await getCurrentAgentId(req.user.userId);
-    if (!agentId) {
-      return res.status(400).json({ error: "No agent is linked to this account" });
-    }
+    const access = await resolvePolicyViewAccess(req, res);
+    if (!access) return;
     const policy = await prisma.policy.findFirst({
-      where: { id: req.params.id, agent_id: agentId },
+      where: { id: req.params.id, ...(access.agentId ? { agent_id: access.agentId } : {}) },
       select: policyDetailSelect,
     });
     if (!policy) {
@@ -564,14 +592,16 @@ router.get("/:id", validateParams(policyIdParamSchema), async (req, res, next) =
 // matches exactly what was approved, even if the Vehicle/Agent/
 // ProductVariant/ProductCoverage rows it was originally sourced from have
 // since changed.
-router.get("/:id/pdf", validateParams(policyIdParamSchema), async (req, res, next) => {
+router.get(
+  "/:id/pdf",
+  requireAnyPermission(["VIEW_POLICIES", "VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT"]),
+  validateParams(policyIdParamSchema),
+  async (req, res, next) => {
   try {
-    const agentId = await getCurrentAgentId(req.user.userId);
-    if (!agentId) {
-      return res.status(400).json({ error: "No agent is linked to this account" });
-    }
+    const access = await resolvePolicyViewAccess(req, res);
+    if (!access) return;
     const policy = await prisma.policy.findFirst({
-      where: { id: req.params.id, agent_id: agentId },
+      where: { id: req.params.id, ...(access.agentId ? { agent_id: access.agentId } : {}) },
       select: policyDetailSelect,
     });
     if (!policy) {
@@ -591,14 +621,16 @@ router.get("/:id/pdf", validateParams(policyIdParamSchema), async (req, res, nex
 // client" action. Mirrors policyApplications.js's/policyQuotations.js's own
 // resend routes, just against the final Policy document (pdf/policyPdf.js)
 // instead of a pre-approval one.
-router.post("/:id/resend-email", validateParams(policyIdParamSchema), async (req, res, next) => {
+router.post(
+  "/:id/resend-email",
+  requireAnyPermission(["VIEW_POLICIES", "VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT"]),
+  validateParams(policyIdParamSchema),
+  async (req, res, next) => {
   try {
-    const agentId = await getCurrentAgentId(req.user.userId);
-    if (!agentId) {
-      return res.status(400).json({ error: "No agent is linked to this account" });
-    }
+    const access = await resolvePolicyViewAccess(req, res);
+    if (!access) return;
     const policy = await prisma.policy.findFirst({
-      where: { id: req.params.id, agent_id: agentId },
+      where: { id: req.params.id, ...(access.agentId ? { agent_id: access.agentId } : {}) },
       select: policyDetailSelect,
     });
     if (!policy) {
@@ -659,7 +691,7 @@ router.post("/:id/resend-email", validateParams(policyIdParamSchema), async (req
 // vehicles" (vehicle_indices: null) — PolicyCoverage rows don't retain which
 // vehicle a coverage was originally scoped to (see schema/policies.prisma) —
 // the agent can re-narrow it on the form same as any other application.
-router.get("/:id/renewal-prefill", validateParams(policyIdParamSchema), async (req, res, next) => {
+router.get("/:id/renewal-prefill", requirePermission("VIEW_POLICIES"), validateParams(policyIdParamSchema), async (req, res, next) => {
   try {
     const agentId = await getCurrentAgentId(req.user.userId);
     if (!agentId) {

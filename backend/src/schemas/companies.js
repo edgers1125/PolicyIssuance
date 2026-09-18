@@ -27,4 +27,30 @@ const agentIdParamSchema = z.object({
   agentId: z.string().uuid("agentId must be a valid UUID"),
 });
 
-module.exports = { companyInputSchema, createCompanySchema, agentIdParamSchema };
+// GET /companies/lookup — the "find an existing company by email" flow
+// (Company.email is unique, see that model's own schema comment) — same
+// shape as schemas/customers.js's own lookupCustomerQuerySchema.
+const lookupCompanyQuerySchema = z.object({
+  query: requiredString("query"),
+});
+
+// POST /companies/:id/connect — id is the already-existing Company to
+// connect to.
+const companyIdParamSchema = z.object({
+  id: z.string().uuid("id must be a valid UUID"),
+});
+
+// POST /companies/:id/connect's own body — same optional agent_id override
+// as createCompanySchema.
+const connectCompanySchema = z.object({
+  agent_id: z.string().uuid("agent_id must be a valid UUID").optional(),
+});
+
+module.exports = {
+  companyInputSchema,
+  createCompanySchema,
+  agentIdParamSchema,
+  lookupCompanyQuerySchema,
+  companyIdParamSchema,
+  connectCompanySchema,
+};

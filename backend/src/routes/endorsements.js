@@ -1,7 +1,7 @@
 const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { requirePermission, getUserPermissionCodes } = require("../middleware/permissions");
+const { requirePermission, requireAnyPermission, getUserPermissionCodes } = require("../middleware/permissions");
 const { validateBody, validateQuery, validateParams } = require("../middleware/validate");
 const { getCurrentAgentId } = require("../lib/agent");
 const { fetchByPriority } = require("../lib/priorityPagination");
@@ -16,6 +16,7 @@ const {
   approveEndorsementSchema,
   rejectEndorsementSchema,
   listEndorsementRequestsQuerySchema,
+  listPoliciesForEndorsementQuerySchema,
   endorsementIdParamSchema,
   endorsementChangeIdParamSchema,
   policyIdParamSchema,
@@ -39,6 +40,64 @@ const router = express.Router();
 // (VIEW_POLICIES.CREATE_ENDORSEMENT for an agent filing one, APPROVE_ENDORSEMENT
 // for the approval queue), and a caller holding only one may well lack the other.
 router.use(requireAuth);
+
+// The Endorsements page's own "New Admin Endorsement" policy-search
+// Autocomplete (VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT only) — every policy
+// in the system, not scoped to any one agent, since that's the whole point
+// of this admin flow. search matches policy_number and the frozen insured-
+// name snapshot columns (same fields Client Policies' own GET /policies
+// search matches). Registered before GET /:id and GET /policy/:policyId
+// below so Express doesn't try to parse "policies" as an endorsement id.
+router.get(
+  "/policies",
+  requirePermission("VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT"),
+  validateQuery(listPoliciesForEndorsementQuerySchema),
+  async (req, res, next) => {
+    try {
+      const { page, page_size: pageSize, search } = req.query;
+      const where = search
+        ? {
+            OR: [
+              { policy_number: { contains: search, mode: "insensitive" } },
+              { customer_name_snapshot: { contains: search, mode: "insensitive" } },
+              { company_name_snapshot: { contains: search, mode: "insensitive" } },
+            ],
+          }
+        : {};
+      const [data, total] = await Promise.all([
+        prisma.policy.findMany({
+          where,
+          orderBy: { issue_date: "desc" },
+          skip: (page - 1) * pageSize,
+          take: pageSize,
+          select: {
+            id: true,
+            policy_number: true,
+            customer_name_snapshot: true,
+            company_name_snapshot: true,
+            agent_code_snapshot: true,
+            policy_status: true,
+          },
+        }),
+        prisma.policy.count({ where }),
+      ]);
+      res.json({
+        data: data.map((p) => ({
+          id: p.id,
+          policy_number: p.policy_number,
+          insured_name: p.customer_name_snapshot || p.company_name_snapshot,
+          agent_code: p.agent_code_snapshot,
+          policy_status: p.policy_status,
+        })),
+        total,
+        page,
+        page_size: pageSize,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
@@ -72,17 +131,22 @@ const endorsementPdfSelect = {
 };
 
 // An approver holding APPROVE_ENDORSEMENT can view/resend any endorsement;
-// an agent holding VIEW_POLICIES.CREATE_ENDORSEMENT can only view/resend
-// endorsements against their own agent's policies (VIEW_POLICIES itself is
-// enough to *view* — the .CREATE_ENDORSEMENT sub-permission only gates
-// actually filing one, same "page access isn't write access" split as
-// CREATE_APPLICATION/.AGENT_ISSUANCE). Returns { agentId: null } for the
-// any-policy tier, { agentId } for the own-policy tier, or null (having
-// already written the 403/400 response) on failure — every caller does
-// `if (!access) return;` right after.
+// so can an admin holding VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT — same
+// reasoning as APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION elsewhere in this
+// app: a caller who can file an endorsement against any agent's policy also
+// needs to view/resend whatever they just filed, without a second, separate
+// "admin view" permission to grant alongside it. An ordinary agent holding
+// VIEW_POLICIES.CREATE_ENDORSEMENT can only view/resend endorsements against
+// their own agent's policies (VIEW_POLICIES itself is enough to *view* —
+// the .CREATE_ENDORSEMENT sub-permission only gates actually filing one,
+// same "page access isn't write access" split as CREATE_APPLICATION/
+// .AGENT_ISSUANCE). Returns { agentId: null } for either any-policy tier,
+// { agentId } for the own-policy tier, or null (having already written the
+// 403/400 response) on failure — every caller does `if (!access) return;`
+// right after.
 async function resolveViewAccess(req, res) {
   const codes = await getUserPermissionCodes(req.user.userId);
-  if (codes.has("APPROVE_ENDORSEMENT")) {
+  if (codes.has("APPROVE_ENDORSEMENT") || codes.has("VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT")) {
     return { agentId: null };
   }
   if (codes.has("VIEW_POLICIES")) {
@@ -94,6 +158,30 @@ async function resolveViewAccess(req, res) {
     return { agentId };
   }
   res.status(403).json({ error: "Missing required permission: VIEW_POLICIES or APPROVE_ENDORSEMENT" });
+  return null;
+}
+
+// Same any-agent-or-own-agent split as resolveViewAccess above, but for the
+// *filing* side (GET /policy/:policyId(/context), POST /, POST /preview-pdf)
+// — VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT grants { agentId: null } (file
+// against any policy in the system), VIEW_POLICIES.CREATE_ENDORSEMENT grants
+// { agentId } (own policies only), same 403/400-then-null-on-failure contract.
+async function resolveCreateAccess(req, res) {
+  const codes = await getUserPermissionCodes(req.user.userId);
+  if (codes.has("VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT")) {
+    return { agentId: null };
+  }
+  if (codes.has("VIEW_POLICIES.CREATE_ENDORSEMENT")) {
+    const agentId = await getCurrentAgentId(req.user.userId);
+    if (!agentId) {
+      res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+      return null;
+    }
+    return { agentId };
+  }
+  res.status(403).json({
+    error: "Missing required permission: VIEW_POLICIES.CREATE_ENDORSEMENT or VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT",
+  });
   return null;
 }
 
@@ -708,17 +796,29 @@ router.get("/", requirePermission("APPROVE_ENDORSEMENT"), validateQuery(listEndo
 
 // One policy's own endorsement history, every status, oldest first — the
 // Client Policies page's own two-pane dialog's "Endorsement History" list.
+// VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT also admits this (any policy, not
+// just the caller's own agent) — same reasoning as resolveCreateAccess's own
+// comment: an admin who can file against any policy needs to see its history
+// too. requirePermission("VIEW_POLICIES") alone still admits an ordinary
+// agent, own-agent-scoped, same as before.
 router.get(
   "/policy/:policyId",
-  requirePermission("VIEW_POLICIES"),
+  requireAnyPermission(["VIEW_POLICIES", "VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT"]),
   validateParams(policyIdParamSchema),
   async (req, res, next) => {
     try {
-      const agentId = await getCurrentAgentId(req.user.userId);
-      if (!agentId) {
-        return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+      const codes = await getUserPermissionCodes(req.user.userId);
+      let agentId = null;
+      if (!codes.has("VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT")) {
+        agentId = await getCurrentAgentId(req.user.userId);
+        if (!agentId) {
+          return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+        }
       }
-      const policy = await prisma.policy.findFirst({ where: { id: req.params.policyId, agent_id: agentId }, select: { id: true } });
+      const policy = await prisma.policy.findFirst({
+        where: { id: req.params.policyId, ...(agentId ? { agent_id: agentId } : {}) },
+        select: { id: true },
+      });
       if (!policy) {
         return res.status(404).json({ error: "Policy not found" });
       }
@@ -766,16 +866,14 @@ router.get(
 // existing one instead gets this same shape back from GET /:id above).
 router.get(
   "/policy/:policyId/context",
-  requirePermission("VIEW_POLICIES.CREATE_ENDORSEMENT"),
+  requireAnyPermission(["VIEW_POLICIES.CREATE_ENDORSEMENT", "VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT"]),
   validateParams(policyIdParamSchema),
   async (req, res, next) => {
     try {
-      const agentId = await getCurrentAgentId(req.user.userId);
-      if (!agentId) {
-        return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
-      }
+      const access = await resolveCreateAccess(req, res);
+      if (!access) return;
       const policy = await prisma.policy.findFirst({
-        where: { id: req.params.policyId, agent_id: agentId },
+        where: { id: req.params.policyId, ...(access.agentId ? { agent_id: access.agentId } : {}) },
         select: policyDetailSelect,
       });
       if (!policy) {
@@ -797,32 +895,42 @@ router.get(
 );
 
 // Files a new endorsement request — the Client Policies page's "Create
-// Endorsement Request" panel. An agent can only endorse their own policies;
-// every proposed change is resolved (change_from computed, never trusted
-// from the client) and saved together with the header row in one
-// transaction. endorsement_number is "<policy_number>-E<sequence_no>",
-// sequence_no counted per policy. A CANCELLATION request carries no
-// client-submitted changes at all — the server synthesizes the single
-// CANCEL_POLICY line itself (its actual payable effect is computed fresh at
-// approval, not here — see POST /:id/approve).
+// Endorsement Request" panel. An ordinary agent can only endorse their own
+// policies; a caller holding VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT instead
+// (an admin who may not even be an agent themselves) can file against any
+// policy in the system — created_by_agent_id then falls back to the policy's
+// own agent_id, same "attribute to the policy's real owning agent regardless
+// of who administratively acts on it" reasoning POST /policy-approval/:id/approve
+// already follows for its own ledger credit. Every proposed change is
+// resolved (change_from computed, never trusted from the client) and saved
+// together with the header row in one transaction. endorsement_number is
+// "<policy_number>-E<sequence_no>", sequence_no counted per policy. A
+// CANCELLATION request carries no client-submitted changes at all — the
+// server synthesizes the single CANCEL_POLICY line itself (its actual
+// payable effect is computed fresh at approval, not here — see
+// POST /:id/approve). A caller filing via the admin tier (access.agentId
+// null) has this same endorsement immediately approved too, in the same
+// request — see the call to approveEndorsementRecord() below.
 router.post(
   "/",
-  requirePermission("VIEW_POLICIES.CREATE_ENDORSEMENT"),
+  requireAnyPermission(["VIEW_POLICIES.CREATE_ENDORSEMENT", "VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT"]),
   validateBody(createEndorsementRequestSchema),
   async (req, res, next) => {
     try {
-      const agentId = await getCurrentAgentId(req.user.userId);
-      if (!agentId) {
-        return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
-      }
+      const access = await resolveCreateAccess(req, res);
+      if (!access) return;
 
       const { policy_id, request_type, effective_date, remarks, send_policy_to_email, send_policy_to_email_on_approval, changes } =
         req.body;
 
-      const policy = await prisma.policy.findFirst({ where: { id: policy_id, agent_id: agentId }, select: policyDetailSelect });
+      const policy = await prisma.policy.findFirst({
+        where: { id: policy_id, ...(access.agentId ? { agent_id: access.agentId } : {}) },
+        select: policyDetailSelect,
+      });
       if (!policy) {
         return res.status(404).json({ error: "Policy not found" });
       }
+      const filingAgentId = access.agentId || policy.agent_id;
       if (policy.policy_status === "CANCELLED") {
         return res.status(400).json({ error: "This policy has been cancelled and cannot be endorsed" });
       }
@@ -864,7 +972,7 @@ router.post(
             remarks: remarks || null,
             send_policy_to_email,
             send_policy_to_email_on_approval,
-            created_by_agent_id: agentId,
+            created_by_agent_id: filingAgentId,
             created_by_user_id: req.user.userId,
           },
         });
@@ -875,6 +983,27 @@ router.post(
 
         return endorsement;
       });
+
+      // Admin tier: file-and-approve in one action (see this route's own
+      // comment) — the "now under review" pending-draft email below is
+      // skipped entirely for the same reason POST /policy-approval/
+      // admin-applications skips its own equivalent: this endorsement never
+      // actually sits under review, so that notice would misstate what just
+      // happened. approveEndorsementRecord itself still fires
+      // send_policy_to_email_on_approval, if it was checked, once actually
+      // approved.
+      if (access.agentId === null) {
+        const approved = await approveEndorsementRecord({
+          endorsementId: created.id,
+          approverUserId: req.user.userId,
+          prorate: true,
+        });
+        return res.status(201).json({
+          id: created.id,
+          endorsement_number: created.endorsement_number,
+          status: approved.status,
+        });
+      }
 
       if (send_policy_to_email) {
         try {
@@ -917,17 +1046,18 @@ router.post(
 // submit" (same gate every other create flow in this app uses).
 router.post(
   "/preview-pdf",
-  requirePermission("VIEW_POLICIES.CREATE_ENDORSEMENT"),
+  requireAnyPermission(["VIEW_POLICIES.CREATE_ENDORSEMENT", "VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT"]),
   validateBody(createEndorsementRequestSchema),
   async (req, res, next) => {
     try {
-      const agentId = await getCurrentAgentId(req.user.userId);
-      if (!agentId) {
-        return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
-      }
+      const access = await resolveCreateAccess(req, res);
+      if (!access) return;
 
       const { policy_id, request_type, effective_date, remarks, changes } = req.body;
-      const policy = await prisma.policy.findFirst({ where: { id: policy_id, agent_id: agentId }, select: policyDetailSelect });
+      const policy = await prisma.policy.findFirst({
+        where: { id: policy_id, ...(access.agentId ? { agent_id: access.agentId } : {}) },
+        select: policyDetailSelect,
+      });
       if (!policy) {
         return res.status(404).json({ error: "Policy not found" });
       }
@@ -1308,17 +1438,15 @@ router.delete(
 // effects here: ADD_COVERAGE materializes its own PolicyCoverage row,
 // REMOVE_CLAUSE soft-deletes one, and a CANCELLATION sets the Policy itself
 // to CANCELLED — each crediting/debiting the filing agent's payable ledger
-// (see EndorsementChangeType's own comment for the full design).
-router.post(
-  "/:id/approve",
-  requirePermission("APPROVE_ENDORSEMENT"),
-  validateParams(endorsementIdParamSchema),
-  validateBody(approveEndorsementSchema),
-  async (req, res, next) => {
-    try {
-      const { prorate } = req.body;
+// (see EndorsementChangeType's own comment for the full design). Pulled into
+// its own function (not a route) so the admin-endorsement flow in POST /
+// above can call it immediately after creating an endorsement — an admin
+// filing via VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT is both the filer and the
+// approver in one action, same "create-and-approve in one step" shape
+// POST /policy-approval/admin-applications already uses for applications.
+async function approveEndorsementRecord({ endorsementId, approverUserId, prorate }) {
       const endorsement = await prisma.endorsementRequest.findUnique({
-        where: { id: req.params.id },
+        where: { id: endorsementId },
         select: {
           id: true,
           status: true,
@@ -1344,18 +1472,18 @@ router.post(
         },
       });
       if (!endorsement) {
-        return res.status(404).json({ error: "Endorsement not found" });
+        throw new HttpError(404, "Endorsement not found");
       }
       if (endorsement.status === "APPROVED") {
-        return res.status(409).json({ error: "This endorsement has already been approved" });
+        throw new HttpError(409, "This endorsement has already been approved");
       }
       if (endorsement.status === "REJECTED") {
-        return res.status(409).json({ error: "This endorsement has been rejected and can no longer be approved" });
+        throw new HttpError(409, "This endorsement has been rejected and can no longer be approved");
       }
 
       const policy = await prisma.policy.findUnique({ where: { id: endorsement.policy_id }, select: policyDetailSelect });
       if (!policy) {
-        return res.status(404).json({ error: "Policy not found" });
+        throw new HttpError(404, "Policy not found");
       }
 
       // Computed once, shared by both branches below — the policy's own
@@ -1613,7 +1741,7 @@ router.post(
         await tx.endorsementApprovalHistory.create({
           data: {
             endorsement_request_id: endorsement.id,
-            approver_id: req.user.userId,
+            approver_id: approverUserId,
             decision: "APPROVED",
             decision_date: new Date(),
           },
@@ -1664,7 +1792,24 @@ router.post(
         }
       }
 
-      res.json({ id: endorsement.id, status: "APPROVED" });
+      return { id: endorsement.id, status: "APPROVED" };
+}
+
+// Thin HTTP wrapper around approveEndorsementRecord above — resolves
+// req.params/req.body/req.user.userId and delegates.
+router.post(
+  "/:id/approve",
+  requirePermission("APPROVE_ENDORSEMENT"),
+  validateParams(endorsementIdParamSchema),
+  validateBody(approveEndorsementSchema),
+  async (req, res, next) => {
+    try {
+      const result = await approveEndorsementRecord({
+        endorsementId: req.params.id,
+        approverUserId: req.user.userId,
+        prorate: req.body.prorate,
+      });
+      res.json(result);
     } catch (err) {
       if (sendIfHttpError(err, res)) return;
       next(err);

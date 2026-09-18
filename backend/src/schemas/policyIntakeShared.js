@@ -8,10 +8,10 @@ const { requiredString } = require("./common");
 const addressInputSchema = z.object({
   address_line_1: requiredString("address_line_1"),
   address_line_2: z.string().optional(),
-  barangay: z.string().optional(),
+  barangay: requiredString("barangay"),
   city: requiredString("city"),
   province: requiredString("province"),
-  postal_code: z.string().optional(),
+  postal_code: requiredString("postal_code"),
   country: z.string().optional(),
   existing_address_id: z.string().nullable().optional(),
   // Only meaningful for a risk address on a Property application/quotation —
@@ -70,16 +70,23 @@ const vehicleInputSchema = z.object({
 
 const coverageSelectionSchema = z.object({
   coverage_id: requiredString("coverage_id"),
-  // .positive() (not .nonnegative()) is deliberate: a selected coverage with
-  // a 0 coverage_amount/premium_amount isn't a real selection, it's an
-  // unfilled-in one — and 0 is exactly what an empty form field coerces to
-  // (Number("") === 0), so .nonnegative() let a coverage the agent never
-  // actually priced sail through as if it were a valid ₱0.00 selection.
-  // This is on top of, not instead of, resolveCoverageRows's own DB-backed
-  // pricing checks (see lib/coveragePricing.js) — this only catches the
-  // shape-level "was anything entered at all" case.
+  // coverage_amount stays .positive() — a selected coverage insuring ₱0 of
+  // value isn't a real selection, it's an unfilled-in one (0 is exactly what
+  // an empty form field coerces to, Number("") === 0). This is on top of,
+  // not instead of, resolveCoverageRows's own DB-backed pricing checks (see
+  // lib/coveragePricing.js) — this only catches the shape-level "was
+  // anything entered at all" case.
   coverage_amount: z.coerce.number({ error: "coverage_amount is required" }).positive("coverage_amount must be greater than 0"),
-  premium_amount: z.coerce.number({ error: "premium_amount is required" }).positive("premium_amount must be greater than 0"),
+  // premium_amount is .nonnegative(), not .positive() — a VEHICLE_SEATS_BASED
+  // coverage whose insured amount falls at or under its own bracket
+  // threshold prices at exactly ₱0 payable to Bethel (see
+  // resolveCoverageRows's own VEHICLE_SEATS_BASED branch), and an agent is
+  // entitled to charge exactly that floor with no margin at all — a
+  // legitimate ₱0 premium, not an unfilled field. resolveCoverageRows's own
+  // floor check (premium_amount must never come in below payable_to_bethel)
+  // is what actually guards against a genuinely-too-low submission; this
+  // schema only rejects a negative number.
+  premium_amount: z.coerce.number({ error: "premium_amount is required" }).nonnegative("premium_amount cannot be negative"),
   // Indices into the `vehicles` array this coverage applies to — null/omitted
   // means the whole policy/quotation (every vehicle); a non-empty array
   // means exactly those vehicles (e.g. [0, 2] for vehicle 1 and 3 of a

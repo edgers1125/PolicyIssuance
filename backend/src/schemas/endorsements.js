@@ -77,7 +77,12 @@ const endorsementChangeInputSchema = z
     remarks: z.string().optional(),
     product_coverage_id: z.string().uuid("product_coverage_id must be a valid UUID").optional(),
     coverage_amount: z.coerce.number({ error: "coverage_amount is required" }).positive().optional(),
-    premium_amount: z.coerce.number({ error: "premium_amount is required" }).positive().optional(),
+    // .nonnegative(), not .positive() — same reasoning as
+    // policyIntakeShared.js's own coverageSelectionSchema: a VEHICLE_SEATS_BASED
+    // coverage priced at or under its own bracket threshold legitimately
+    // floors at ₱0 payable to Bethel, and an ADD_COVERAGE endorsement can
+    // target one of those same coverages.
+    premium_amount: z.coerce.number({ error: "premium_amount is required" }).nonnegative().optional(),
   })
   .superRefine((data, ctx) => {
     if (VEHICLE_CHANGE_TYPES.has(data.change_type) && !data.policy_vehicle_id) {
@@ -181,6 +186,16 @@ const listEndorsementRequestsQuerySchema = z.object({
   request_type: z.enum(REQUEST_TYPES).optional(),
 });
 
+// GET /endorsements/policies — the Endorsements page's own "New Admin
+// Endorsement" policy-search Autocomplete (VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT
+// only). page_size capped smaller than the usual tracker lists (100) since
+// this only ever backs a type-ahead dropdown, never a full table.
+const listPoliciesForEndorsementQuerySchema = z.object({
+  page: z.coerce.number().int().positive().optional().default(1),
+  page_size: z.coerce.number().int().positive().max(50).optional().default(20),
+  search: z.string().trim().optional(),
+});
+
 const endorsementIdParamSchema = z.object({
   id: z.string().uuid("id must be a valid UUID"),
 });
@@ -202,6 +217,7 @@ module.exports = {
   createEndorsementRequestSchema,
   endorsementChangeSchema,
   approveEndorsementSchema,
+  listPoliciesForEndorsementQuerySchema,
   rejectEndorsementSchema,
   listEndorsementRequestsQuerySchema,
   endorsementIdParamSchema,

@@ -11,7 +11,7 @@ import { ManageProducts } from "./pages/ManageProducts";
 import { AuthorizedPaymentMethods } from "./pages/AuthorizedPaymentMethods";
 import { PolicyApplications } from "./pages/PolicyApplications";
 import { Quotations } from "./pages/Quotations";
-import { Approvals } from "./pages/Approvals";
+import { Endorsements } from "./pages/Endorsements";
 import { MyClients } from "./pages/MyClients";
 import { MyAgents } from "./pages/MyAgents";
 import { Accounting } from "./pages/Accounting";
@@ -38,7 +38,7 @@ function App() {
         <Route
           path="/policy-application"
           element={
-            <RequirePermission permission="CREATE_APPLICATION">
+            <RequirePermission permission={["CREATE_APPLICATION", "APPROVE_APPLICATION"]}>
               <PolicyApplications />
             </RequirePermission>
           }
@@ -68,10 +68,10 @@ function App() {
           }
         />
         <Route
-          path="/approvals"
+          path="/endorsements"
           element={
-            <RequirePermission permission={["APPROVE_APPLICATION", "APPROVE_ENDORSEMENT"]}>
-              <Approvals />
+            <RequirePermission permission={["APPROVE_ENDORSEMENT", "VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT"]}>
+              <Endorsements />
             </RequirePermission>
           }
         />

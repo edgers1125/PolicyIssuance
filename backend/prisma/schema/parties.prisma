@@ -27,7 +27,10 @@ model Customer {
   birthday      DateTime?      @db.Date
   gender        String?        @db.VarChar(20)
   email         String         @unique @db.VarChar(255)
-  mobile_number String?        @db.VarChar(50)
+  // Unique (nullable-unique — Postgres allows multiple NULLs) alongside
+  // email, so either one reliably identifies a single customer for
+  // routes/customers.js's own GET /lookup — see that route's comment.
+  mobile_number String?        @unique @db.VarChar(50)
   company_id    String?        @db.Uuid
   status        CustomerStatus
   created_at    DateTime       @default(now())

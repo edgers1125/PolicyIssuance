@@ -417,10 +417,26 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
   // the two can never drift apart. FLAT_TIER never shows an editable premium
   // field at all (no agent margin — see lib/coveragePricing.js) or a Profit
   // line, since its premium is always exactly what's payable to Bethel.
+  // Same layout/wording as PolicyApplication.jsx's/QuotationCreator.jsx's own
+  // renderCoverageDetails (net rate caption, clause text, and a cleanly
+  // stacked success Alert with one fact per line) — this dialog's own
+  // version used to cram everything into a single run-on paragraph instead.
   function renderCoverageDetails(cov, selection, resolved) {
     if (!selection) return null;
     return (
       <Box sx={{ pl: 4, pb: 1 }}>
+        {cov.pricing_mode === "PERCENTAGE" && (
+          <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 1 }}>
+            Your net rate: <strong>{formatRate(cov.rate)}</strong>
+            {cov.is_custom_rate ? " (your rate)" : " (standard rate)"}
+          </Typography>
+        )}
+        {cov.clause && (
+          <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 1 }}>
+            {cov.clause}
+          </Typography>
+        )}
+
         {cov.pricing_mode === "PERCENTAGE" && (
           <Grid container spacing={2} sx={{ mb: 1 }}>
             <Grid size={6}>
@@ -451,7 +467,7 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
           >
             {(cov.tier_based_prices || []).map((tier) => (
               <MenuItem key={tier.id} value={String(tier.coverage_amount)}>
-                {formatPHP(tier.coverage_amount)} — {formatPHP(tier.coverage_price)}
+                {formatPHP(tier.coverage_amount)}
               </MenuItem>
             ))}
           </TextField>
@@ -480,35 +496,69 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
             ))}
           </TextField>
         )}
+        {cov.pricing_mode === "VALUE_PERCENTAGE" && resolved.pending && (
+          <Alert severity="info" sx={{ mb: 1 }}>
+            {resolved.noTier
+              ? "No pricing tier is set up yet for this coverage — contact Settings."
+              : "Priced automatically once the vehicle's estimated value is assessed."}
+          </Alert>
+        )}
+
         {!resolved.pending && (
           <>
             {cov.pricing_mode !== "FLAT_TIER" && (
-              <NumberField
-                label="Premium amount (your price)"
-                value={selection.premium_amount}
-                onChange={(v) => updateCoverageField(cov.id, "premium_amount", v)}
-                required
-                fullWidth
-                size="small"
-                error={resolved.belowMinimum}
-                helperText={
-                  resolved.belowMinimum
-                    ? `Below the amount payable to Bethel of ${formatPHP(resolved.minPremiumPerVehicle)}`
-                    : ""
-                }
-                slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
-              />
+              <Grid container spacing={2}>
+                <Grid size={6}>
+                  <NumberField
+                    label="Premium amount (your price)"
+                    value={selection.premium_amount}
+                    onChange={(v) => updateCoverageField(cov.id, "premium_amount", v)}
+                    required
+                    fullWidth
+                    size="small"
+                    error={resolved.belowMinimum}
+                    helperText={
+                      resolved.belowMinimum
+                        ? `Below the amount payable to Bethel of ${formatPHP(resolved.minPremiumPerVehicle)}`
+                        : ""
+                    }
+                    slotProps={{ input: { startAdornment: <InputAdornment position="start">₱</InputAdornment> } }}
+                  />
+                </Grid>
+              </Grid>
             )}
             <Alert severity="success" sx={{ mt: 1 }}>
-              Payable to Bethel: <strong>{formatPHP(resolved.payable_to_bethel)}</strong>
-              {cov.pricing_mode === "FLAT_TIER" && (
-                <>
-                  {" "}(fixed premium — no agent margin)
-                </>
-              )}
-              {resolved.hasPremium && !resolved.belowMinimum && cov.pricing_mode !== "FLAT_TIER" && (
-                <> &mdash; Your profit: <strong>{formatPHP(resolved.agentEarnings)}</strong></>
-              )}
+              <Stack spacing={0.25}>
+                {cov.pricing_mode === "VALUE_PERCENTAGE" && (
+                  <>
+                    <span>
+                      Insured value: <strong>{formatPHP(resolved.coverage_amount)}</strong>
+                    </span>
+                    <span>
+                      Rate: <strong>{formatRate(resolved.effectiveRate)}</strong>
+                    </span>
+                  </>
+                )}
+                {cov.pricing_mode === "VEHICLE_SEATS_BASED" && (
+                  <span>
+                    Insured amount: <strong>{formatPHP(resolved.coverage_amount)}</strong>{" "}
+                    (threshold {formatPHP(cov.seats_threshold_amount)})
+                  </span>
+                )}
+                {cov.pricing_mode === "FLAT_TIER" && (
+                  <span>
+                    Premium: <strong>{formatPHP(resolved.premium_amount)}</strong> (fixed — no agent margin)
+                  </span>
+                )}
+                <span>
+                  Payable to Bethel: <strong>{formatPHP(resolved.payable_to_bethel)}</strong>
+                </span>
+                {resolved.hasPremium && !resolved.belowMinimum && cov.pricing_mode !== "FLAT_TIER" && (
+                  <span>
+                    Your Profit: <strong>{formatPHP(resolved.agentEarnings)}</strong>
+                  </span>
+                )}
+              </Stack>
             </Alert>
           </>
         )}

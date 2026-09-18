@@ -2,9 +2,16 @@ const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
 const { requirePermission, requireAnyPermission, ensureAnyPermission, getUserPermissionCodes, INTAKE_PERMISSIONS } = require("../middleware/permissions");
-const { validateBody, validateParams } = require("../middleware/validate");
+const { validateBody, validateQuery, validateParams } = require("../middleware/validate");
 const { getCurrentAgentId, getAccessibleAgentIds } = require("../lib/agent");
-const { companyInputSchema, createCompanySchema, agentIdParamSchema } = require("../schemas/companies");
+const {
+  companyInputSchema,
+  createCompanySchema,
+  agentIdParamSchema,
+  lookupCompanyQuerySchema,
+  companyIdParamSchema,
+  connectCompanySchema,
+} = require("../schemas/companies");
 
 // Callers allowed to create a brand-new company under an agent other than
 // their own — same two "choose an agent" permissions POST /policy-quotations
@@ -81,6 +88,30 @@ router.get("/", requireAnyPermission(INTAKE_PERMISSIONS), async (req, res, next)
   }
 });
 
+// Deliberately not scoped to the agent's own companies — Company.email is
+// unique (see that model's own schema comment), so an exact match always
+// identifies a single real company regardless of which agent(s) already
+// service them. Mirrors routes/customers.js's own GET /lookup. Registered
+// before PATCH /:id so a caller can't collide with an actual company id.
+router.get("/lookup", requireAnyPermission(INTAKE_PERMISSIONS), validateQuery(lookupCompanyQuerySchema), async (req, res, next) => {
+  try {
+    const query = req.query.query.trim();
+
+    const company = await prisma.company.findFirst({
+      where: { email: { equals: query, mode: "insensitive" } },
+      select: { id: true, company_code: true, company_name: true, tin_no: true, email: true, status: true },
+    });
+
+    if (!company) {
+      return res.status(404).json({ error: "No company found with that email" });
+    }
+
+    res.json(company);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post("/", requireAnyPermission(INTAKE_PERMISSIONS), validateBody(createCompanySchema), async (req, res, next) => {
   try {
     // agent_id (optional) — same reasoning/gate as routes/customers.js's own
@@ -130,6 +161,51 @@ router.post("/", requireAnyPermission(INTAKE_PERMISSIONS), validateBody(createCo
     next(err);
   }
 });
+
+// Links the caller's own agent (or a chosen one, same ADMIN_CREATE_PERMISSIONS
+// override as elsewhere) to a company found via GET /lookup above — same
+// "many agents can share one insured party, so only ever add a link"
+// reasoning as routes/customers.js's own POST /:id/connect. Idempotent.
+router.post(
+  "/:id/connect",
+  requireAnyPermission(INTAKE_PERMISSIONS),
+  validateParams(companyIdParamSchema),
+  validateBody(connectCompanySchema),
+  async (req, res, next) => {
+    try {
+      let agentId;
+      if (req.body.agent_id) {
+        const actingPermissions = await getUserPermissionCodes(req.user.userId);
+        if (!ensureAnyPermission(res, actingPermissions, ADMIN_CREATE_PERMISSIONS)) return;
+        const agent = await prisma.agent.findUnique({ where: { id: req.body.agent_id } });
+        if (!agent) {
+          return res.status(400).json({ error: "agent_id does not match an existing agent" });
+        }
+        agentId = agent.id;
+      } else {
+        agentId = await getCurrentAgentId(req.user.userId);
+        if (!agentId) {
+          return res.status(400).json({ error: "Your account isn't linked to an agent profile" });
+        }
+      }
+
+      const company = await prisma.company.findUnique({ where: { id: req.params.id } });
+      if (!company) {
+        return res.status(404).json({ error: "No company found with that id" });
+      }
+
+      await prisma.companyAgent.upsert({
+        where: { company_id_agent_id: { company_id: company.id, agent_id: agentId } },
+        create: { company_id: company.id, agent_id: agentId },
+        update: {},
+      });
+
+      res.json(company);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 router.patch("/:id", requireAnyPermission(INTAKE_PERMISSIONS), validateBody(companyInputSchema), async (req, res, next) => {
   try {

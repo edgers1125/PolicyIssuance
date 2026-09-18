@@ -36,6 +36,7 @@ import { formatPHP } from "../utils/currency";
 import { StatusChip, STATUS_LABELS } from "../components/StatusChip";
 import { ApplicationDetailDialog } from "../components/ApplicationDetailDialog";
 import { PolicyApplication as PolicyApplicationCreator } from "./PolicyApplication";
+import { PolicyApproval } from "./PolicyApproval";
 
 function fmtDate(value) {
   if (!value) return "—";
@@ -44,7 +45,23 @@ function fmtDate(value) {
   return d.toLocaleDateString("en-PH", { year: "numeric", month: "short", day: "numeric" });
 }
 
+// The /policy-application route ("Policy Issuance" in the sidebar) now
+// admits either CREATE_APPLICATION or APPROVE_APPLICATION (see App.jsx) —
+// this top-level export picks exactly one of the two views to render based
+// on which the caller holds, never both: an approver sees PolicyApproval.jsx
+// (the cross-agent queue + "New Admin Application"), an agent sees this
+// file's own PolicyApplicationsAgentView below (their own tracker + "New
+// Application"). A caller is expected to hold only one of the two
+// permissions in practice; if somehow both are held, the approver view wins
+// (it's the more privileged one, and already lets an approver reach the
+// admin-create flow an ordinary agent's own "New Application" doesn't cover).
 export function PolicyApplications() {
+  const { permissions } = useAuth();
+  const isApprover = permissions?.includes("APPROVE_APPLICATION");
+  return isApprover ? <PolicyApproval /> : <PolicyApplicationsAgentView />;
+}
+
+function PolicyApplicationsAgentView() {
   const { token } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
   const [rows, setRows] = useState([]);

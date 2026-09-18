@@ -189,8 +189,8 @@ export function InLeaseDetailDialog({ policyId, token, canMarkDone, canMarkUndon
                 <Stack spacing={1.5} divider={<Divider flexItem />}>
                   <CopyableField label="Plate Number" value={v.plate_number} copiedField={copiedField} onCopy={handleCopy} />
                   <CopyableField label="MV File No." value={v.mv_file_no} copiedField={copiedField} onCopy={handleCopy} />
-                  <CopyableField label="Engine Number" value={v.engine_number} copiedField={copiedField} onCopy={handleCopy} />
-                  <CopyableField label="Chassis Number" value={v.chassis_number} copiedField={copiedField} onCopy={handleCopy} />
+                  <CopyableField label="Motor Number" value={v.engine_number} copiedField={copiedField} onCopy={handleCopy} />
+                  <CopyableField label="Serial Number" value={v.chassis_number} copiedField={copiedField} onCopy={handleCopy} />
                   <CopyableField label="Make" value={v.make} copiedField={copiedField} onCopy={handleCopy} />
                   <CopyableField label="Model" value={v.model} copiedField={copiedField} onCopy={handleCopy} />
                   <CopyableField label="Year Model" value={v.year_model} copiedField={copiedField} onCopy={handleCopy} />

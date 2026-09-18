@@ -21,8 +21,8 @@ import { useAuth } from "../context/AuthContext";
 import { useNavigationGuard } from "../context/UnsavedChangesContext";
 import { navItems } from "../nav/navItems";
 
-const DRAWER_WIDTH = 260;
-const DRAWER_WIDTH_COLLAPSED = 72;
+const DRAWER_WIDTH = 224;
+const DRAWER_WIDTH_COLLAPSED = 60;
 
 export function AppLayout() {
   const theme = useTheme();
@@ -62,9 +62,9 @@ export function AppLayout() {
 
   function renderNavList(showLabels) {
     return (
-      <Box sx={{ overflowX: "hidden" }}>
+      <Box sx={{ overflowX: "hidden", height: "100%" }}>
         <Toolbar />
-        <List sx={{ px: showLabels ? 1 : 0.5, py: 1 }}>
+        <List sx={{ px: showLabels ? 1 : 0.75, py: 1.5 }}>
           {visibleNavItems.map(({ label, path, icon: Icon }) => {
             const selected = location.pathname === path;
             const button = (
@@ -78,17 +78,33 @@ export function AppLayout() {
                   if (isMobile) setMobileOpen(false);
                 }}
                 sx={{
-                  borderRadius: 2,
-                  mb: 0.5,
+                  borderRadius: 1.5,
+                  mb: 0.25,
+                  minHeight: 38,
                   justifyContent: showLabels ? "flex-start" : "center",
-                  px: showLabels ? 2 : 1,
+                  px: showLabels ? 1.5 : 1,
+                  color: "rgba(255,255,255,0.72)",
+                  borderLeft: "3px solid transparent",
+                  "&:hover": {
+                    bgcolor: "rgba(255,255,255,0.06)",
+                    color: "rgba(255,255,255,0.92)",
+                  },
+                  "&.Mui-selected": {
+                    bgcolor: "rgba(224,147,46,0.16)",
+                    borderLeft: "3px solid",
+                    borderLeftColor: "secondary.main",
+                  },
+                  "&.Mui-selected:hover": {
+                    bgcolor: "rgba(224,147,46,0.22)",
+                  },
                 }}
               >
                 <ListItemIcon
                   sx={{
-                    minWidth: showLabels ? 40 : 0,
-                    color: selected ? "primary.main" : "inherit",
+                    minWidth: showLabels ? 32 : 0,
+                    color: selected ? "secondary.main" : "inherit",
                     justifyContent: "center",
+                    "& svg": { fontSize: "1.2rem" },
                   }}
                 >
                   <Icon />
@@ -99,8 +115,10 @@ export function AppLayout() {
                     slotProps={{
                       primary: {
                         sx: {
-                          fontWeight: selected ? 700 : 400,
-                          color: selected ? "primary.main" : "inherit",
+                          fontSize: "0.85rem",
+                          fontWeight: selected ? 700 : 500,
+                          color: selected ? "common.white" : "inherit",
+                          whiteSpace: "nowrap",
                         },
                       },
                     }}
@@ -136,7 +154,7 @@ export function AppLayout() {
               <MenuIcon />
             </IconButton>
             <Box sx={{ "& .MuiTypography-root": { color: "common.white" } }}>
-              <BrandMark size="small" />
+              <BrandMark size="small" monochrome />
             </Box>
           </Box>
           <IconButton color="inherit" onClick={handleLogout} title="Log out">
@@ -153,7 +171,14 @@ export function AppLayout() {
         ModalProps={{ keepMounted: true }}
         sx={{ display: { xs: "block", md: "none" } }}
         slotProps={{
-          paper: { sx: { width: DRAWER_WIDTH, boxSizing: "border-box" } },
+          paper: {
+            sx: {
+              width: DRAWER_WIDTH,
+              boxSizing: "border-box",
+              bgcolor: "primary.dark",
+              borderRight: "none",
+            },
+          },
         }}
       >
         {renderNavList(true)}
@@ -182,10 +207,9 @@ export function AppLayout() {
             left: 0,
             height: "100vh",
             width: desktopOpen ? DRAWER_WIDTH : DRAWER_WIDTH_COLLAPSED,
-            bgcolor: "background.paper",
-            borderRight: 1,
-            borderColor: "divider",
+            bgcolor: "primary.dark",
             overflowX: "hidden",
+            boxShadow: "1px 0 0 rgba(0,0,0,0.08)",
             transition: theme.transitions.create("width", {
               easing: theme.transitions.easing.sharp,
               duration: theme.transitions.duration.enteringScreen,

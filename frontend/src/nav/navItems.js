@@ -28,17 +28,23 @@ export const navItems = [
     label: "Policy Issuance",
     path: "/policy-application",
     icon: AssignmentIcon,
-    permission: "CREATE_APPLICATION",
+    // Either permission admits the page — PolicyApplications.jsx itself
+    // picks which of the two views to render (the approver's cross-agent
+    // queue + "New Admin Application", or an agent's own tracker + "New
+    // Application") based on which one the caller actually holds; a caller
+    // is expected to hold only one of the two in practice.
+    permission: ["CREATE_APPLICATION", "APPROVE_APPLICATION"],
   },
   { label: "My Clients", path: "/my-policies", icon: ListAltIcon, permission: "VIEW_POLICIES" },
   {
-    label: "Approvals",
-    path: "/approvals",
+    label: "Endorsements",
+    path: "/endorsements",
     icon: FactCheckIcon,
-    // Either sub-permission unlocks the page — its two tabs (Policy
-    // Approval/Endorsement Approval) are each independently gated inside
-    // Approvals.jsx itself.
-    permission: ["APPROVE_APPLICATION", "APPROVE_ENDORSEMENT"],
+    // Either permission admits the page — an ordinary approver
+    // (APPROVE_ENDORSEMENT) sees the review queue; an admin
+    // (VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT) additionally/instead sees the
+    // "New Admin Endorsement" policy-search action, see Endorsements.jsx.
+    permission: ["APPROVE_ENDORSEMENT", "VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT"],
   },
   {
     label: "In-Lease",

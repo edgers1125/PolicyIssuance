@@ -156,7 +156,7 @@ model PolicyVehicle {
   // re-exported. These columns are what the PDF actually reads instead.
   plate_number_snapshot   String?  @db.VarChar(50)
   mv_file_no_snapshot     String   @db.VarChar(100)
-  engine_number_snapshot  String   @db.VarChar(100)
+  engine_number_snapshot  String?  @db.VarChar(100)
   chassis_number_snapshot String   @db.VarChar(100)
   make_snapshot           String?  @db.VarChar(100)
   model_snapshot          String?  @db.VarChar(100)

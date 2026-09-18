@@ -826,7 +826,7 @@ export function PolicyDetailDialog({ open, policyId, policyNumber, token, onClos
                                           />
                                           <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
                                             <TextField
-                                              label="Barangay (optional)"
+                                              label="Barangay"
                                               value={addressFields.barangay}
                                               onChange={(e) => setAddressFields((f) => ({ ...f, barangay: e.target.value }))}
                                               size="small"
@@ -849,7 +849,7 @@ export function PolicyDetailDialog({ open, policyId, policyNumber, token, onClos
                                           </Stack>
                                           <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
                                             <TextField
-                                              label="Postal code (optional)"
+                                              label="Postal code"
                                               value={addressFields.postal_code}
                                               onChange={(e) => setAddressFields((f) => ({ ...f, postal_code: e.target.value }))}
                                               size="small"

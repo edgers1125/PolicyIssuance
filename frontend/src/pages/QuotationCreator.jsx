@@ -44,6 +44,10 @@ import {
   listAgentsForQuotation,
   updateVehicle,
   lookupVehicleByPlate,
+  lookupCustomerByContact,
+  connectCustomer,
+  lookupCompanyByContact,
+  connectCompany,
   updateAddress,
   createPolicyQuotation,
   previewQuotationPdf,
@@ -335,7 +339,7 @@ function isVehicleComplete(v) {
 }
 
 function isAddressComplete(a) {
-  return Boolean(a.address_line_1 && a.city && a.province);
+  return Boolean(a.address_line_1 && a.barangay && a.city && a.province && a.postal_code);
 }
 
 // Display-only — this date is never entered directly, so there's no
@@ -623,7 +627,7 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly, 
             </Grid>
             <Grid size={{ xs: 12, sm: 6 }}>
               <TextField
-                label="Engine number"
+                label="Motor number"
                 value={form.engine_number}
                 onChange={(e) => setForm({ ...form, engine_number: e.target.value })}
                 fullWidth
@@ -631,7 +635,7 @@ function VehicleEditDialog({ open, onClose, vehicle, token, onSaved, localOnly, 
             </Grid>
             <Grid size={{ xs: 12, sm: 6 }}>
               <TextField
-                label="Chassis number"
+                label="Serial number"
                 value={form.chassis_number}
                 onChange={(e) => setForm({ ...form, chassis_number: e.target.value })}
                 required
@@ -801,6 +805,7 @@ function AddressEditDialog({ open, onClose, address, token, onSaved, showEstimat
                 label="Barangay"
                 value={form.barangay}
                 onChange={(e) => setForm({ ...form, barangay: e.target.value })}
+                required
                 fullWidth
               />
             </Grid>
@@ -827,6 +832,7 @@ function AddressEditDialog({ open, onClose, address, token, onSaved, showEstimat
                 label="Postal code"
                 value={form.postal_code}
                 onChange={(e) => setForm({ ...form, postal_code: e.target.value })}
+                required
                 fullWidth
               />
             </Grid>
@@ -920,6 +926,12 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
   // Which plate number was last checked per vehicle row, so blurring an
   // unchanged field doesn't keep re-triggering the lookup.
   const lastCheckedPlateRef = useRef({});
+  // Which email/mobile number was last checked for the Insured Party
+  // contact-lookup fields (see handleCustomerContactBlur/
+  // handleCompanyContactBlur) — same "don't re-trigger on an unchanged blur"
+  // guard as lastCheckedPlateRef above.
+  const lastCheckedCustomerContactRef = useRef({});
+  const lastCheckedCompanyContactRef = useRef({});
   // { [vehicleRowIndex]: latest_policy-or-null } — populated the moment a
   // plate lookup resolves a vehicle with policy history (GET /vehicles/lookup
   // already includes latest_policy), so a row can proactively show "this
@@ -1023,6 +1035,8 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
     setInsuredType("INDIVIDUAL");
     setNewCustomer(emptyCustomer);
     setNewCompany(emptyCompany);
+    lastCheckedCustomerContactRef.current = {};
+    lastCheckedCompanyContactRef.current = {};
     loadParties(resolved).catch((err) => setError(err.message));
   }
 
@@ -1510,7 +1524,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
             >
               {(cov.tier_based_prices || []).map((tier) => (
                 <MenuItem key={tier.id} value={String(tier.coverage_amount)}>
-                  {formatPHP(tier.coverage_amount)} — {formatPHP(tier.coverage_price)}
+                  {formatPHP(tier.coverage_amount)}
                 </MenuItem>
               ))}
             </TextField>
@@ -1749,6 +1763,62 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
     delete lastCheckedPlateRef.current[index];
   }
 
+  // Email/mobile number are both unique on Customer (see that model's own
+  // schema comment), so an exact match always identifies a single real
+  // person — unlike a vehicle's plate number, there's nothing to confirm: a
+  // Customer can legitimately be serviced by more than one agent at once, so
+  // finding one under a different agent just means connecting to it (a
+  // background, idempotent link), not "taking it away" from anyone. Fires on
+  // blur of either the Email or Mobile number field.
+  async function handleCustomerContactBlur(field) {
+    const value = newCustomer[field]?.trim();
+    if (!value || newCustomer.existing_customer_id) return;
+    if (lastCheckedCustomerContactRef.current[field] === value) return;
+    lastCheckedCustomerContactRef.current[field] = value;
+
+    const found = await lookupCustomerByContact(token, value).catch(() => null);
+    if (!found) return;
+
+    setNewCustomer({
+      first_name: found.first_name,
+      last_name: found.last_name,
+      middle_name: found.middle_name || "",
+      email: found.email,
+      mobile_number: found.mobile_number || "",
+      birthday: found.birthday ? found.birthday.slice(0, 10) : "",
+      gender: found.gender || "",
+      existing_customer_id: found.id,
+    });
+    // Same "only send agent_id when actually filing under a different agent"
+    // condition the submit payload itself uses (see handleSubmit's own
+    // agent_id line) — sending it unconditionally would require
+    // ADMIN_CREATE_PERMISSIONS even for an ordinary agent filing for themselves.
+    const agentOverride = canFileForOtherAgent && filingAgentId && filingAgentId !== agent?.id ? filingAgentId : undefined;
+    connectCustomer(token, found.id, agentOverride ? { agent_id: agentOverride } : {}).catch(() => {});
+  }
+
+  // Same as handleCustomerContactBlur above, for a Company's own Email field
+  // (Company has no phone field, so email is the only contact-lookup key).
+  async function handleCompanyContactBlur() {
+    const value = newCompany.email?.trim();
+    if (!value || newCompany.existing_company_id) return;
+    if (lastCheckedCompanyContactRef.current.email === value) return;
+    lastCheckedCompanyContactRef.current.email = value;
+
+    const found = await lookupCompanyByContact(token, value).catch(() => null);
+    if (!found) return;
+
+    setNewCompany({
+      company_code: found.company_code,
+      company_name: found.company_name,
+      tin_no: found.tin_no || "",
+      email: found.email,
+      existing_company_id: found.id,
+    });
+    const agentOverride = canFileForOtherAgent && filingAgentId && filingAgentId !== agent?.id ? filingAgentId : undefined;
+    connectCompany(token, found.id, agentOverride ? { agent_id: agentOverride } : {}).catch(() => {});
+  }
+
   function handlePreview(e) {
     e.preventDefault();
     setError("");
@@ -1965,9 +2035,11 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
       if (insuredType === "INDIVIDUAL") {
         setNewCustomer((prev) => ({ ...prev, existing_customer_id: customerId }));
         setNewCompany(emptyCompany);
+        lastCheckedCompanyContactRef.current = {};
       } else {
         setNewCompany((prev) => ({ ...prev, existing_company_id: companyId }));
         setNewCustomer(emptyCustomer);
+        lastCheckedCustomerContactRef.current = {};
       }
       setVariantId("");
       setCoverageSelections({});
@@ -2210,9 +2282,13 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                         // Editing away from a matched customer clears every field that came
                         // from their record, not just the id — otherwise a stale last name,
                         // email, etc. could get submitted for whoever they search for next.
-                        setNewCustomer((prev) =>
-                          prev.existing_customer_id ? { ...emptyCustomer, first_name: value } : { ...prev, first_name: value }
-                        );
+                        setNewCustomer((prev) => {
+                          if (prev.existing_customer_id) {
+                            lastCheckedCustomerContactRef.current = {};
+                            return { ...emptyCustomer, first_name: value };
+                          }
+                          return { ...prev, first_name: value };
+                        });
                       }
                     }}
                     onChange={(e, value) => {
@@ -2279,9 +2355,11 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                     type="email"
                     value={newCustomer.email}
                     onChange={(e) => setNewCustomer({ ...newCustomer, email: e.target.value })}
+                    onBlur={() => handleCustomerContactBlur("email")}
                     required
                     fullWidth
                     disabled={Boolean(newCustomer.existing_customer_id)}
+                    helperText="Matches an existing customer's email? Their details will load automatically."
                   />
                 </Grid>
                 <Grid size={{ xs: 12, sm: 6 }}>
@@ -2289,6 +2367,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                     label="Mobile number"
                     value={newCustomer.mobile_number}
                     onChange={(e) => setNewCustomer({ ...newCustomer, mobile_number: e.target.value })}
+                    onBlur={() => handleCustomerContactBlur("mobile_number")}
                     fullWidth
                     disabled={Boolean(newCustomer.existing_customer_id)}
                   />
@@ -2349,9 +2428,13 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                       if (reason === "input") {
                         // Same reasoning as the customer field — clear the whole record, not
                         // just the id, so stale details from the old match can't slip through.
-                        setNewCompany((prev) =>
-                          prev.existing_company_id ? { ...emptyCompany, company_name: value } : { ...prev, company_name: value }
-                        );
+                        setNewCompany((prev) => {
+                          if (prev.existing_company_id) {
+                            lastCheckedCompanyContactRef.current = {};
+                            return { ...emptyCompany, company_name: value };
+                          }
+                          return { ...prev, company_name: value };
+                        });
                       }
                     }}
                     onChange={(e, value) => {
@@ -2402,8 +2485,10 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                     type="email"
                     value={newCompany.email}
                     onChange={(e) => setNewCompany({ ...newCompany, email: e.target.value })}
+                    onBlur={handleCompanyContactBlur}
                     required
                     fullWidth
+                    helperText="Matches an existing company's email? Their details will load automatically."
                     disabled={Boolean(newCompany.existing_company_id)}
                   />
                 </Grid>
@@ -2523,6 +2608,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                     label="Barangay"
                     value={insuredAddress.barangay}
                     onChange={(e) => setInsuredAddress({ ...insuredAddress, barangay: e.target.value })}
+                    required
                     fullWidth
                     disabled={Boolean(insuredAddress.existing_address_id)}
                   />
@@ -2552,6 +2638,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                     label="Postal code"
                     value={insuredAddress.postal_code}
                     onChange={(e) => setInsuredAddress({ ...insuredAddress, postal_code: e.target.value })}
+                    required
                     fullWidth
                     disabled={Boolean(insuredAddress.existing_address_id)}
                   />
@@ -2826,7 +2913,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
                         <TextField
-                          label="Engine number"
+                          label="Motor number"
                           value={v.engine_number}
                           onChange={(e) => updateVehicleField(index, "engine_number", e.target.value)}
                           fullWidth
@@ -2835,7 +2922,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                       </Grid>
                       <Grid size={{ xs: 12, sm: 6 }}>
                         <TextField
-                          label="Chassis number"
+                          label="Serial number"
                           value={v.chassis_number}
                           onChange={(e) => updateVehicleField(index, "chassis_number", e.target.value)}
                           required
@@ -3044,6 +3131,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                     label="Barangay"
                     value={riskAddress.barangay}
                     onChange={(e) => setRiskAddress({ ...riskAddress, barangay: e.target.value })}
+                    required
                     fullWidth
                     disabled={Boolean(riskAddress.existing_address_id)}
                   />
@@ -3073,6 +3161,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                     label="Postal code"
                     value={riskAddress.postal_code}
                     onChange={(e) => setRiskAddress({ ...riskAddress, postal_code: e.target.value })}
+                    required
                     fullWidth
                     disabled={Boolean(riskAddress.existing_address_id)}
                   />

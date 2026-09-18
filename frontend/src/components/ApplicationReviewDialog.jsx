@@ -51,8 +51,8 @@ const CHANGE_TYPE_LABELS = {
   VEHICLE_TYPE: "Vehicle Type",
   VEHICLE_MAKE: "Vehicle Make",
   VEHICLE_COLOR: "Vehicle Color",
-  VEHICLE_ENGINE_NO: "Vehicle Engine No.",
-  VEHICLE_CHASSIS_NO: "Vehicle Chassis No.",
+  VEHICLE_ENGINE_NO: "Vehicle Motor No.",
+  VEHICLE_CHASSIS_NO: "Vehicle Serial No.",
   ADD_CLAUSE: "Add Clause",
   REMOVE_CLAUSE: "Remove Clause",
 };
@@ -655,7 +655,7 @@ export function ApplicationReviewDialog({ open, applicationId, applicationNumber
                             />
                             <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
                               <TextField
-                                label="Barangay (optional)"
+                                label="Barangay"
                                 value={addressFields.barangay}
                                 onChange={(e) => setAddressFields((f) => ({ ...f, barangay: e.target.value }))}
                                 size="small"
@@ -678,7 +678,7 @@ export function ApplicationReviewDialog({ open, applicationId, applicationNumber
                             </Stack>
                             <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
                               <TextField
-                                label="Postal code (optional)"
+                                label="Postal code"
                                 value={addressFields.postal_code}
                                 onChange={(e) => setAddressFields((f) => ({ ...f, postal_code: e.target.value }))}
                                 size="small"

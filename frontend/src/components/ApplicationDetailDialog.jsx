@@ -36,8 +36,8 @@ const CHANGE_TYPE_LABELS = {
   VEHICLE_TYPE: "Vehicle Type",
   VEHICLE_MAKE: "Vehicle Make",
   VEHICLE_COLOR: "Vehicle Color",
-  VEHICLE_ENGINE_NO: "Vehicle Engine No.",
-  VEHICLE_CHASSIS_NO: "Vehicle Chassis No.",
+  VEHICLE_ENGINE_NO: "Vehicle Motor No.",
+  VEHICLE_CHASSIS_NO: "Vehicle Serial No.",
   ADD_CLAUSE: "Add Clause",
   REMOVE_CLAUSE: "Remove Clause",
 };

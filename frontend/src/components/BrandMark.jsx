@@ -1,7 +1,13 @@
 import { Box, Typography } from "@mui/material";
 import bethelLogo from "../assets/bethel-logo.png";
 
-export function BrandMark({ size = "large" }) {
+// monochrome (used on the top nav bar's own navy background) renders the
+// shield as a flat white silhouette instead of its full-color artwork —
+// brightness(0) crushes every pixel to black first (so color/alpha edges
+// stay crisp), invert(1) then flips that to white; a plain grayscale filter
+// would leave the logo's own colors muddy on a navy backdrop instead of
+// reading as a clean reversed-out mark.
+export function BrandMark({ size = "large", monochrome = false }) {
   const isLarge = size === "large";
   const shieldSize = isLarge ? 64 : 36;
 
@@ -10,12 +16,13 @@ export function BrandMark({ size = "large" }) {
       <Box
         component="img"
         src={bethelLogo}
-        alt="Bethel General Insurance and Surety Corporation"
+        alt="Bethel Life and General Insurance Corporation"
         sx={{
           width: shieldSize,
           height: shieldSize,
           objectFit: "contain",
           flexShrink: 0,
+          filter: monochrome ? "brightness(0) invert(1)" : "none",
         }}
       />
       <Box sx={{ textAlign: "left" }}>
@@ -30,19 +37,18 @@ export function BrandMark({ size = "large" }) {
         >
           BETHEL
         </Typography>
-        {isLarge && (
-          <Typography
-            sx={{
-              color: "secondary.main",
-              fontWeight: 700,
-              fontSize: "0.65rem",
-              letterSpacing: 0.5,
-              display: { xs: "none", sm: "block" },
-            }}
-          >
-            GENERAL INSURANCE AND SURETY CORP.
-          </Typography>
-        )}
+        <Typography
+          sx={{
+            color: "secondary.main",
+            fontWeight: 700,
+            fontSize: isLarge ? "0.65rem" : "0.55rem",
+            letterSpacing: 0.5,
+            lineHeight: 1.2,
+            display: { xs: "none", sm: "block" },
+          }}
+        >
+          Life and General Insurance Corporation
+        </Typography>
       </Box>
     </Box>
   );

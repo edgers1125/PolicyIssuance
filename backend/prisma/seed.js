@@ -62,6 +62,11 @@ const PERMISSIONS = [
     name: "Create Endorsement Request",
     description: "File an endorsement request against one of your own issued policies",
   },
+  {
+    code: "VIEW_POLICIES.ADMIN_CREATE_ENDORSEMENT",
+    name: "Create Endorsement Request (Any Policy)",
+    description: "File an endorsement request against any policy in the system, regardless of filing agent",
+  },
   { code: "MANAGE_INLEASE", name: "In-Lease Backlogs", description: "Manage the In-Lease backlog queue" },
   {
     code: "MANAGE_INLEASE.MARK_DONE",

@@ -154,10 +154,10 @@ function buildQuotationPdf(props) {
         .text(`SCHEDULED VEHICLE${vehicles.length > 1 ? "S" : ""}`, left, doc.y, { width: pageWidth });
       doc.moveDown(0.4);
       // Two columns × four rows — Model/MV File No., Body/Serial No.,
-      // Make/Authentication No., Plate No./Color. "Model" reads year_model
+      // Make/Motor No., Plate No./Color. "Model" reads year_model
       // (this schedule's own convention, matching how "Model" on a PH
       // OR/CR reads as the model *year* rather than the model name) and
-      // "Body"/"Serial No."/"Authentication No." are this document's own
+      // "Body"/"Serial No."/"Motor No." are this document's own
       // labels for vehicle_type/chassis_number/engine_number respectively —
       // same underlying Vehicle fields as before, just relabeled/regrouped.
       const half = pageWidth / 2;
@@ -174,7 +174,7 @@ function buildQuotationPdf(props) {
         labelValue(doc, "Serial No.:", v.chassis_number, left + half, rowY2, half);
         const rowY3 = doc.y + 5;
         labelValue(doc, "Make:", [v.make, v.model].filter(Boolean).join(" ") || "—", left, rowY3, half);
-        labelValue(doc, "Authentication No.:", v.engine_number, left + half, rowY3, half);
+        labelValue(doc, "Motor No.:", v.engine_number, left + half, rowY3, half);
         const rowY4 = doc.y + 5;
         labelValue(doc, "Plate No.:", v.plate_number, left, rowY4, half);
         labelValue(doc, "Color:", v.color || "—", left + half, rowY4, half);
