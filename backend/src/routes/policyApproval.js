@@ -222,7 +222,7 @@ router.post(
         return res.status(400).json({ error: "agent_id does not match an existing agent" });
       }
 
-      const application = await createApplicationRecord({ agent, body: req.body });
+      const application = await createApplicationRecord({ agent, body: req.body, allowBackdating: true });
       const policy = await approveApplicationRecord({ applicationId: application.id, approverUserId: req.user.userId });
 
       res.status(201).json(policy);
@@ -621,12 +621,19 @@ async function approveApplicationRecord({ applicationId, approverUserId, coc_num
             coverage_id: true,
             coverage_amount: true,
             premium_amount: true,
-            // The agent's own margin on this coverage line — premium_amount
-            // minus what's actually owed to Bethel (see ApplicationCoverage's
-            // own comment) — summed below into the AgentPayableTransaction
-            // credited to the filing agent once this application is approved.
+            // What's actually owed to Bethel for this row, and the net rate
+            // that produced it — frozen at submission time (see
+            // ApplicationCoverage's own comment). Summed below into the
+            // AgentPayableTransaction credited to the filing agent once this
+            // application is approved, and also copied verbatim onto the
+            // issued PolicyCoverage row (see the policyCoverage.createMany
+            // call below) so the policy keeps a durable, "for transparency"
+            // record of exactly what the agent's rates were at the moment
+            // this policy was actually written, even if that agent's own
+            // net rates are edited afterward.
             payable_to_bethel: true,
-            coverage: { select: { coverage_code: true, coverage_name: true, clause: true, pricing_mode: true } },
+            applied_rate: true,
+            coverage: { select: { coverage_code: true, coverage_name: true, clause: true, pricing_mode: true, is_misc: true } },
           },
         },
       },
@@ -701,14 +708,18 @@ async function approveApplicationRecord({ applicationId, approverUserId, coc_num
       }
     }
 
-    // The agent's own commission on this policy — summed across every
-    // coverage line's own margin (premium_amount minus what's actually owed
-    // to Bethel) — credited to their payable ledger the moment this
-    // application becomes an issued Policy. See AgentPayableTransaction
-    // (agentPayables.prisma) for why this is a signed-amount ledger entry
-    // rather than a running balance column on Agent.
-    const agentCommission = application.coverages.reduce(
-      (sum, c) => sum + (Number(c.premium_amount) - Number(c.payable_to_bethel)),
+    // What this agent actually owes Bethel for the policy — summed across
+    // every coverage line's own payable_to_bethel (the floor cost the agent's
+    // premium_amount is priced against, never the agent's own margin on top
+    // of it — see lib/coveragePricing.js). Credited to their payable ledger
+    // the moment this application becomes an issued Policy: the agent has
+    // (or is about to) collect the full premium from the insured, and this
+    // is the portion of it that must flow back to Bethel, not the margin the
+    // agent keeps. See AgentPayableTransaction (agentPayables.prisma) for why
+    // this is a signed-amount ledger entry rather than a running balance
+    // column on Agent.
+    const amountPayableToBethel = application.coverages.reduce(
+      (sum, c) => sum + Number(c.payable_to_bethel),
       0
     );
 
@@ -814,18 +825,33 @@ async function approveApplicationRecord({ applicationId, approverUserId, coc_num
             pricing_mode_snapshot: c.coverage.pricing_mode,
             coverage_amount: c.coverage_amount,
             premium_amount: c.premium_amount,
+            // Frozen off the ApplicationCoverage row's own values — the
+            // agent's net rate as it actually stood at submission time, and
+            // what that rate worked out to in pesos for this specific
+            // coverage — so an issued policy carries a permanent, "for
+            // transparency" record of the rate it was actually priced at,
+            // even if that agent's own net rate is edited (or their whole
+            // company's rates are) at any point afterward. Previously left
+            // null at issuance (only ever populated by an ADD_COVERAGE
+            // endorsement's own new row) — see this column's own schema
+            // comment for why that was a gap worth closing here too.
+            payable_to_bethel: c.payable_to_bethel,
+            applied_rate: c.applied_rate,
+            is_misc_snapshot: c.coverage.is_misc,
           })),
         });
       }
 
-      // Credits the filing agent's payable ledger with their commission on
-      // this policy — see AgentPayableTransaction's own note. Recorded even
-      // when it's 0 (a coverage priced at exactly Bethel's own floor rate),
-      // so the ledger's own row-per-policy history stays complete rather than
-      // silently skipping some approvals. Agent.payable (the denormalized
-      // running-balance cache the Accounting Overview page reads) is
-      // incremented in the same transaction so it can never drift from the
-      // ledger it's summarizing.
+      // Credits the filing agent's payable ledger with what they owe Bethel
+      // for this policy — see amountPayableToBethel's own note above.
+      // Recorded even when it's 0 (every coverage priced with no margin at
+      // all still owes Bethel its own floor cost — 0 only when that floor
+      // cost itself is 0, e.g. a VEHICLE_SEATS_BASED coverage under its own
+      // bracket threshold), so the ledger's own row-per-policy history stays
+      // complete rather than silently skipping some approvals. Agent.payable
+      // (the denormalized running-balance cache the Accounting Overview page
+      // reads) is incremented in the same transaction so it can never drift
+      // from the ledger it's summarizing.
       // This ISSUANCE row is the policy's own original payable-aging bucket
       // (see AgentPayableTransaction.due_date/remaining_amount's own schema
       // comments and lib/agentPayables.js) — due_date is frozen off the
@@ -836,14 +862,14 @@ async function approveApplicationRecord({ applicationId, approverUserId, coc_num
           agent_id: application.agent_id,
           policy_id: createdPolicy.id,
           transaction_type: "ISSUANCE",
-          amount: agentCommission,
+          amount: amountPayableToBethel,
           due_date: computeDueDate(createdPolicy.issue_date, application.agent.payment_terms_days),
-          remaining_amount: agentCommission,
+          remaining_amount: amountPayableToBethel,
         },
       });
       await tx.agent.update({
         where: { id: application.agent_id },
-        data: { payable: { increment: agentCommission } },
+        data: { payable: { increment: amountPayableToBethel } },
       });
 
       await tx.policyApplication.update({ where: { id: application.id }, data: { status: "APPROVED" } });

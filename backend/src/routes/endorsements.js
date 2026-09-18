@@ -618,10 +618,10 @@ function computeEndorsementChargeDelta(changes, policy) {
   return { totalPremium, docStamps, vat, lgt, misc, totalAmount: round2(totalPremium + docStamps + vat + lgt + misc) };
 }
 
-// The agent's commission earned on this policy so far (every ISSUANCE/
-// ENDORSEMENT credit ever posted against it — a REMOVE_CLAUSE's own
+// The amount payable to Bethel accrued on this policy so far (every
+// ISSUANCE/ENDORSEMENT credit ever posted against it — a REMOVE_CLAUSE's own
 // ENDORSEMENT debit already nets out of this the moment it's posted, so this
-// always reflects the *current*, not original, commission), and the
+// always reflects the *current*, not original, accrual), and the
 // day-prorated portion of it a CANCEL_POLICY endorsement's approval hands
 // back — see EndorsementChangeType.CANCEL_POLICY's own comment for why this
 // is computed fresh at approval time rather than at filing.
@@ -634,26 +634,26 @@ function computeCancellationProration({ basisAmount, effectiveDate, expiryDate, 
   const deduction = round2(dailyRate * remainingDays);
   const description =
     `Policy cancellation proration: ${totalDays}-day term, ${elapsedDays} day(s) used, ${remainingDays} day(s) unused ` +
-    `at ₱${formatMoney(dailyRate)}/day (total commission earned to date: ₱${formatMoney(basisAmount)}) ` +
+    `at ₱${formatMoney(dailyRate)}/day (total payable to Bethel accrued to date: ₱${formatMoney(basisAmount)}) ` +
     `→ payable deduction ₱${formatMoney(deduction)}. Cancellation effective ${new Date(cancellationDate).toISOString().slice(0, 10)}.`;
   return { totalDays, elapsedDays, remainingDays, dailyRate, deduction, description };
 }
 
 // How much of an ADD_COVERAGE/REMOVE_CLAUSE/VEHICLE_ESTIMATED_VALUE line's
-// own margin (or margin delta) actually gets credited/debited to the agent's
-// payable ledger, by default — the fraction of the policy's own current
-// coverage period still remaining as of this endorsement's own effective_date,
-// same remaining-days-over-full-period shape as computeCancellationProration
-// above, just without the "already elapsed" framing (there's no cancellation
-// date here, only "from here to expiry"). Returns 1 (no proration at all)
-// once the endorsement's effective_date is on/before the period's own start,
-// and clamps to [0, 1] either way — an endorsement can't earn negative or
-// more-than-full margin just because its own effective_date landed outside
-// the period. Called only when the approver leaves POST /:id/approve's own
-// `prorate` flag at its default `true`; passing `prorate: false` (the review
-// dialog's "Do not apply pro-rated" checkbox) skips this entirely and posts
-// the full margin/delta instead, same as this app's original behavior before
-// this flag existed.
+// own payable_to_bethel (or its delta) actually gets credited/debited to the
+// agent's payable ledger, by default — the fraction of the policy's own
+// current coverage period still remaining as of this endorsement's own
+// effective_date, same remaining-days-over-full-period shape as
+// computeCancellationProration above, just without the "already elapsed"
+// framing (there's no cancellation date here, only "from here to expiry").
+// Returns 1 (no proration at all) once the endorsement's effective_date is
+// on/before the period's own start, and clamps to [0, 1] either way — an
+// endorsement can't owe negative or more-than-full payable-to-Bethel just
+// because its own effective_date landed outside the period. Called only when
+// the approver leaves POST /:id/approve's own `prorate` flag at its default
+// `true`; passing `prorate: false` (the review dialog's "Do not apply
+// pro-rated" checkbox) skips this entirely and posts the full amount/delta
+// instead, same as this app's original behavior before this flag existed.
 function computeProrationFactor(effectiveDate, expiryDate, endorsementEffectiveDate) {
   const totalMs = new Date(expiryDate).getTime() - new Date(effectiveDate).getTime();
   if (totalMs <= 0) return 1;
@@ -1499,11 +1499,16 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
 
       await prisma.$transaction(async (tx) => {
         if (endorsement.request_type === "CANCELLATION") {
-          const commissionSoFar = await tx.agentPayableTransaction.aggregate({
+          // What this agent has been charged payable-to-Bethel so far across
+          // ISSUANCE + every approved ENDORSEMENT on this policy — cancelling
+          // early waives back the still-unused, day-prorated portion of it
+          // (see computeCancellationProration below), the same way a
+          // short-rate refund works.
+          const payableSoFar = await tx.agentPayableTransaction.aggregate({
             where: { policy_id: policy.id, transaction_type: { in: ["ISSUANCE", "ENDORSEMENT"] } },
             _sum: { amount: true },
           });
-          const basisAmount = Number(commissionSoFar._sum.amount || 0);
+          const basisAmount = Number(payableSoFar._sum.amount || 0);
           const proration = computeCancellationProration({
             basisAmount,
             effectiveDate: folded.effective_date,
@@ -1515,26 +1520,31 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
             where: { id: policy.id },
             data: { policy_status: "CANCELLED", cancelled_at: endorsement.effective_date },
           });
-          if (proration.deduction !== 0) {
-            // A cancellation clawback claws back against the policy's own
-            // original ISSUANCE bucket (same treatment as a REMOVE_CLAUSE
-            // debit below) rather than opening an independent one — it's
-            // reducing commission already credited for *this* policy, not
-            // creating a new one of its own with a fresh due date.
-            const appliesToId = await applyDebitToOriginalBucket(tx, policy.id, proration.deduction);
-            await tx.agentPayableTransaction.create({
-              data: {
-                agent_id: policy.agent_id,
-                policy_id: policy.id,
-                endorsement_request_id: endorsement.id,
-                transaction_type: "CANCELLED_POLICY",
-                amount: -proration.deduction,
-                remarks: proration.description,
-                applies_to_transaction_id: appliesToId,
-              },
-            });
-            await tx.agent.update({ where: { id: policy.agent_id }, data: { payable: { decrement: proration.deduction } } });
-          }
+          // A cancellation clawback claws back against the policy's own
+          // original ISSUANCE bucket (same treatment as a REMOVE_CLAUSE
+          // debit below) rather than opening an independent one — it's
+          // reducing the payable-to-Bethel amount already credited for
+          // *this* policy, not creating a new one of its own with a fresh
+          // due date. Recorded even when the deduction is exactly 0 (e.g.
+          // this policy's own basisAmount was already 0 — a legacy ISSUANCE
+          // row predating the fix that made ISSUANCE actually record
+          // payable_to_bethel, or a policy cancelled the same day it was
+          // issued with nothing yet earned to claw back), same "the ledger's
+          // own row-per-policy history stays complete, no silent gaps"
+          // reasoning as every other transaction_type in this table.
+          const appliesToId = await applyDebitToOriginalBucket(tx, policy.id, proration.deduction);
+          await tx.agentPayableTransaction.create({
+            data: {
+              agent_id: policy.agent_id,
+              policy_id: policy.id,
+              endorsement_request_id: endorsement.id,
+              transaction_type: "CANCELLED_POLICY",
+              amount: -proration.deduction,
+              remarks: proration.description,
+              applies_to_transaction_id: appliesToId,
+            },
+          });
+          await tx.agent.update({ where: { id: policy.agent_id }, data: { payable: { decrement: proration.deduction } } });
         } else {
           let coverageSetChanged = false;
           for (const change of endorsement.changes) {
@@ -1561,7 +1571,7 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
                 data: { created_policy_coverage_id: createdCoverage.id },
               });
 
-              const margin = round2(Number(change.premium_amount) - Number(change.payable_to_bethel));
+              const amountOwed = round2(Number(change.payable_to_bethel));
               // Prorated by default against how much of the coverage period
               // remains from this endorsement's own effective_date — see
               // computeProrationFactor — unless the approver checked "Do not
@@ -1569,7 +1579,7 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
               // Only the ledger amount is prorated; the PolicyCoverage row
               // itself always carries the coverage's own full, correctly-
               // priced premium/coverage_amount.
-              const postedAmount = round2(margin * prorationFactor);
+              const postedAmount = round2(amountOwed * prorationFactor);
               // An ADD_COVERAGE credit opens its own new payable-aging
               // bucket — its own due date off this endorsement's own
               // effective_date, independent of the policy's original
@@ -1587,7 +1597,7 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
                   amount: postedAmount,
                   remarks:
                     `Added coverage "${change.product_coverage.coverage_name}" via endorsement ${endorsement.id}` +
-                    (prorationFactor < 1 ? ` (prorated ${Math.round(prorationFactor * 100)}% of ₱${formatMoney(margin)} margin)` : ""),
+                    (prorationFactor < 1 ? ` (prorated ${Math.round(prorationFactor * 100)}% of ₱${formatMoney(amountOwed)} payable to Bethel)` : ""),
                   due_date: computeDueDate(endorsement.effective_date, addingAgent.payment_terms_days),
                   remaining_amount: postedAmount,
                 },
@@ -1608,9 +1618,8 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
                 change.payable_to_bethel !== null && change.payable_to_bethel !== undefined
                   ? Number(change.payable_to_bethel)
                   : Number(change.premium_amount);
-              const margin = round2(Number(change.premium_amount) - payableToBethel);
               // Same prorate-by-default treatment as ADD_COVERAGE above.
-              const postedAmount = round2(margin * prorationFactor);
+              const postedAmount = round2(payableToBethel * prorationFactor);
               // A REMOVE_CLAUSE debit claws back against the policy's own
               // original ISSUANCE bucket rather than opening a new one — see
               // lib/agentPayables.js's applyDebitToOriginalBucket.
@@ -1624,7 +1633,7 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
                   amount: -postedAmount,
                   remarks:
                     `Removed coverage "${targetCoverage.coverage_name_snapshot}" via endorsement ${endorsement.id}` +
-                    (prorationFactor < 1 ? ` (prorated ${Math.round(prorationFactor * 100)}% of ₱${formatMoney(margin)} margin)` : ""),
+                    (prorationFactor < 1 ? ` (prorated ${Math.round(prorationFactor * 100)}% of ₱${formatMoney(payableToBethel)} payable to Bethel)` : ""),
                   applies_to_transaction_id: appliesToId,
                 },
               });
@@ -1652,9 +1661,8 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
                 },
               });
 
-              // change.premium_amount/payable_to_bethel are already deltas
-              // (new minus old — see priceVehicleValueChange), so the margin
-              // delta is just their difference; same prorate-by-default
+              // change.payable_to_bethel is already a delta (new minus old —
+              // see priceVehicleValueChange); same prorate-by-default
               // treatment as ADD_COVERAGE/REMOVE_CLAUSE above. The sign of
               // the resulting posted amount decides how it's booked, same
               // convention lib/agentPayables.js's isBucketTransactionType
@@ -1664,8 +1672,8 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
               // against the policy's original ISSUANCE bucket (mirrors
               // REMOVE_CLAUSE's own debit) — never left ambiguous the way an
               // unconditional clawback regardless of sign would leave it.
-              const marginDelta = round2(Number(change.premium_amount) - Number(change.payable_to_bethel));
-              const postedAmount = round2(marginDelta * prorationFactor);
+              const payableDelta = round2(Number(change.payable_to_bethel));
+              const postedAmount = round2(payableDelta * prorationFactor);
               // Recorded even when exactly 0 (a fully-prorated-away or
               // net-unchanged correction) — same "the ledger's own
               // row-per-change history stays complete, no silent gaps"
@@ -1684,7 +1692,7 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
                     amount: postedAmount,
                     remarks:
                       `Corrected vehicle estimated value via endorsement ${endorsement.id}` +
-                      (prorationFactor < 1 ? ` (prorated ${Math.round(prorationFactor * 100)}% of ₱${formatMoney(marginDelta)} margin increase)` : ""),
+                      (prorationFactor < 1 ? ` (prorated ${Math.round(prorationFactor * 100)}% of ₱${formatMoney(payableDelta)} payable-to-Bethel increase)` : ""),
                     due_date: computeDueDate(endorsement.effective_date, owningAgent.payment_terms_days),
                     remaining_amount: postedAmount,
                   },
@@ -1702,7 +1710,7 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
                     amount: postedAmount,
                     remarks:
                       `Corrected vehicle estimated value via endorsement ${endorsement.id}` +
-                      (prorationFactor < 1 ? ` (prorated ${Math.round(prorationFactor * 100)}% of ₱${formatMoney(-marginDelta)} margin decrease)` : ""),
+                      (prorationFactor < 1 ? ` (prorated ${Math.round(prorationFactor * 100)}% of ₱${formatMoney(-payableDelta)} payable-to-Bethel decrease)` : ""),
                     applies_to_transaction_id: appliesToId,
                   },
                 });

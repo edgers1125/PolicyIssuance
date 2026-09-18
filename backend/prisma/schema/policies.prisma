@@ -214,17 +214,19 @@ model PolicyCoverage {
   pricing_mode_snapshot  CoveragePricingMode
   coverage_amount        Decimal  @db.Decimal(18, 2)
   premium_amount         Decimal  @db.Decimal(18, 2)
-  // The agent's own margin on this line (premium_amount minus what's owed to
-  // Bethel) and the rate that produced it — mirrors ApplicationCoverage's own
-  // columns of the same name, added here specifically so an ADD_COVERAGE/
-  // REMOVE_CLAUSE endorsement has something to compute its
-  // AgentPayableTransaction off of without a live re-price. Null on every
-  // PolicyCoverage row created before this column existed (issuance never
-  // used to persist it, since a Policy's charges were frozen forever and
-  // nothing ever needed to remove a coverage from one) — routes/endorsements.js
-  // falls back to treating premium_amount itself as the margin for such a
-  // row (payable_to_bethel unknown => assume 0) rather than blocking removal
-  // of a legacy coverage entirely.
+  // What's actually owed to Bethel for this row and the net rate that
+  // produced it — mirrors ApplicationCoverage's own columns of the same
+  // name, frozen at issuance off that same row (routes/policyApproval.js's
+  // approveApplicationRecord) so an issued policy keeps a durable,
+  // "for transparency" record of exactly what the agent's rates were at the
+  // moment it was written, even if that agent's own rates are edited later.
+  // Also set on a row an ADD_COVERAGE endorsement itself creates, and read
+  // by REMOVE_CLAUSE to compute its own AgentPayableTransaction debit
+  // without a live re-price. Still nullable — and still null — on any
+  // PolicyCoverage row issued before this column started being populated at
+  // issuance; routes/endorsements.js falls back to treating premium_amount
+  // itself as fully payable to Bethel for such a legacy row (payable_to_bethel
+  // unknown => assume 0 margin) rather than blocking removal of it entirely.
   payable_to_bethel      Decimal? @db.Decimal(18, 2)
   applied_rate           Decimal? @db.Decimal(10, 6)
   // Frozen off ProductCoverage.is_misc at the moment this row was created —

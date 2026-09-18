@@ -16,6 +16,7 @@ const { getAccessibleAgentIds } = require("../lib/agent");
 const { round2, resolveCoverageRows, getRequiredCoverageIds } = require("../lib/coveragePricing");
 const { resolveVehicleRenewal, resolveRiskAddressRenewal } = require("../lib/policyConflicts");
 const { assertVehicleIdentifiersUnique } = require("../lib/vehicleUniqueness");
+const { assertCoverageStartNotBackdated, canOverrideBackdating } = require("../lib/backdating");
 const { HttpError, sendIfHttpError } = require("../lib/httpError");
 const { sendMail } = require("../lib/mailer");
 const { buildSubmissionEmailContent } = require("../lib/applicationEmails");
@@ -132,7 +133,11 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
     }
     const agent = await prisma.agent.findUnique({ where: { id: user.agent_id } });
 
-    const result = await createApplicationRecord({ agent, body: req.body });
+    const result = await createApplicationRecord({
+      agent,
+      body: req.body,
+      allowBackdating: canOverrideBackdating(actingPermissions),
+    });
 
     // Sent right away, not just on manual "Resend to client" — a mail
     // failure here must never fail the application that was just created, so
@@ -181,7 +186,7 @@ router.post("/", validateBody(createApplicationSchema), async (req, res, next) =
 // rejection throws HttpError instead of writing directly to `res` (which
 // this function no longer has) — every call site already wraps its own call
 // in a try/catch ending with sendIfHttpError(err, res).
-async function createApplicationRecord({ agent, body }) {
+async function createApplicationRecord({ agent, body, allowBackdating = false }) {
   const {
     customer_id,
     company_id,
@@ -202,6 +207,14 @@ async function createApplicationRecord({ agent, body }) {
     pricing_input_mode,
     target_gross_amount,
   } = body;
+
+  // A regular agent can never file an application with an inception date
+  // before today — only a caller this route's own POST / resolved
+  // allowBackdating: true for (an admin-tier permission — see
+  // lib/backdating.js) can. POST /policy-approval/admin-applications always
+  // passes true, since reaching that route at all already requires
+  // APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION.
+  assertCoverageStartNotBackdated(startAt, { allowBackdating });
 
   // Which one applies is derived from whichever id was actually sent — the
   // schema already enforced that exactly one of the two is present.
@@ -285,8 +298,19 @@ async function createApplicationRecord({ agent, body }) {
     // to (or the primary/first vehicle, for one that applies to the whole
     // policy) — for an existing vehicle this is looked up fresh from the
     // database (its value/date are frozen once assessed, so this is the
-    // authoritative figure); a brand-new vehicle is being assessed for the
-    // first time right now, so "now" is its assessment date.
+    // authoritative figure). Depreciation is computed as of this filing's own
+    // coverage_start_at (startAt), never "now" — a renewal is very often
+    // filed with a coverage_start_at in the future (typically the prior
+    // policy's own expiry_date), and pricing it off today's date instead of
+    // the date the new coverage actually takes effect would under- (or
+    // over-) count how many whole-year anniversaries have actually passed by
+    // then, silently mispricing the vehicle's insured value. A brand-new
+    // vehicle has no initial_assessment_date yet (stays null until this
+    // application is approved — see approveApplicationRecord) — passing null
+    // through explicitly (not "now", which would wrongly anchor a fresh
+    // vehicle's depreciation clock to whatever the filing date happens to
+    // be) makes currentVehicleValue() return its raw estimated_value
+    // undiminished, exactly as before this deferral existed.
     async function resolveVehicleValue(v) {
       if (!v) return null;
       if (v.existing_vehicle_id) {
@@ -294,10 +318,10 @@ async function createApplicationRecord({ agent, body }) {
           where: { id: v.existing_vehicle_id },
           select: { estimated_value: true, initial_assessment_date: true },
         });
-        return currentVehicleValue(dbVehicle?.estimated_value, dbVehicle?.initial_assessment_date);
+        return currentVehicleValue(dbVehicle?.estimated_value, dbVehicle?.initial_assessment_date, startAt);
       }
       if (v.estimated_value !== undefined) {
-        return currentVehicleValue(v.estimated_value, new Date());
+        return currentVehicleValue(v.estimated_value, null);
       }
       return null;
     }

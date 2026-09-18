@@ -14,14 +14,22 @@ function wholeYearsElapsed(from, to) {
   return Math.max(0, years);
 }
 
-// Mirrors the server's calculation purely for live preview while filling out
-// the form — the server always recomputes and enforces this independently at
-// submission time, so this never needs to be authoritative. Value drops a
-// full 10% at each whole-year anniversary of the assessment date, never
-// gradually.
+// Mirrors the server's calculation (backend/src/lib/vehicleValue.js) purely
+// for live preview while filling out the form — the server always
+// recomputes and enforces this independently at submission time, so this
+// never needs to be authoritative. Value drops a full 10% at each whole-year
+// anniversary of the assessment date, never gradually. A vehicle with no
+// initial_assessment_date yet (not-yet-assessed — see that column's own
+// backend schema comment) hasn't started depreciating at all, so its raw
+// estimated_value comes back undiminished — same as the backend, so a
+// brand-new vehicle still previews a real premium at intake instead of
+// looking "pending" for no reason.
 export function currentVehicleValue(estimatedValue, initialAssessmentDate, asOf = new Date()) {
-  if (estimatedValue === "" || estimatedValue === null || estimatedValue === undefined || !initialAssessmentDate) {
+  if (estimatedValue === "" || estimatedValue === null || estimatedValue === undefined) {
     return null;
+  }
+  if (!initialAssessmentDate) {
+    return Number(estimatedValue);
   }
   const yearsElapsed = wholeYearsElapsed(new Date(initialAssessmentDate), asOf);
   return Number(estimatedValue) * Math.pow(1 - ANNUAL_DEPRECIATION_RATE, yearsElapsed);

@@ -17,6 +17,7 @@ const { getAccessibleAgentIds } = require("../lib/agent");
 const { round2, resolveCoverageRows, getRequiredCoverageIds } = require("../lib/coveragePricing");
 const { resolveVehicleRenewal, resolveRiskAddressRenewal } = require("../lib/policyConflicts");
 const { assertVehicleIdentifiersUnique } = require("../lib/vehicleUniqueness");
+const { assertCoverageStartNotBackdated } = require("../lib/backdating");
 const { sendIfHttpError } = require("../lib/httpError");
 const { sendMail } = require("../lib/mailer");
 const { buildSubmissionEmailContent } = require("../lib/applicationEmails");
@@ -298,6 +299,11 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
       target_gross_amount,
     } = req.body;
 
+    // A regular agent can never file a quotation with an inception date
+    // before today — only a caller holding one of the admin-tier
+    // permissions (see lib/backdating.js) can.
+    assertCoverageStartNotBackdated(startAt, { actingPermissions });
+
     const insured_type = customer_id ? "INDIVIDUAL" : "CORPORATE";
     const partyIdFields =
       insured_type === "INDIVIDUAL" ? { customer_id, company_id: null } : { customer_id: null, company_id };
@@ -351,6 +357,12 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
       return res.status(400).json({ error: "Select at least one coverage in addition to the required ones" });
     }
 
+    // Depreciation is computed as of this quotation's own coverage_start_at
+    // (startAt), never "now" — see routes/policyApplications.js's identical
+    // resolveVehicleValue for the full reasoning (a renewal quotation is
+    // very often priced for a future coverage_start_at). A brand-new
+    // vehicle's null initial_assessment_date is passed through explicitly so
+    // its raw estimated_value comes back undiminished.
     async function resolveVehicleValue(v) {
       if (!v) return null;
       if (v.existing_vehicle_id) {
@@ -358,10 +370,10 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
           where: { id: v.existing_vehicle_id },
           select: { estimated_value: true, initial_assessment_date: true },
         });
-        return currentVehicleValue(dbVehicle?.estimated_value, dbVehicle?.initial_assessment_date);
+        return currentVehicleValue(dbVehicle?.estimated_value, dbVehicle?.initial_assessment_date, startAt);
       }
       if (v.estimated_value !== undefined) {
-        return currentVehicleValue(v.estimated_value, new Date());
+        return currentVehicleValue(v.estimated_value, null);
       }
       return null;
     }
@@ -982,7 +994,8 @@ router.get("/:id", validateParams(quotationIdParamSchema), async (req, res, next
 // what a coverage's vehicle_indices are positions into).
 router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(updateQuotationSchema), async (req, res, next) => {
   try {
-    const scope = await resolveScope(req, res, CREATE_CODE, ADMIN_CREATE_CODE);
+    const actingPermissions = await getUserPermissionCodes(req.user.userId);
+    const scope = await resolveScope(req, res, CREATE_CODE, ADMIN_CREATE_CODE, actingPermissions);
     if (!scope) return;
 
     const where = scope.agentId ? { id: req.params.id, agent_id: scope.agentId } : { id: req.params.id };
@@ -1031,6 +1044,12 @@ router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(update
     }
 
     const { coverage_start_at: startAt, coverage_end_at: endAt, coverages, send_policy_to_email } = req.body;
+
+    // Same "no backdating an inception date" rule as POST / above — an edit
+    // can move the coverage period into the past just as easily as a fresh
+    // filing could.
+    assertCoverageStartNotBackdated(startAt, { actingPermissions });
+
     const className = quotation.product_variant.insurance_class.class_name;
 
     // resolveCoverageRows only needs enough of each vehicle to resolve
@@ -1041,9 +1060,13 @@ router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(update
       existing_vehicle_id: v.vehicle_id,
       no_of_seats: v.vehicle.no_of_seats,
     }));
+    // asOf: startAt (this edit's own, possibly-changed coverage_start_at),
+    // never "now" — see POST /'s own resolveVehicleValue for the full
+    // reasoning (a renewal quotation is very often priced for a future
+    // coverage_start_at).
     const vehicleValues =
       className === "Motor"
-        ? quotation.vehicles.map((v) => currentVehicleValue(v.vehicle.estimated_value, v.vehicle.initial_assessment_date))
+        ? quotation.vehicles.map((v) => currentVehicleValue(v.vehicle.estimated_value, v.vehicle.initial_assessment_date, startAt))
         : [];
     const riskAddressValue = quotation.addresses[0]?.address?.estimated_value;
     const addressValue =
@@ -1191,8 +1214,17 @@ router.post("/:id/submit", validateParams(quotationIdParamSchema), validateBody(
         remarks: true,
         converted_application: { select: { application_number: true } },
         product_variant: { select: { insurance_class: { select: { class_name: true } } } },
-        vehicles: { orderBy: { created_at: "asc" }, select: { id: true, vehicle_id: true } },
-        addresses: { select: { role: true, address_id: true } },
+        vehicles: {
+          orderBy: { created_at: "asc" },
+          select: {
+            id: true,
+            vehicle_id: true,
+            vehicle: { select: { estimated_value: true, initial_assessment_date: true, no_of_seats: true } },
+          },
+        },
+        addresses: {
+          select: { role: true, address_id: true, address: { select: { estimated_value: true } } },
+        },
         coverages: {
           select: {
             coverage_id: true,
@@ -1201,6 +1233,10 @@ router.post("/:id/submit", validateParams(quotationIdParamSchema), validateBody(
             premium_amount: true,
             payable_to_bethel: true,
             applied_rate: true,
+            // Needed to reconstruct a VEHICLE_SEATS_BASED row's own selection
+            // input below — see coveragesForPricing's own comment on why its
+            // stored coverage_amount can't be fed straight back in.
+            coverage: { select: { pricing_mode: true } },
           },
         },
       },
@@ -1226,6 +1262,92 @@ router.post("/:id/submit", validateParams(quotationIdParamSchema), validateBody(
     const className = quotation.product_variant.insurance_class.class_name;
     const vehicleIds = quotation.vehicles.map((v) => v.vehicle_id);
     const riskAddress = quotation.addresses.find((a) => a.role === "RISK");
+
+    // "For transparency" — an agent's own net rate/tier overrides (or their
+    // whole company's) can change between when a quotation was drafted and
+    // when it's actually submitted as a binding application. Re-resolve
+    // every coverage against the agent's CURRENT rates here, feeding in the
+    // quotation's own already-quoted premium_amount as the agent's asking
+    // price — resolveCoverageRows's own floor check (premium_amount must
+    // never come in below payable_to_bethel) naturally 400s the submission
+    // if a rate change means the agent could no longer actually afford to
+    // charge what was quoted, rather than letting a stale, now-underwater
+    // quote silently become a real policy. Vehicle values are depreciated as
+    // of the quotation's own coverage_start_at, same as everywhere else.
+    const isMotor = className === "Motor";
+    const vehiclesForPricing = quotation.vehicles.map((v) => ({ no_of_seats: v.vehicle.no_of_seats }));
+    const vehicleValuesForPricing = isMotor
+      ? quotation.vehicles.map((v) =>
+          currentVehicleValue(v.vehicle.estimated_value, v.vehicle.initial_assessment_date, quotation.coverage_start_at)
+        )
+      : [];
+    const riskAddressValueForPricing =
+      className === "Property" && riskAddress?.address?.estimated_value != null
+        ? Number(riskAddress.address.estimated_value)
+        : null;
+
+    // Regroups the quotation's already-per-vehicle-expanded coverage rows
+    // back into one selection per coverage_id (mirroring
+    // EditQuotationDialog.jsx's own reconstructSelections, and PATCH /:id's
+    // own re-pricing above) — resolveCoverageRows expects one entry per
+    // coverage with vehicle_indices naming every vehicle it targets, not one
+    // entry per already-expanded row.
+    const vehicleIndexByQuotationVehicleId = new Map(quotation.vehicles.map((v, i) => [v.id, i]));
+    const coverageGroups = new Map();
+    for (const c of quotation.coverages) {
+      if (!coverageGroups.has(c.coverage_id)) {
+        coverageGroups.set(c.coverage_id, {
+          coverage_amount: c.coverage_amount,
+          premium_amount: c.premium_amount,
+          pricing_mode: c.coverage.pricing_mode,
+          indices: [],
+        });
+      }
+      if (isMotor && c.policy_quotation_vehicle_id) {
+        const idx = vehicleIndexByQuotationVehicleId.get(c.policy_quotation_vehicle_id);
+        if (idx !== undefined) coverageGroups.get(c.coverage_id).indices.push(idx);
+      }
+    }
+    const coveragesForPricing = Array.from(coverageGroups.entries()).map(([coverageId, g]) => {
+      // A VEHICLE_SEATS_BASED selection's own coverage_amount is the agent's
+      // chosen "insured amount for each occupant" (the tier key) — but the
+      // stored QuotationCoverage row already carries the *resolved* total
+      // (seats × that tier key, see resolveCoverageRows's own
+      // VEHICLE_SEATS_BASED branch), not the tier key itself. Recover it by
+      // dividing back out by the first targeted vehicle's own seat count —
+      // every vehicle a single selection targets shares the same
+      // agent-picked tier, so any one of them recovers the same key.
+      let coverageAmountForSelection = Number(g.coverage_amount);
+      if (g.pricing_mode === "VEHICLE_SEATS_BASED") {
+        const firstVehicleIndex = g.indices[0] ?? 0;
+        const seats = Number(quotation.vehicles[firstVehicleIndex]?.vehicle.no_of_seats);
+        if (seats > 0) {
+          coverageAmountForSelection = round2(coverageAmountForSelection / seats);
+        }
+      }
+      return {
+        coverage_id: coverageId,
+        coverage_amount: coverageAmountForSelection,
+        premium_amount: Number(g.premium_amount),
+        vehicle_indices: !isMotor || g.indices.length >= quotation.vehicles.length ? null : g.indices,
+      };
+    });
+
+    const freshlyResolvedRows = await resolveCoverageRows({
+      coverages: coveragesForPricing,
+      className,
+      vehicles: vehiclesForPricing,
+      vehicleValues: vehicleValuesForPricing,
+      addressValue: riskAddressValueForPricing,
+      agentId: quotation.agent_id,
+      startAt: quotation.coverage_start_at,
+      endAt: quotation.coverage_end_at,
+    });
+    // Keyed by (coverage, vehicle) exactly like the quotation's own already-
+    // expanded rows, so each one can be updated with its own freshly
+    // resolved payable_to_bethel/applied_rate below — see the
+    // applicationCoverage.createMany call further down.
+    const freshRowByKey = new Map(freshlyResolvedRows.map((r) => [`${r.coverage_id}:${r.vehicle_index ?? "null"}`, r]));
 
     // The rule the agent asked for: never let the same vehicle, or (for an
     // address-based/Property product) the same risk address, carry an
@@ -1293,17 +1415,31 @@ router.post("/:id/submit", validateParams(quotationIdParamSchema), validateBody(
       }
 
       await tx.applicationCoverage.createMany({
-        data: quotation.coverages.map((c) => ({
-          application_id: application.id,
-          coverage_id: c.coverage_id,
-          policy_application_vehicle_id: c.policy_quotation_vehicle_id
-            ? applicationVehicleIdByQuotationVehicleId.get(c.policy_quotation_vehicle_id)
-            : null,
-          coverage_amount: c.coverage_amount,
-          premium_amount: c.premium_amount,
-          payable_to_bethel: c.payable_to_bethel,
-          applied_rate: c.applied_rate,
-        })),
+        data: quotation.coverages.map((c) => {
+          // Same key shape as freshRowByKey above — falls back to the
+          // quotation's own stored values only if a row somehow can't be
+          // matched (should never happen, since coveragesForPricing was
+          // built from these exact same rows), rather than leaving the new
+          // application with a null payable_to_bethel.
+          const vehicleIndex = c.policy_quotation_vehicle_id
+            ? vehicleIndexByQuotationVehicleId.get(c.policy_quotation_vehicle_id)
+            : null;
+          const fresh = freshRowByKey.get(`${c.coverage_id}:${vehicleIndex ?? "null"}`);
+          return {
+            application_id: application.id,
+            coverage_id: c.coverage_id,
+            policy_application_vehicle_id: c.policy_quotation_vehicle_id
+              ? applicationVehicleIdByQuotationVehicleId.get(c.policy_quotation_vehicle_id)
+              : null,
+            coverage_amount: c.coverage_amount,
+            premium_amount: c.premium_amount,
+            // Re-resolved just above against the agent's CURRENT rates, not
+            // the quotation's own possibly-stale ones — see this route's own
+            // rate-consistency check.
+            payable_to_bethel: fresh ? fresh.payable_to_bethel : c.payable_to_bethel,
+            applied_rate: fresh ? fresh.applied_rate : c.applied_rate,
+          };
+        }),
       });
 
       for (const addr of quotation.addresses) {

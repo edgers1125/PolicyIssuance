@@ -517,8 +517,14 @@ export function PolicyDetailDialog({ open, policyId, policyNumber, token, onClos
         <DialogContent dividers>
           <Box sx={{ display: "flex", gap: 3, flexDirection: { xs: "column", md: "row" } }}>
             <Box sx={{ flex: 1, minWidth: 0 }}>
-              <PdfViewer url={pdfUrl} loading={pdfLoading} error={pdfError} height={{ xs: "42vh", md: "75vh" }} />
-              <Stack direction="row" spacing={1} sx={{ mt: 1, flexWrap: "wrap" }}>
+              {/* Above the PDF, not below it — with the preview itself
+                  standing 75vh tall on desktop, an action bar placed after
+                  it used to fall below the dialog's own visible area,
+                  needing a full scroll past the preview (and, on desktop,
+                  past the Endorsement History pane's own height too) before
+                  "Export PDF" was even visible. Putting it here means it's
+                  on screen the instant the dialog opens. */}
+              <Stack direction="row" spacing={1} sx={{ mb: 1, flexWrap: "wrap" }}>
                 <Button size="small" startIcon={<PrintIcon />} onClick={() => window.open(pdfUrl, "_blank")} disabled={!pdfUrl}>
                   Export PDF
                 </Button>
@@ -530,10 +536,11 @@ export function PolicyDetailDialog({ open, policyId, policyNumber, token, onClos
                 </Button>
               </Stack>
               {resendResult && (
-                <Alert severity={resendResult.severity} sx={{ mt: 1 }} onClose={() => setResendResult(null)}>
+                <Alert severity={resendResult.severity} sx={{ mb: 1 }} onClose={() => setResendResult(null)}>
                   {resendResult.message}
                 </Alert>
               )}
+              <PdfViewer url={pdfUrl} loading={pdfLoading} error={pdfError} height={{ xs: "42vh", md: "75vh" }} />
               {/* Phone-only: the two panes stack vertically here (see this
                   Box's parent flexDirection), and the PDF actions above can
                   otherwise look like the end of the dialog's content — this

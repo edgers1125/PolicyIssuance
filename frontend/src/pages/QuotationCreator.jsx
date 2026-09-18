@@ -57,6 +57,7 @@ import { formatPeriodLabel } from "../utils/coveragePeriods";
 import { currentVehicleValue, findApplicableValueTier } from "../utils/vehicleValue";
 import { NumberField } from "../components/NumberField";
 import { PdfViewer } from "../components/PdfViewer";
+import { canOverrideBackdating, todayFloorLocal } from "../utils/backdating";
 
 const emptyCustomer = {
   first_name: "",
@@ -141,11 +142,18 @@ function toLocalDateTimeInput(value) {
 }
 
 // Resolves a single vehicle's current (depreciated) value the same way the
-// server does for a brand-new one: "now" is its assessment date, since it's
-// being assessed for the first time right this moment.
-function vehicleCurrentValue(vehicle) {
+// server does — depreciated as of this filing's own coverage_start_at
+// (asOf), never "now": a renewal is very often filed with a coverage start
+// date in the future (typically the prior policy's own expiry_date), and
+// previewing off today's date instead of the date the new coverage actually
+// takes effect would show the agent a different number than what the server
+// actually charges at submission. A brand-new vehicle has no
+// initial_assessment_date yet, so it falls back to its own raw
+// estimated_value undiminished, same as currentVehicleValue does for any
+// null initialAssessmentDate.
+function vehicleCurrentValue(vehicle, asOf) {
   if (!vehicle) return null;
-  return currentVehicleValue(vehicle.estimated_value, vehicle.initial_assessment_date || new Date());
+  return currentVehicleValue(vehicle.estimated_value, vehicle.initial_assessment_date, asOf);
 }
 
 // coverage_end_at is never entered directly — it's always coverage_start_at
@@ -180,7 +188,7 @@ function addDaysToLocalDateTime(value, days) {
 // selection with no vehicle_indices applies to the whole policy — every
 // vehicle on the application; one with a specific (possibly multi-vehicle)
 // list applies to just those.
-function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
+function resolveCoverageSelection(cov, selection, vehicles, addressValue, asOf) {
   if (!selection) return null;
 
   // Property has no vehicle concept at all — treat it as a single virtual
@@ -214,7 +222,7 @@ function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
       // Motor prices off the targeted vehicle's own (depreciated) value;
       // Property has no vehicles at all, so it prices off the risk
       // address's own estimated value instead.
-      const targetValue = idx !== null ? vehicleCurrentValue(vehicles[idx]) : Number(addressValue) || null;
+      const targetValue = idx !== null ? vehicleCurrentValue(vehicles[idx], asOf) : Number(addressValue) || null;
       if (targetValue === null || targetValue === undefined) {
         return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
       }
@@ -1137,6 +1145,11 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
     ? addDaysToLocalDateTime(coverageStartAt, Number(coveragePeriodDays))
     : "";
 
+  // Every VALUE_PERCENTAGE preview depreciates a vehicle as of this filing's
+  // own coverage_start_at (see vehicleCurrentValue's own comment) — falls
+  // back to "now" only until the agent has actually picked one.
+  const depreciationAsOf = coverageStartAt ? new Date(coverageStartAt) : new Date();
+
   // The latest expiry date among every vehicle row's own still-ACTIVE
   // existing policy (if more than one vehicle has one) — coverage can't
   // start before whichever of them expires last, since POST /policy-quotations
@@ -1149,6 +1162,18 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
     return latest;
   }, null);
   const minCoverageStartAt = blockingPolicy ? toLocalDateTimeInput(blockingPolicy.expiry_date) : "";
+
+  // A regular agent can never file with an inception date before today —
+  // only a caller holding one of the admin-tier permissions (see
+  // utils/backdating.js) can. Purely a UX guardrail; the server enforces
+  // this independently and always wins. Doesn't touch the separate
+  // vehicle-conflict floor (minCoverageStartAt) above.
+  const canBackdate = canOverrideBackdating(permissions);
+  const effectiveMinCoverageStartAt = canBackdate
+    ? minCoverageStartAt || undefined
+    : minCoverageStartAt && minCoverageStartAt > todayFloorLocal()
+      ? minCoverageStartAt
+      : todayFloorLocal();
 
   const isMotor = selectedClass?.class_name === "Motor";
   const isProperty = selectedClass?.class_name === "Property";
@@ -1207,7 +1232,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
     if (coverageId === grossTargetCoverageId) return sum;
     const cov = coverages.find((c) => c.id === coverageId);
     if (!cov) return sum;
-    const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue);
+    const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue, depreciationAsOf);
     return sum + (resolved?.premium_amount || 0);
   }, 0);
 
@@ -1216,7 +1241,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
   // minPremiumPerVehicle/pending/noTier; the real premium is solved below.
   const targetFloorResolved =
     isGrossMode && targetSelection
-      ? resolveCoverageSelection(grossTargetCoverage, targetSelection, coverageVehicles, riskAddressValue)
+      ? resolveCoverageSelection(grossTargetCoverage, targetSelection, coverageVehicles, riskAddressValue, depreciationAsOf)
       : null;
   const targetVehicleCount = countTargetedVehicles(targetSelection, coverageVehicles);
 
@@ -1259,7 +1284,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
   const totalPremium = Object.entries(effectiveCoverageSelections).reduce((sum, [coverageId, selection]) => {
     const cov = coverages.find((c) => c.id === coverageId);
     if (!cov) return sum;
-    const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue);
+    const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue, depreciationAsOf);
     return sum + (resolved?.premium_amount || 0);
   }, 0);
   const docStamps = totalPremium * DOC_STAMPS_RATE;
@@ -1855,6 +1880,10 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
       );
       return;
     }
+    if (!canBackdate && coverageStartAt < todayFloorLocal()) {
+      setError("Insured from cannot be before today.");
+      return;
+    }
     if (!coveragePeriodDays) {
       setError("Select a coverage period.");
       return;
@@ -1897,7 +1926,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
         setError(`Select which vehicle(s) ${cov.coverage_name} applies to, or apply it to the whole policy.`);
         return;
       }
-      const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue);
+      const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue, depreciationAsOf);
       if (resolved.pending) {
         setError(
           cov.pricing_mode === "VALUE_PERCENTAGE"
@@ -1990,7 +2019,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
           // server ignores whatever's sent here anyway and recomputes it.
           const resolvedPremium =
             cov?.pricing_mode === "FLAT_TIER"
-              ? resolveCoverageSelection(cov, v, coverageVehicles, riskAddressValue)?.premium_amount
+              ? resolveCoverageSelection(cov, v, coverageVehicles, riskAddressValue, depreciationAsOf)?.premium_amount
               : null;
           return {
             coverage_id,
@@ -2097,7 +2126,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
     vehicles: isMotor ? vehicles : [],
     coverages: Object.entries(effectiveCoverageSelections).map(([id, sel]) => {
       const cov = coverages.find((c) => c.id === id);
-      const resolved = cov ? resolveCoverageSelection(cov, sel, coverageVehicles, riskAddressValue) : null;
+      const resolved = cov ? resolveCoverageSelection(cov, sel, coverageVehicles, riskAddressValue, depreciationAsOf) : null;
       // Only worth spelling out which vehicle(s) a coverage applies to when
       // there's more than one on the application — otherwise it's implicit.
       const scopedToAll = sel.vehicle_indices === null || sel.vehicle_indices === undefined;
@@ -2210,7 +2239,8 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
             </Paper>
           )}
 
-          {/* Insured party */}
+          {/* Insured party: hidden for an ADMIN_CREATE_QUOTATION caller until a Filing Agent is picked above. */}
+          {(!canFileForOtherAgent || filingAgentId) && (
           <Paper sx={{ p: { xs: 2, sm: 3 }, borderRadius: 3 }}>
             <Typography variant="subtitle1" sx={{ fontWeight: 600, mb: 2 }}>
               Insured Party
@@ -2495,6 +2525,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
               </Grid>
             )}
           </Paper>
+          )}
 
           {/* Insured Address — the address the policy will actually be named
               on, for both Motor and Property, collected right after the
@@ -3228,14 +3259,16 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                     type="datetime-local"
                     value={coverageStartAt}
                     onChange={(e) => setCoverageStartAt(e.target.value)}
-                    slotProps={{ inputLabel: { shrink: true }, htmlInput: { min: minCoverageStartAt || undefined } }}
+                    slotProps={{ inputLabel: { shrink: true }, htmlInput: { min: effectiveMinCoverageStartAt } }}
                     required
                     fullWidth
                     error={Boolean(blockingPolicy && minCoverageStartAt && coverageStartAt && coverageStartAt < minCoverageStartAt)}
                     helperText={
                       blockingPolicy
                         ? `Must be on or after ${minCoverageStartAt.replace("T", " ")} — when ${blockingPolicy.policy_number} expires.`
-                        : ""
+                        : !canBackdate
+                          ? "Cannot be before today"
+                          : ""
                     }
                   />
                 </Grid>
@@ -3312,7 +3345,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                   <Stack spacing={1.5} divider={<Divider />}>
                     {requiredCoverages.map((cov) => {
                       const selection = coverageSelections[cov.id];
-                      const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue) : null;
+                      const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue, depreciationAsOf) : null;
                       return (
                         <Box key={cov.id}>
                           <Typography variant="body2" sx={{ fontWeight: 600 }}>
@@ -3338,7 +3371,7 @@ export function QuotationCreator({ onClose, onCreated } = {}) {
                       const rawSelection = coverageSelections[cov.id];
                       const isGrossTargetRow = isGrossMode && cov.id === grossTargetCoverageId;
                       const selection = effectiveCoverageSelections[cov.id];
-                      const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue) : null;
+                      const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue, depreciationAsOf) : null;
                       const periodAllowed = coverageAllowsPeriod(cov, coveragePeriodDays);
                       const isPriced = !periodAllowed || coverageIsPriced(cov);
                       return (

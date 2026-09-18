@@ -7,8 +7,8 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 // claws back against the policy's own original bucket instead of opening a
 // new one (see applyDebitToOriginalBucket below) — the same sign convention
 // routes/endorsements.js's own POST /:id/approve already relies on (an
-// ADD_COVERAGE line's margin is always >= 0, floor-enforced at pricing time;
-// a REMOVE_CLAUSE line's own debit is always <= 0).
+// ADD_COVERAGE line's own payable_to_bethel is always >= 0; a REMOVE_CLAUSE
+// line's own debit is always <= 0).
 function isBucketTransactionType(transactionType, amount) {
   if (transactionType === "ISSUANCE") return true;
   if (transactionType === "ENDORSEMENT") return Number(amount) >= 0;

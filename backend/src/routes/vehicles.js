@@ -80,6 +80,12 @@ router.get("/lookup", validateQuery(lookupVehicleQuerySchema), async (req, res, 
       product_variant_name: vehicle.product_variant?.variant_name || null,
       estimated_value: vehicle.estimated_value,
       initial_assessment_date: vehicle.initial_assessment_date,
+      // A same-day preview only — as of "now", since a plate lookup happens
+      // before the agent has picked a coverage_start_at to depreciate
+      // against. Not currently read anywhere on the frontend, and not what
+      // actually prices the policy either way: the authoritative figure is
+      // resolveVehicleValue's own currentVehicleValue() call (policyApplications.js/
+      // policyQuotations.js), evaluated as of the filing's own coverage_start_at.
       current_value: currentVehicleValue(vehicle.estimated_value, vehicle.initial_assessment_date),
       current_owner: currentCustomer
         ? { type: "CUSTOMER", id: currentCustomer.id, name: `${currentCustomer.first_name} ${currentCustomer.last_name}` }

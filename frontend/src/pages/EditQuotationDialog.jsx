@@ -29,6 +29,7 @@ import { formatPeriodLabel } from "../utils/coveragePeriods";
 import { currentVehicleValue, findApplicableValueTier } from "../utils/vehicleValue";
 import { NumberField } from "../components/NumberField";
 import { PdfViewer } from "../components/PdfViewer";
+import { canOverrideBackdating, todayFloorLocal } from "../utils/backdating";
 
 const DOC_STAMPS_RATE = 0.125;
 const VAT_RATE = 0.12;
@@ -66,7 +67,7 @@ function toLocalDateTimeInput(value) {
 // non-authoritative pricing preview (the server always recomputes and
 // enforces this independently on save). Vehicles here are the quotation's
 // own fixed list (never edited from this dialog), not user-entered ones.
-function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
+function resolveCoverageSelection(cov, selection, vehicles, addressValue, asOf) {
   if (!selection) return null;
 
   const scopedToAll = selection.vehicle_indices === null || selection.vehicle_indices === undefined;
@@ -94,7 +95,7 @@ function resolveCoverageSelection(cov, selection, vehicles, addressValue) {
       // Property has no vehicles at all, so it prices off the quotation's
       // fixed risk address value instead (never edited from this dialog).
       const targetValue = vehicle
-        ? currentVehicleValue(vehicle.estimated_value, vehicle.initial_assessment_date || new Date())
+        ? currentVehicleValue(vehicle.estimated_value, vehicle.initial_assessment_date, asOf)
         : Number(addressValue) || null;
       if (targetValue === null || targetValue === undefined) {
         return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
@@ -214,6 +215,7 @@ function reconstructSelections(detail, isMotor) {
 }
 
 export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved }) {
+  const { permissions } = useAuth();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -341,10 +343,22 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
     ? addDaysToLocalDateTime(coverageStartAt, Number(coveragePeriodDays))
     : "";
 
+  // Every VALUE_PERCENTAGE preview depreciates a vehicle as of this edit's
+  // own coverage_start_at, never "now" — see PolicyApplication.jsx's own
+  // vehicleCurrentValue for the full reasoning (a renewal is very often
+  // priced for a future coverage_start_at).
+  const depreciationAsOf = coverageStartAt ? new Date(coverageStartAt) : new Date();
+
+  // A regular agent can never move a quotation's inception date to before
+  // today — only a caller holding one of the admin-tier permissions (see
+  // utils/backdating.js) can. Purely a UX guardrail; the server enforces
+  // this independently and always wins.
+  const canBackdate = canOverrideBackdating(permissions);
+
   const totalPremium = Object.entries(coverageSelections).reduce((sum, [coverageId, selection]) => {
     const cov = coverages.find((c) => c.id === coverageId);
     if (!cov) return sum;
-    const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue);
+    const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue, depreciationAsOf);
     return sum + (resolved?.premium_amount || 0);
   }, 0);
   const docStamps = totalPremium * DOC_STAMPS_RATE;
@@ -596,7 +610,7 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
       })),
       coverages: Object.entries(coverageSelections).map(([id, sel]) => {
         const cov = coverages.find((c) => c.id === id);
-        const resolved = cov ? resolveCoverageSelection(cov, sel, coverageVehicles, riskAddressValue) : null;
+        const resolved = cov ? resolveCoverageSelection(cov, sel, coverageVehicles, riskAddressValue, depreciationAsOf) : null;
         return {
           name: cov?.coverage_name || "",
           clause: cov?.clause || "",
@@ -645,9 +659,13 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
       setError("Set the coverage period.");
       return;
     }
+    if (!canBackdate && coverageStartAt < todayFloorLocal()) {
+      setError("Insured from cannot be before today.");
+      return;
+    }
     for (const [coverageId, selection] of entries) {
       const cov = coverages.find((c) => c.id === coverageId);
-      const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue);
+      const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue, depreciationAsOf);
       if (resolved.pending) {
         setError(`Finish pricing ${cov.coverage_name} before previewing.`);
         return;
@@ -703,7 +721,7 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
           // server ignores whatever's sent here anyway and recomputes it.
           const resolvedPremium =
             cov?.pricing_mode === "FLAT_TIER"
-              ? resolveCoverageSelection(cov, v, coverageVehicles, riskAddressValue)?.premium_amount
+              ? resolveCoverageSelection(cov, v, coverageVehicles, riskAddressValue, depreciationAsOf)?.premium_amount
               : null;
           return {
             coverage_id,
@@ -766,9 +784,10 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
                   type="datetime-local"
                   value={coverageStartAt}
                   onChange={(e) => setCoverageStartAt(e.target.value)}
-                  slotProps={{ inputLabel: { shrink: true } }}
+                  slotProps={{ inputLabel: { shrink: true }, htmlInput: { min: canBackdate ? undefined : todayFloorLocal() } }}
                   required
                   fullWidth
+                  helperText={!canBackdate ? "Cannot be before today" : undefined}
                 />
               </Grid>
               <Grid size={{ xs: 12, sm: 6 }}>
@@ -813,7 +832,7 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
                 <Stack spacing={1.5} divider={<Divider />}>
                   {requiredCoverages.map((cov) => {
                     const selection = coverageSelections[cov.id];
-                    const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue) : null;
+                    const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue, depreciationAsOf) : null;
                     return (
                       <Box key={cov.id}>
                         <Typography variant="body2" sx={{ fontWeight: 600 }}>
@@ -834,7 +853,7 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
             <Stack spacing={1.5} divider={<Divider />}>
               {optionalCoverages.map((cov) => {
                 const selection = coverageSelections[cov.id];
-                const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue) : null;
+                const resolved = selection ? resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue, depreciationAsOf) : null;
                 const periodAllowed = coverageAllowsPeriod(cov, coveragePeriodDays);
                 const isPriced = !periodAllowed || coverageIsPriced(cov);
                 return (
