@@ -22,6 +22,31 @@ function computeDueDate(basisDate, paymentTermsDays) {
   return new Date(new Date(basisDate).getTime() + paymentTermsDays * MS_PER_DAY);
 }
 
+// Atomically decrements one bucket's remaining_amount by amt in SQL (no
+// read-then-write, so two concurrent ledger writes against the same bucket
+// can't lose an update). A legacy row with a null remaining_amount is treated
+// as 0 — set to -amt instead (guarded on still being null, so it can't
+// clobber a value a concurrent writer just set).
+async function decrementBucket(tx, id, amt) {
+  const { count } = await tx.agentPayableTransaction.updateMany({
+    where: { id, remaining_amount: { not: null } },
+    data: { remaining_amount: { decrement: amt } },
+  });
+  if (count === 0) {
+    const legacy = await tx.agentPayableTransaction.updateMany({
+      where: { id, remaining_amount: null },
+      data: { remaining_amount: -amt },
+    });
+    if (legacy.count === 0) {
+      // Became non-null between the two statements — retry the decrement.
+      await tx.agentPayableTransaction.updateMany({
+        where: { id, remaining_amount: { not: null } },
+        data: { remaining_amount: { decrement: amt } },
+      });
+    }
+  }
+}
+
 // Locates the given policy's own ISSUANCE row and decrements its
 // remaining_amount by debitAmount (a positive number) — used by a
 // REMOVE_CLAUSE-debit ENDORSEMENT row and by a CANCELLED_POLICY row, both of
@@ -38,10 +63,7 @@ async function applyDebitToOriginalBucket(tx, policyId, debitAmount) {
     select: { id: true, remaining_amount: true },
   });
   if (!issuance) return null;
-  await tx.agentPayableTransaction.update({
-    where: { id: issuance.id },
-    data: { remaining_amount: Number(issuance.remaining_amount || 0) - debitAmount },
-  });
+  await decrementBucket(tx, issuance.id, debitAmount);
   return issuance.id;
 }
 
@@ -74,22 +96,12 @@ async function allocatePaymentFifo(tx, agentId, paymentAmount) {
     const bucketRemaining = Number(bucket.remaining_amount || 0);
     if (bucketRemaining <= 0) continue;
     const applied = Math.min(remainingToApply, bucketRemaining);
-    await tx.agentPayableTransaction.update({
-      where: { id: bucket.id },
-      data: { remaining_amount: bucketRemaining - applied },
-    });
+    await decrementBucket(tx, bucket.id, applied);
     remainingToApply -= applied;
     lastTouchedId = bucket.id;
   }
   if (remainingToApply > 0) {
-    const last = await tx.agentPayableTransaction.findUnique({
-      where: { id: lastTouchedId },
-      select: { remaining_amount: true },
-    });
-    await tx.agentPayableTransaction.update({
-      where: { id: lastTouchedId },
-      data: { remaining_amount: Number(last.remaining_amount || 0) - remainingToApply },
-    });
+    await decrementBucket(tx, lastTouchedId, remainingToApply);
   }
 }
 
@@ -124,6 +136,7 @@ async function computeAgentPayableBalances(prisma) {
 module.exports = {
   isBucketTransactionType,
   computeDueDate,
+  decrementBucket,
   applyDebitToOriginalBucket,
   allocatePaymentFifo,
   computeAgentPayableBalances,

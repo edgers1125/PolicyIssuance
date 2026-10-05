@@ -57,6 +57,13 @@ const listInsuranceClassesQuerySchema = z.object({
   status: z.enum(["ACTIVE", "INACTIVE", "ALL"]).optional().default("ACTIVE"),
 });
 
+// GET /product-catalog's optional agent_id — annotate the catalog with THAT
+// agent's effective rates instead of the caller's own. Shape-only here; the
+// route itself 403s it unless the caller holds an admin-tier filing grant.
+const productCatalogQuerySchema = z.object({
+  agent_id: z.string().uuid("agent_id must be a valid UUID").optional(),
+});
+
 // Both optional — gated entirely behind MANAGE_SETTINGS.MANAGE_PRODUCTS.EDIT_DETAILS.
 const updateInsuranceClassSchema = z.object({
   class_name: z.string().min(1, "class_name cannot be empty").optional(),
@@ -134,6 +141,7 @@ module.exports = {
   updateProductVariantSchema,
   insuranceClassIdParamSchema,
   listInsuranceClassesQuerySchema,
+  productCatalogQuerySchema,
   updateInsuranceClassSchema,
   createInsuranceClassSchema,
   createProductVariantSchema,

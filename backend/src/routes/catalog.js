@@ -16,6 +16,7 @@ const {
   updateProductVariantSchema,
   insuranceClassIdParamSchema,
   listInsuranceClassesQuerySchema,
+  productCatalogQuerySchema,
   updateInsuranceClassSchema,
   createInsuranceClassSchema,
   createProductVariantSchema,
@@ -27,17 +28,44 @@ const router = express.Router();
 
 // Feeds both PolicyApplication.jsx (CREATE_APPLICATION) and
 // QuotationCreator.jsx (QUOTATION_TRACKER.CREATE_QUOTATION/
-// ADMIN_CREATE_QUOTATION) — see INTAKE_PERMISSIONS (middleware/permissions.js).
+// ADMIN_CREATE_QUOTATION) — see INTAKE_PERMISSIONS (middleware/permissions.js)
+// — and the admin Policy Application form (APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION),
+// whose holder may hold none of the intake grants.
+const CATALOG_AGENT_OVERRIDE_PERMISSIONS = [
+  "QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION",
+  "APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION",
+];
 router.get(
   "/product-catalog",
   requireAuth,
-  requireAnyPermission(INTAKE_PERMISSIONS),
+  requireAnyPermission([...INTAKE_PERMISSIONS, "APPROVE_APPLICATION.ADMIN_POLICYAPPLICATION"]),
+  validateQuery(productCatalogQuerySchema),
   async (req, res, next) => {
     try {
-      const user = await prisma.user.findUnique({
-        where: { id: req.user.userId },
-        select: { agent_id: true },
-      });
+      // ?agent_id= lets an admin-tier filer (quotation or admin application
+      // under a chosen agent) see THAT agent's rates instead of their own.
+      let baseAgentId;
+      if (req.query.agent_id) {
+        const actingPermissions = await getUserPermissionCodes(req.user.userId);
+        if (!ensureAnyPermission(res, actingPermissions, CATALOG_AGENT_OVERRIDE_PERMISSIONS)) return;
+        baseAgentId = req.query.agent_id;
+      } else {
+        const user = await prisma.user.findUnique({
+          where: { id: req.user.userId },
+          select: { agent_id: true },
+        });
+        baseAgentId = user?.agent_id ?? null;
+      }
+      // Same effective-agent resolution lib/coveragePricing.js's
+      // resolveCoverageRows uses — an INDIVIDUAL employed under a CORPORATE
+      // agency prices off the company's own overrides, so the catalog has to
+      // show those, not the individual's dormant ones.
+      const baseAgent = baseAgentId
+        ? await prisma.agent.findUnique({ where: { id: baseAgentId }, select: { id: true, company_id: true } })
+        : null;
+      if (req.query.agent_id && !baseAgent) {
+        return res.status(400).json({ error: "agent_id does not match an existing agent" });
+      }
       // The nil UUID — never matches a real agent id, so the nested
       // `where: { agent_id }` filters below run unconditionally (returning no
       // override rows) instead of branching the whole query shape on whether
@@ -45,7 +73,7 @@ router.get(
       // uuid, not just an arbitrary sentinel string — agent_id is a uuid
       // column, and Postgres rejects a non-uuid literal at the query level
       // (a 500) before it ever gets the chance to just not match any row.
-      const agentId = user?.agent_id ?? "00000000-0000-0000-0000-000000000000";
+      const agentId = baseAgent ? baseAgent.company_id || baseAgent.id : "00000000-0000-0000-0000-000000000000";
 
       const classes = await prisma.insuranceClass.findMany({
         where: { status: "ACTIVE" },

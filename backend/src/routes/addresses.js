@@ -2,9 +2,9 @@ const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
 const { requireAnyPermission, INTAKE_PERMISSIONS } = require("../middleware/permissions");
-const { validateBody } = require("../middleware/validate");
+const { validateBody, validateParams } = require("../middleware/validate");
 const { getCurrentAgentId } = require("../lib/agent");
-const { updateAddressSchema } = require("../schemas/addresses");
+const { updateAddressSchema, addressIdParamSchema } = require("../schemas/addresses");
 
 const router = express.Router();
 
@@ -27,7 +27,7 @@ async function agentCanEditAddress(agentId, addressId) {
   return Boolean(owned);
 }
 
-router.patch("/:id", validateBody(updateAddressSchema), async (req, res, next) => {
+router.patch("/:id", validateParams(addressIdParamSchema), validateBody(updateAddressSchema), async (req, res, next) => {
   try {
     const { id } = req.params;
     const agentId = await getCurrentAgentId(req.user.userId);

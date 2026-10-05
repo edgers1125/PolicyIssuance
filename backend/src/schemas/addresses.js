@@ -14,4 +14,9 @@ const updateAddressSchema = z.object({
   estimated_value: z.preprocess((v) => (v === "" ? undefined : v), z.coerce.number().nonnegative().optional()),
 });
 
-module.exports = { updateAddressSchema };
+// PATCH /:id — rejects a malformed id with a 400 before it reaches Prisma.
+const addressIdParamSchema = z.object({
+  id: z.string().uuid("id must be a valid UUID"),
+});
+
+module.exports = { updateAddressSchema, addressIdParamSchema };

@@ -6,7 +6,12 @@ const { validateBody, validateQuery, validateParams } = require("../middleware/v
 const { getCurrentAgentId } = require("../lib/agent");
 const { fetchByPriority } = require("../lib/priorityPagination");
 const { resolveCoverageRows, computeChargeTotals, round2 } = require("../lib/coveragePricing");
-const { computeDueDate, applyDebitToOriginalBucket } = require("../lib/agentPayables");
+const {
+  computeDueDate,
+  applyDebitToOriginalBucket,
+  decrementBucket,
+  isBucketTransactionType,
+} = require("../lib/agentPayables");
 const { currentVehicleValue } = require("../lib/vehicleValue");
 const {
   VEHICLE_CHANGE_TYPES,
@@ -244,7 +249,11 @@ async function priceAddCoverageChange(policy, baseline, input) {
     }
     vehicles = [{ no_of_seats: policyVehicle.no_of_seats_snapshot }];
     vehicleValues = [
-      currentVehicleValue(policyVehicle.vehicle.estimated_value, policyVehicle.vehicle.initial_assessment_date),
+      currentVehicleValue(
+        policyVehicle.vehicle.estimated_value,
+        policyVehicle.vehicle.initial_assessment_date,
+        new Date(baseline.effective_date)
+      ),
     ];
     vehicleIndices = [0];
   }
@@ -272,6 +281,7 @@ async function priceAddCoverageChange(policy, baseline, input) {
     vehicleValues,
     addressValue,
     agentId: policy.agent_id,
+    productVariantId: policy.product_variant_id,
     startAt: new Date(baseline.effective_date),
     endAt: new Date(baseline.expiry_date),
   });
@@ -625,18 +635,66 @@ function computeEndorsementChargeDelta(changes, policy) {
 // day-prorated portion of it a CANCEL_POLICY endorsement's approval hands
 // back — see EndorsementChangeType.CANCEL_POLICY's own comment for why this
 // is computed fresh at approval time rather than at filing.
-function computeCancellationProration({ basisAmount, effectiveDate, expiryDate, cancellationDate }) {
-  const totalDays = Math.max(0, Math.round((new Date(expiryDate).getTime() - new Date(effectiveDate).getTime()) / MS_PER_DAY));
-  const rawElapsed = Math.round((new Date(cancellationDate).getTime() - new Date(effectiveDate).getTime()) / MS_PER_DAY);
-  const elapsedDays = Math.min(totalDays, Math.max(0, rawElapsed));
-  const remainingDays = totalDays - elapsedDays;
-  const dailyRate = totalDays > 0 ? basisAmount / totalDays : 0;
-  const deduction = round2(dailyRate * remainingDays);
+//
+// Business rule: the agent's payable to Bethel is earned from each ledger
+// component's own start date up to the cancellation date; only the unused
+// remainder (cancellation → expiry) is refunded. Each component is refunded
+// for its OWN unused fraction rather than prorating the summed total over the
+// whole term (which double-prorated ENDORSEMENT rows — those were already
+// prorated from their endorsement's effective_date when posted):
+//   ISSUANCE:    amount × (expiry − cancel) / (expiry − policy effective)
+//   ENDORSEMENT: amount × (expiry − cancel) / (expiry − that endorsement's effective_date)
+// each fraction clamped to [0, 1]. `components` is
+// [{ transactionType, amount, startDate, label }]. A negative ENDORSEMENT row
+// (a REMOVE_CLAUSE/VEHICLE_ESTIMATED_VALUE debit) contributes a negative
+// refund, netting against the rest; the total deduction is floored at 0 since
+// a CANCELLED_POLICY row must always debit (DB CHECK constraint).
+function computeCancellationProration({ components, expiryDate, cancellationDate }) {
+  const expiryMs = new Date(expiryDate).getTime();
+  const cancelMs = new Date(cancellationDate).getTime();
+  const unusedDays = Math.max(0, Math.round((expiryMs - cancelMs) / MS_PER_DAY));
+  const lines = [];
+  const refunds = [];
+  let rawTotal = 0;
+  for (const c of components) {
+    const startMs = new Date(c.startDate).getTime();
+    const spanDays = Math.max(0, Math.round((expiryMs - startMs) / MS_PER_DAY));
+    const fraction = expiryMs - startMs > 0 ? Math.max(0, Math.min(1, (expiryMs - cancelMs) / (expiryMs - startMs))) : 0;
+    const refund = round2(Number(c.amount) * fraction);
+    refunds.push(refund);
+    rawTotal += refund;
+    lines.push(
+      `${c.label}: ₱${formatMoney(Number(c.amount))} × ${Math.min(unusedDays, spanDays)}/${spanDays} unused day(s) ` +
+        `(from ${new Date(c.startDate).toISOString().slice(0, 10)}) = ₱${formatMoney(refund)}`
+    );
+  }
+  const deduction = Math.max(0, round2(rawTotal));
   const description =
-    `Policy cancellation proration: ${totalDays}-day term, ${elapsedDays} day(s) used, ${remainingDays} day(s) unused ` +
-    `at ₱${formatMoney(dailyRate)}/day (total payable to Bethel accrued to date: ₱${formatMoney(basisAmount)}) ` +
-    `→ payable deduction ₱${formatMoney(deduction)}. Cancellation effective ${new Date(cancellationDate).toISOString().slice(0, 10)}.`;
-  return { totalDays, elapsedDays, remainingDays, dailyRate, deduction, description };
+    `Policy cancellation effective ${new Date(cancellationDate).toISOString().slice(0, 10)}, expiry ` +
+    `${new Date(expiryDate).toISOString().slice(0, 10)} (${unusedDays} unused day(s)). Per-component refund: ` +
+    (lines.length ? lines.join("; ") : "no ISSUANCE/ENDORSEMENT payable on file") +
+    `. Total payable deduction ₱${formatMoney(deduction)}` +
+    (round2(rawTotal) < 0 ? ` (net computed ₱${formatMoney(round2(rawTotal))}, floored at 0)` : "") +
+    ".";
+  return { unusedDays, deduction, refunds, floored: round2(rawTotal) < 0, description };
+}
+
+// Business rule (B): a cancellation can't take effect before today (midnight
+// UTC floor, same convention as lib/backdating.js's assertCoverageStartNotBackdated)
+// nor after the policy's current (folded) expiry. Returns an error message,
+// or null when valid — callers pick the status (400 at filing, 409 at approval).
+function cancellationDateError(cancellationDate, currentExpiryDate, { atApproval = false } = {}) {
+  const todayFloor = new Date();
+  todayFloor.setUTCHours(0, 0, 0, 0);
+  if (new Date(cancellationDate) < todayFloor) {
+    return atApproval
+      ? "This cancellation's effective date has passed; reject it and re-file with a current date"
+      : "Cancellation effective_date cannot be before today";
+  }
+  if (new Date(cancellationDate) > new Date(currentExpiryDate)) {
+    return "Cancellation effective_date cannot be after the policy's current expiry date";
+  }
+  return null;
 }
 
 // How much of an ADD_COVERAGE/REMOVE_CLAUSE/VEHICLE_ESTIMATED_VALUE line's
@@ -934,9 +992,26 @@ router.post(
       if (policy.policy_status === "CANCELLED") {
         return res.status(400).json({ error: "This policy has been cancelled and cannot be endorsed" });
       }
+      if (request_type === "CANCELLATION") {
+        const pendingCancellation = await prisma.endorsementRequest.findFirst({
+          where: { policy_id, request_type: "CANCELLATION", status: "SUBMITTED" },
+          select: { endorsement_number: true },
+        });
+        if (pendingCancellation) {
+          return res.status(409).json({
+            error: `A cancellation request (${pendingCancellation.endorsement_number}) is already pending for this policy`,
+          });
+        }
+      }
 
       let resolvedChanges;
       if (request_type === "CANCELLATION") {
+        const priorApproved = (policy.endorsement_requests || []).flatMap((e) => e.changes);
+        const currentState = applyFoldedState(policy, foldEndorsementChanges(policy, priorApproved));
+        const dateError = cancellationDateError(effective_date, currentState.expiry_date);
+        if (dateError) {
+          return res.status(400).json({ error: dateError });
+        }
         resolvedChanges = [
           {
             policy_vehicle_id: null,
@@ -1065,6 +1140,12 @@ router.post(
       const priorApprovedChanges = (policy.endorsement_requests || []).flatMap((e) => e.changes);
       let resolvedChanges;
       if (request_type === "CANCELLATION") {
+        const priorApproved = (policy.endorsement_requests || []).flatMap((e) => e.changes);
+        const currentState = applyFoldedState(policy, foldEndorsementChanges(policy, priorApproved));
+        const dateError = cancellationDateError(effective_date, currentState.expiry_date);
+        if (dateError) {
+          return res.status(400).json({ error: dateError });
+        }
         resolvedChanges = [
           {
             change_type: "CANCEL_POLICY",
@@ -1449,6 +1530,7 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
         where: { id: endorsementId },
         select: {
           id: true,
+          endorsement_number: true,
           status: true,
           request_type: true,
           policy_id: true,
@@ -1458,6 +1540,7 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
             select: {
               id: true,
               change_type: true,
+              change_from: true,
               policy_vehicle_id: true,
               policy_coverage_id: true,
               product_coverage_id: true,
@@ -1497,21 +1580,55 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
         ? computeProrationFactor(folded.effective_date, folded.expiry_date, endorsement.effective_date)
         : 1;
 
+      if (endorsement.request_type === "CANCELLATION") {
+        const dateError = cancellationDateError(endorsement.effective_date, folded.expiry_date, { atApproval: true });
+        if (dateError) {
+          throw new HttpError(409, dateError);
+        }
+      }
+
       await prisma.$transaction(async (tx) => {
+        // Atomic claim: only one concurrent approve/reject can move this
+        // request out of SUBMITTED — the pre-checks above are just fast-fail.
+        const claim = await tx.endorsementRequest.updateMany({
+          where: { id: endorsement.id, status: "SUBMITTED" },
+          data: { status: "APPROVED" },
+        });
+        if (claim.count !== 1) {
+          throw new HttpError(409, "This endorsement has already been decided");
+        }
+        // Re-read inside the transaction: a concurrent cancellation of this
+        // same policy may have committed since the pre-transaction read.
+        const livePolicy = await tx.policy.findUnique({ where: { id: policy.id }, select: { policy_status: true } });
+        if (!livePolicy || livePolicy.policy_status === "CANCELLED") {
+          throw new HttpError(409, "This policy has been cancelled and can no longer be endorsed");
+        }
+
         if (endorsement.request_type === "CANCELLATION") {
-          // What this agent has been charged payable-to-Bethel so far across
-          // ISSUANCE + every approved ENDORSEMENT on this policy — cancelling
-          // early waives back the still-unused, day-prorated portion of it
-          // (see computeCancellationProration below), the same way a
-          // short-rate refund works.
-          const payableSoFar = await tx.agentPayableTransaction.aggregate({
+          // Every payable-to-Bethel ledger component on this policy
+          // (ISSUANCE + every ENDORSEMENT credit/debit) — each refunded for
+          // its own unused days only (see computeCancellationProration).
+          const ledgerRows = await tx.agentPayableTransaction.findMany({
             where: { policy_id: policy.id, transaction_type: { in: ["ISSUANCE", "ENDORSEMENT"] } },
-            _sum: { amount: true },
+            select: {
+              id: true,
+              transaction_type: true,
+              amount: true,
+              endorsement_request: { select: { endorsement_number: true, effective_date: true } },
+            },
+            orderBy: { created_at: "asc" },
           });
-          const basisAmount = Number(payableSoFar._sum.amount || 0);
+          const components = ledgerRows.map((row) => {
+            const isEndorsement = row.transaction_type === "ENDORSEMENT" && row.endorsement_request;
+            return {
+              transactionType: row.transaction_type,
+              amount: Number(row.amount),
+              startDate: isEndorsement ? row.endorsement_request.effective_date : folded.effective_date,
+              label: isEndorsement ? `ENDORSEMENT ${row.endorsement_request.endorsement_number}` : row.transaction_type,
+            };
+          });
           const proration = computeCancellationProration({
-            basisAmount,
-            effectiveDate: folded.effective_date,
+            components,
             expiryDate: folded.expiry_date,
             cancellationDate: endorsement.effective_date,
           });
@@ -1520,19 +1637,52 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
             where: { id: policy.id },
             data: { policy_status: "CANCELLED", cancelled_at: endorsement.effective_date },
           });
-          // A cancellation clawback claws back against the policy's own
-          // original ISSUANCE bucket (same treatment as a REMOVE_CLAUSE
-          // debit below) rather than opening an independent one — it's
-          // reducing the payable-to-Bethel amount already credited for
-          // *this* policy, not creating a new one of its own with a fresh
-          // due date. Recorded even when the deduction is exactly 0 (e.g.
-          // this policy's own basisAmount was already 0 — a legacy ISSUANCE
-          // row predating the fix that made ISSUANCE actually record
-          // payable_to_bethel, or a policy cancelled the same day it was
-          // issued with nothing yet earned to claw back), same "the ledger's
-          // own row-per-policy history stays complete, no silent gaps"
-          // reasoning as every other transaction_type in this table.
-          const appliesToId = await applyDebitToOriginalBucket(tx, policy.id, proration.deduction);
+          // Any other still-pending endorsement on this policy can never be
+          // approved now (see the CANCELLED check above) — auto-reject them
+          // so they don't sit in the Endorsement Approval queue forever.
+          const orphaned = await tx.endorsementRequest.findMany({
+            where: { policy_id: policy.id, status: "SUBMITTED", id: { not: endorsement.id } },
+            select: { id: true },
+          });
+          if (orphaned.length > 0) {
+            await tx.endorsementRequest.updateMany({
+              where: { id: { in: orphaned.map((o) => o.id) }, status: "SUBMITTED" },
+              data: { status: "REJECTED" },
+            });
+            await tx.endorsementApprovalHistory.createMany({
+              data: orphaned.map((o) => ({
+                endorsement_request_id: o.id,
+                approver_id: approverUserId,
+                decision: "REJECTED",
+                comments: `Automatically rejected: policy cancelled by endorsement ${endorsement.endorsement_number}`,
+                decision_date: new Date(),
+              })),
+            });
+          }
+          // Each component's refund claws back against its OWN bucket — the
+          // ISSUANCE row, or an ADD_COVERAGE-credited ENDORSEMENT row — so
+          // every bucket on this policy ends at what's actually still owed
+          // for it. (Putting the whole clawback on the ISSUANCE bucket alone
+          // drove it negative while the endorsement buckets stayed fully
+          // outstanding; FIFO payments skip negative buckets, so the
+          // Overview's overdue balance could never net back to 0.) A
+          // negative ENDORSEMENT row has no bucket of its own — it was
+          // clawed back against the ISSUANCE bucket when posted, so its
+          // (negative) refund is reversed there too. When the net is
+          // floored at 0, nothing moves. The CANCELLED_POLICY row itself is
+          // recorded even when the deduction is 0, so the ledger keeps one
+          // row per cancellation with no silent gaps.
+          const issuanceRow = ledgerRows.find((r) => r.transaction_type === "ISSUANCE");
+          if (!proration.floored) {
+            for (let i = 0; i < ledgerRows.length; i += 1) {
+              const row = ledgerRows[i];
+              const refund = proration.refunds[i];
+              if (!refund) continue;
+              const targetId = isBucketTransactionType(row.transaction_type, row.amount) ? row.id : issuanceRow?.id;
+              if (targetId) await decrementBucket(tx, targetId, refund);
+            }
+          }
+          const appliesToId = issuanceRow?.id ?? null;
           await tx.agentPayableTransaction.create({
             data: {
               agent_id: policy.agent_id,
@@ -1546,6 +1696,18 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
           });
           await tx.agent.update({ where: { id: policy.agent_id }, data: { payable: { decrement: proration.deduction } } });
         } else {
+          // The policy's own non-coverage misc component (its variant
+          // misc_fee as frozen at issuance), backed out of the stored misc
+          // total rather than re-read live off ProductVariant.misc_fee —
+          // a later catalog change must never move an issued policy's misc.
+          const miscCoveragesBefore = await tx.policyCoverage.findMany({
+            where: { policy_id: policy.id, removed_at: null, is_misc_snapshot: true },
+            select: { premium_amount: true },
+          });
+          const baseMisc = round2(
+            Number(policy.misc || 0) - miscCoveragesBefore.reduce((sum, c) => sum + Number(c.premium_amount), 0)
+          );
+
           let coverageSetChanged = false;
           for (const change of endorsement.changes) {
             if (change.change_type === "ADD_COVERAGE") {
@@ -1644,6 +1806,26 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
               if (!targetCoverage || targetCoverage.removed_at) {
                 throw new HttpError(409, "The value-based coverage this change targets has since been removed");
               }
+              // The deltas below were computed at filing against the
+              // coverage's then-current figures (frozen in change_from). If
+              // that row has moved since (another endorsement touched it),
+              // applying stale deltas would corrupt it — make the approver
+              // edit (re-price) or re-file the line instead. An unparseable
+              // change_from (legacy wording) skips the check.
+              const filedFrom = /Coverage Amount ₱([\d,.]+), Premium ₱([\d,.]+)$/.exec(change.change_from || "");
+              if (filedFrom) {
+                const filedCoverageAmount = round2(Number(filedFrom[1].replace(/,/g, "")));
+                const filedPremium = round2(Number(filedFrom[2].replace(/,/g, "")));
+                if (
+                  filedCoverageAmount !== round2(Number(targetCoverage.coverage_amount)) ||
+                  filedPremium !== round2(Number(targetCoverage.premium_amount))
+                ) {
+                  throw new HttpError(
+                    409,
+                    "The coverage this estimated-value correction targets has changed since it was filed — edit the line to re-price it, or reject and re-file"
+                  );
+                }
+              }
               const newCoverageAmount = round2(Number(targetCoverage.coverage_amount) + Number(change.coverage_amount));
               const newPremium = round2(Number(targetCoverage.premium_amount) + Number(change.premium_amount));
               const oldPayable =
@@ -1721,16 +1903,13 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
           }
 
           if (coverageSetChanged) {
-            const [activeCoverages, productVariant] = await Promise.all([
-              tx.policyCoverage.findMany({
-                where: { policy_id: policy.id, removed_at: null },
-                select: { premium_amount: true, is_misc_snapshot: true },
-              }),
-              tx.productVariant.findUnique({ where: { id: policy.product_variant_id }, select: { misc_fee: true } }),
-            ]);
+            const activeCoverages = await tx.policyCoverage.findMany({
+              where: { policy_id: policy.id, removed_at: null },
+              select: { premium_amount: true, is_misc_snapshot: true },
+            });
             const totals = computeChargeTotals(
               activeCoverages.map((c) => ({ premium_amount: c.premium_amount, is_misc: c.is_misc_snapshot })),
-              productVariant?.misc_fee
+              baseMisc
             );
             await tx.policy.update({
               where: { id: policy.id },
@@ -1745,7 +1924,6 @@ async function approveEndorsementRecord({ endorsementId, approverUserId, prorate
           }
         }
 
-        await tx.endorsementRequest.update({ where: { id: endorsement.id }, data: { status: "APPROVED" } });
         await tx.endorsementApprovalHistory.create({
           data: {
             endorsement_request_id: endorsement.id,
@@ -1845,9 +2023,17 @@ router.post(
         return res.status(409).json({ error: "This endorsement has already been rejected" });
       }
 
-      await prisma.$transaction([
-        prisma.endorsementRequest.update({ where: { id: endorsement.id }, data: { status: "REJECTED" } }),
-        prisma.endorsementApprovalHistory.create({
+      await prisma.$transaction(async (tx) => {
+        // Same atomic SUBMITTED-only claim as approveEndorsementRecord, so a
+        // concurrent approve and reject can't both succeed.
+        const claim = await tx.endorsementRequest.updateMany({
+          where: { id: endorsement.id, status: "SUBMITTED" },
+          data: { status: "REJECTED" },
+        });
+        if (claim.count !== 1) {
+          throw new HttpError(409, "This endorsement has already been decided");
+        }
+        await tx.endorsementApprovalHistory.create({
           data: {
             endorsement_request_id: endorsement.id,
             approver_id: req.user.userId,
@@ -1855,8 +2041,8 @@ router.post(
             comments: req.body.remarks,
             decision_date: new Date(),
           },
-        }),
-      ]);
+        });
+      });
 
       res.json({ id: endorsement.id, status: "REJECTED" });
     } catch (err) {

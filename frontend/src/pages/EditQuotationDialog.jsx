@@ -30,10 +30,7 @@ import { currentVehicleValue, findApplicableValueTier } from "../utils/vehicleVa
 import { NumberField } from "../components/NumberField";
 import { PdfViewer } from "../components/PdfViewer";
 import { canOverrideBackdating, todayFloorLocal } from "../utils/backdating";
-
-const DOC_STAMPS_RATE = 0.125;
-const VAT_RATE = 0.12;
-const LGT_RATE = 0.002;
+import { computeChargeTotals, seatsBracketCharge } from "../utils/charges";
 
 // Same as QuotationCreator.jsx's helper of the same name — coverage_end_at
 // is always start-plus-whole-days, never entered directly.
@@ -141,9 +138,13 @@ function resolveCoverageSelection(cov, selection, vehicles, addressValue, asOf) 
       // split into seats_exceed_threshold_amount-sized brackets, each
       // charged seats_exceed_threshold_price.
       coverageAmount = seats * Number(tier.insured_amount_per_occupant);
-      const excessValue = Math.max(0, coverageAmount - Number(cov.seats_threshold_amount));
-      const brackets = Number(cov.seats_exceed_threshold_amount) > 0 ? excessValue / Number(cov.seats_exceed_threshold_amount) : 0;
-      payablePerVehicle = brackets * Number(cov.seats_exceed_threshold_price);
+      // Brackets are "per bracket or fraction thereof" (rounded up).
+      payablePerVehicle = seatsBracketCharge(
+        coverageAmount,
+        cov.seats_threshold_amount,
+        cov.seats_exceed_threshold_amount,
+        cov.seats_exceed_threshold_price
+      );
     } else {
       coverageAmount = Number(selection.coverage_amount) || 0;
       payablePerVehicle = coverageAmount * Number(cov.rate);
@@ -195,7 +196,17 @@ function reconstructSelections(detail, isMotor) {
   const groups = new Map();
   for (const c of detail.coverages) {
     if (!groups.has(c.coverage_id)) {
-      groups.set(c.coverage_id, { indices: [], amount: c.amount, premium: c.premium });
+      // A VEHICLE_SEATS_BASED row's stored amount is the resolved total
+      // (seats × the agent-picked per-occupant tier), but the selection's
+      // coverage_amount is the tier key itself — recover it by dividing back
+      // out by this row's own vehicle's seat count (mirrors backend
+      // policyQuotations.js's submit reconstruction).
+      let amount = c.amount;
+      if (c.pricing_mode === "VEHICLE_SEATS_BASED") {
+        const seats = Number(detail.vehicles?.[c.vehicle_index ?? 0]?.no_of_seats);
+        if (seats > 0) amount = Math.round((Number(c.amount) / seats) * 100) / 100;
+      }
+      groups.set(c.coverage_id, { indices: [], amount, premium: c.premium });
     }
     const g = groups.get(c.coverage_id);
     if (isMotor && c.vehicle_index !== null && c.vehicle_index !== undefined) {
@@ -215,13 +226,17 @@ function reconstructSelections(detail, isMotor) {
 }
 
 export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved }) {
-  const { permissions } = useAuth();
+  const { permissions, agent } = useAuth();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   const [detail, setDetail] = useState(null);
   const [rawCoverages, setRawCoverages] = useState([]);
+  // The variant's own flat misc_fee — the Miscellaneous base. Not
+  // detail.misc, which already includes every is_misc coverage's premium
+  // and would double-count them once they're added back below.
+  const [variantMiscFee, setVariantMiscFee] = useState(0);
 
   const [coverageStartAt, setCoverageStartAt] = useState("");
   const [coveragePeriodDays, setCoveragePeriodDays] = useState("");
@@ -243,7 +258,17 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
     let cancelled = false;
     setLoading(true);
     setError("");
-    Promise.all([getQuotation(token, quotationId), getProductCatalog(token)])
+    // The catalog has to be annotated with the quotation's own agent's
+    // effective rates — the admin-only ?agent_id= is sent only when an
+    // ADMIN_CREATE_QUOTATION caller is editing someone else's quotation (a
+    // non-admin would 403 on it, and only ever edits their own anyway).
+    const canAdminCreate = permissions?.includes("QUOTATION_TRACKER.ADMIN_CREATE_QUOTATION");
+    getQuotation(token, quotationId)
+      .then((q) =>
+        getProductCatalog(token, canAdminCreate && q.agent_id && q.agent_id !== agent?.id ? q.agent_id : undefined).then(
+          (catalog) => [q, catalog]
+        )
+      )
       .then(([q, catalog]) => {
         if (cancelled) return;
         const isMotor = q.class_name === "Motor";
@@ -265,12 +290,16 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
           .flatMap((cls) => cls.product_variants)
           .find((v) => v.id === q.product_variant_id);
         setRawCoverages(variant ? variant.product_coverages : []);
+        setVariantMiscFee(Number(variant?.misc_fee) || 0);
       })
       .catch((err) => !cancelled && setError(err.message))
       .finally(() => !cancelled && setLoading(false));
     return () => {
       cancelled = true;
     };
+    // permissions/agent deliberately not deps — re-fetching on an auth
+    // refresh would wipe an in-progress edit (see initialSnapshot above).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [quotationId, token]);
 
   const isMotor = detail?.class_name === "Motor";
@@ -355,17 +384,21 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
   // this independently and always wins.
   const canBackdate = canOverrideBackdating(permissions);
 
-  const totalPremium = Object.entries(coverageSelections).reduce((sum, [coverageId, selection]) => {
+  // Same is_misc split as the server's computeChargeTotals (utils/charges.js).
+  const chargeRows = Object.entries(coverageSelections).flatMap(([coverageId, selection]) => {
     const cov = coverages.find((c) => c.id === coverageId);
-    if (!cov) return sum;
+    if (!cov) return [];
     const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue, depreciationAsOf);
-    return sum + (resolved?.premium_amount || 0);
-  }, 0);
-  const docStamps = totalPremium * DOC_STAMPS_RATE;
-  const vat = totalPremium * VAT_RATE;
-  const lgt = totalPremium * LGT_RATE;
-  const miscAmount = Number(detail?.misc) || 0;
-  const totalAmount = totalPremium + docStamps + vat + lgt + miscAmount;
+    return [{ premium_amount: resolved?.premium_amount || 0, is_misc: Boolean(cov.is_misc) }];
+  });
+  const {
+    totalPremium,
+    docStamps,
+    vat,
+    lgt,
+    misc: miscAmount,
+    totalAmount,
+  } = computeChargeTotals(chargeRows, variantMiscFee);
 
   // "Preview changes" has nothing to show until the form actually diverges
   // from what was just loaded — comparing against initialSnapshot rather
@@ -608,16 +641,30 @@ export function EditQuotationDialog({ open, quotationId, token, onClose, onSaved
         color: v.color || "",
         no_of_seats: v.no_of_seats ?? "",
       })),
-      coverages: Object.entries(coverageSelections).map(([id, sel]) => {
+      // One row per targeted vehicle (each with its own amount/premium),
+      // the same shape the saved quotation's own rows have.
+      coverages: Object.entries(coverageSelections).flatMap(([id, sel]) => {
         const cov = coverages.find((c) => c.id === id);
-        const resolved = cov ? resolveCoverageSelection(cov, sel, coverageVehicles, riskAddressValue, depreciationAsOf) : null;
-        return {
-          name: cov?.coverage_name || "",
-          clause: cov?.clause || "",
-          amount: resolved?.coverage_amount || 0,
-          premium: resolved?.premium_amount || 0,
-          pricing_mode: cov?.pricing_mode,
-        };
+        if (!cov) return [];
+        const scopedToAll = sel.vehicle_indices === null || sel.vehicle_indices === undefined;
+        const targetIndices =
+          coverageVehicles.length === 0 ? [null] : scopedToAll ? coverageVehicles.map((_, i) => i) : sel.vehicle_indices;
+        return targetIndices.map((idx) => {
+          const resolved = resolveCoverageSelection(
+            cov,
+            idx === null ? sel : { ...sel, vehicle_indices: [idx] },
+            coverageVehicles,
+            riskAddressValue,
+            depreciationAsOf
+          );
+          return {
+            name: cov.coverage_name || "",
+            clause: cov.clause || "",
+            amount: resolved?.coverage_amount || 0,
+            premium: resolved?.premium_amount || 0,
+            pricing_mode: cov.pricing_mode,
+          };
+        });
       }),
       deductibleRate: detail.deductible_rate,
       minimumDeductibleAmount: detail.minimum_deductible_amount,

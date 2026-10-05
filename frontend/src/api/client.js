@@ -1,11 +1,34 @@
-// VITE_API_URL is an explicit override (e.g. pointing at a staging backend).
-// Left unset, this derives the backend's address from whatever host the page
-// itself was loaded from, on the known dev port — so the same build works
-// from http://localhost:5173 *and* from http://<lan-ip>:5173 when another
-// device on the network opens it, without hardcoding "localhost" (which
-// would otherwise resolve to that device itself, not this machine, and every
-// API call would fail to connect).
-const API_URL = import.meta.env.VITE_API_URL || `http://${window.location.hostname}:4000`;
+// VITE_API_URL is an explicit override (e.g. pointing at a different backend).
+// Left unset:
+// - a production build (UAT/prod Docker image) is served by the backend's
+//   own Express process, so the API is same-origin under /api;
+// - in dev (Vite on :5173) this derives the backend's address from whatever
+//   host the page itself was loaded from, on the known dev port — so the same
+//   setup works from http://localhost:5173 *and* from http://<lan-ip>:5173
+//   when another device on the network opens it, without hardcoding
+//   "localhost" (which would resolve to that device itself, not this machine).
+// Every backend route is mounted under /api (see backend/src/index.js).
+const API_URL =
+  import.meta.env.VITE_API_URL ||
+  (import.meta.env.PROD ? "/api" : `http://${window.location.hostname}:4000/api`);
+
+// Mirrors AuthContext's own localStorage keys. Kept here (rather than calling
+// into AuthContext) because this module is plain JS with no React access.
+const TOKEN_STORAGE_KEYS = ["token", "user"];
+
+// A 401 on a request that *sent* a token means that token is expired or
+// otherwise no longer valid — clear the stored session and send the user back
+// to the login page. A full page load (not a router navigate) is deliberate:
+// it resets every bit of in-memory React state (AuthContext, open dialogs)
+// along with localStorage. Requests without a token (login, forgot-password)
+// are never redirected — a 401 there is just "wrong password".
+function handleUnauthorized(token, status) {
+  if (status !== 401 || !token) return;
+  for (const key of TOKEN_STORAGE_KEYS) localStorage.removeItem(key);
+  if (window.location.pathname !== "/login") {
+    window.location.replace("/login?expired=1");
+  }
+}
 
 async function request(path, { method = "GET", body, token } = {}) {
   const headers = { "Content-Type": "application/json" };
@@ -18,6 +41,7 @@ async function request(path, { method = "GET", body, token } = {}) {
     headers,
     body: body ? JSON.stringify(body) : undefined,
   });
+  handleUnauthorized(token, res.status);
 
   const data = await res.json().catch(() => null);
 
@@ -61,6 +85,7 @@ async function requestBlob(path, { method = "GET", body, token } = {}) {
     headers,
     body: body ? JSON.stringify(body) : undefined,
   });
+  handleUnauthorized(token, res.status);
 
   if (!res.ok) {
     const data = await res.json().catch(() => null);
@@ -133,8 +158,13 @@ export function createRole(token, { role_name, description, permission_ids }) {
   });
 }
 
-export function getProductCatalog(token) {
-  return request("/product-catalog", { token });
+// agentId (optional, admin-only server-side) annotates the catalog with that
+// agent's own effective rates instead of the caller's — pass it only when
+// filing for a different agent than the caller's own, since a non-admin
+// caller sending it gets a 403.
+export function getProductCatalog(token, agentId) {
+  const query = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+  return request(`/product-catalog${query}`, { token });
 }
 
 export function listCoverages(token) {
@@ -222,6 +252,7 @@ export function updateCustomer(token, id, payload) {
 export async function lookupCustomerByContact(token, query) {
   const headers = { Authorization: `Bearer ${token}` };
   const res = await fetch(`${API_URL}/customers/lookup?query=${encodeURIComponent(query)}`, { headers });
+  handleUnauthorized(token, res.status);
   if (res.status === 404) {
     return null;
   }
@@ -261,6 +292,7 @@ export function updateCompany(token, id, payload) {
 export async function lookupCompanyByContact(token, query) {
   const headers = { Authorization: `Bearer ${token}` };
   const res = await fetch(`${API_URL}/companies/lookup?query=${encodeURIComponent(query)}`, { headers });
+  handleUnauthorized(token, res.status);
   if (res.status === 404) {
     return null;
   }
@@ -286,6 +318,7 @@ export function updateVehicle(token, id, payload) {
 export async function lookupVehicleByPlate(token, plateNumber) {
   const headers = { Authorization: `Bearer ${token}` };
   const res = await fetch(`${API_URL}/vehicles/lookup?plate_number=${encodeURIComponent(plateNumber)}`, { headers });
+  handleUnauthorized(token, res.status);
   if (res.status === 404) {
     return null;
   }

@@ -2,9 +2,9 @@ const express = require("express");
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
 const { requireAnyPermission, INTAKE_PERMISSIONS } = require("../middleware/permissions");
-const { validateBody, validateQuery } = require("../middleware/validate");
+const { validateBody, validateQuery, validateParams } = require("../middleware/validate");
 const { getCurrentAgentId } = require("../lib/agent");
-const { updateVehicleSchema, lookupVehicleQuerySchema } = require("../schemas/vehicles");
+const { updateVehicleSchema, lookupVehicleQuerySchema, vehicleIdParamSchema } = require("../schemas/vehicles");
 const { currentVehicleValue } = require("../lib/vehicleValue");
 const { assertVehicleIdentifiersUnique } = require("../lib/vehicleUniqueness");
 const { sendIfHttpError } = require("../lib/httpError");
@@ -123,7 +123,7 @@ async function agentCanEditVehicle(agentId, vehicleId) {
   return Boolean(owned);
 }
 
-router.patch("/:id", validateBody(updateVehicleSchema), async (req, res, next) => {
+router.patch("/:id", validateParams(vehicleIdParamSchema), validateBody(updateVehicleSchema), async (req, res, next) => {
   try {
     const { id } = req.params;
     const agentId = await getCurrentAgentId(req.user.userId);

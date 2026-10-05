@@ -17,8 +17,8 @@ const { getAccessibleAgentIds } = require("../lib/agent");
 const { round2, resolveCoverageRows, getRequiredCoverageIds } = require("../lib/coveragePricing");
 const { resolveVehicleRenewal, resolveRiskAddressRenewal } = require("../lib/policyConflicts");
 const { assertVehicleIdentifiersUnique } = require("../lib/vehicleUniqueness");
-const { assertCoverageStartNotBackdated } = require("../lib/backdating");
-const { sendIfHttpError } = require("../lib/httpError");
+const { assertCoverageStartNotBackdated, canOverrideBackdating } = require("../lib/backdating");
+const { HttpError, sendIfHttpError } = require("../lib/httpError");
 const { sendMail } = require("../lib/mailer");
 const { buildSubmissionEmailContent } = require("../lib/applicationEmails");
 const { buildQuotationPdf } = require("../pdf/quotationPdf");
@@ -86,7 +86,10 @@ async function resolveScope(req, res, baseCode, adminCode, actingPermissions) {
 // this only decides *whose* agent, not whether creating is allowed at all.
 async function resolveWriteAgent(req, res, actingPermissions) {
   const requestedAgentId = req.body?.agent_id;
-  if (requestedAgentId) {
+  const user = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { agent_id: true } });
+  // Naming your own agent explicitly is the same as omitting it — only a
+  // *different* agent needs ADMIN_CREATE_QUOTATION.
+  if (requestedAgentId && requestedAgentId !== user?.agent_id) {
     if (!ensurePermission(res, actingPermissions, ADMIN_CREATE_CODE)) return null;
     const agent = await prisma.agent.findUnique({ where: { id: requestedAgentId } });
     if (!agent) {
@@ -95,7 +98,6 @@ async function resolveWriteAgent(req, res, actingPermissions) {
     }
     return agent;
   }
-  const user = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { agent_id: true } });
   if (!user?.agent_id) {
     res.status(400).json({ error: "Your account isn't linked to an agent profile" });
     return null;
@@ -310,10 +312,20 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
 
     const productVariant = await prisma.productVariant.findUnique({
       where: { id: product_variant_id },
-      select: { misc_fee: true, gross_target_coverage_id: true, insurance_class: { select: { class_name: true } } },
+      select: {
+        misc_fee: true,
+        gross_target_coverage_id: true,
+        status: true,
+        insurance_class: { select: { class_name: true, status: true } },
+      },
     });
     if (!productVariant) {
       return res.status(400).json({ error: "product_variant_id does not match an existing product" });
+    }
+    // A soft-deleted variant (or one under a soft-deleted class) is no
+    // longer sold — same check as routes/policyApplications.js.
+    if (productVariant.status !== "ACTIVE" || productVariant.insurance_class.status !== "ACTIVE") {
+      return res.status(400).json({ error: "This product variant is no longer offered" });
     }
     const className = productVariant.insurance_class.class_name;
     const requiresRiskAddress = className === "Property";
@@ -370,6 +382,12 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
           where: { id: v.existing_vehicle_id },
           select: { estimated_value: true, initial_assessment_date: true },
         });
+        // Same reassigned-but-not-yet-assessed case as
+        // routes/policyApplications.js — price off the client-sent value the
+        // reassign_owner write branch below actually saves.
+        if (v.reassign_owner && !dbVehicle?.initial_assessment_date && v.estimated_value !== undefined) {
+          return currentVehicleValue(v.estimated_value ?? null, null);
+        }
         return currentVehicleValue(dbVehicle?.estimated_value, dbVehicle?.initial_assessment_date, startAt);
       }
       if (v.estimated_value !== undefined) {
@@ -432,6 +450,7 @@ router.post("/", validateBody(createQuotationSchema), async (req, res, next) => 
       targetGrossAmount: pricing_input_mode === "TARGET_GROSS" ? target_gross_amount : undefined,
       miscFee: productVariant.misc_fee,
       grossTargetCoverageId: productVariant.gross_target_coverage_id,
+      productVariantId: product_variant_id,
     });
 
     // Same is_misc split as applications (see policyApplications.js's own
@@ -773,6 +792,7 @@ const quotationDetailSelect = {
   customer: { select: { first_name: true, last_name: true, middle_name: true, email: true } },
   company_name_snapshot: true,
   company: { select: { email: true } },
+  agent_id: true,
   agent: { select: { agent_code: true, agent_name: true } },
   product_variant_id: true,
   product_variant: {
@@ -864,6 +884,10 @@ function toQuotationDetail(quotation) {
   return {
     id: quotation.id,
     quotation_number: quotation.quotation_number,
+    // The quotation's own filing agent — EditQuotationDialog.jsx passes it to
+    // GET /product-catalog?agent_id= so its live preview prices off this
+    // agent's rates, not an admin editor's own.
+    agent_id: quotation.agent_id,
     insured_type: quotation.insured_type,
     insured_name:
       quotation.insured_type === "INDIVIDUAL"
@@ -1108,6 +1132,7 @@ router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(update
       agentId: quotation.agent_id,
       startAt,
       endAt,
+      productVariantId: quotation.product_variant_id,
     });
 
     // Same is_misc split as POST / above.
@@ -1133,6 +1158,22 @@ router.patch("/:id", validateParams(quotationIdParamSchema), validateBody(update
     }
 
     const updated = await prisma.$transaction(async (tx) => {
+      // The converted check above ran outside this transaction. Touching the
+      // quotation row first takes its row lock (POST /:id/submit takes the
+      // same one), so a concurrent submit is serialized against this edit,
+      // then the check is repeated against now-settled state — a quotation
+      // can never be re-priced after it has already become an application.
+      await tx.policyQuotation.update({ where: { id: quotation.id }, data: { updated_at: new Date() } });
+      const convertedMeanwhile = await tx.policyApplication.findUnique({
+        where: { source_quotation_id: quotation.id },
+        select: { application_number: true },
+      });
+      if (convertedMeanwhile) {
+        throw new HttpError(
+          409,
+          `This quotation has already been submitted as policy application ${convertedMeanwhile.application_number} and can no longer be edited`
+        );
+      }
       await tx.quotationCoverage.deleteMany({ where: { quotation_id: quotation.id } });
       await tx.quotationCoverage.createMany({
         data: resolvedRows.map((r) => ({
@@ -1250,6 +1291,15 @@ router.post("/:id/submit", validateParams(quotationIdParamSchema), validateBody(
         .json({ error: `This quotation has already been submitted as policy application ${quotation.converted_application.application_number}` });
     }
 
+    // Same "no backdating an inception date" rule as POST / and PATCH /:id —
+    // a quotation drafted a while ago can have a coverage_start_at that's
+    // since slipped into the past, and this is the moment it becomes a
+    // binding application.
+    assertCoverageStartNotBackdated(quotation.coverage_start_at, {
+      actingPermissions,
+      allowBackdating: canOverrideBackdating(actingPermissions),
+    });
+
     const { payment_method, payment_remittance, bethel_payment_method_id, send_policy_to_email, send_policy_to_email_on_approval } = req.body;
     let bethelPaymentMethod = null;
     if (bethel_payment_method_id) {
@@ -1342,12 +1392,32 @@ router.post("/:id/submit", validateParams(quotationIdParamSchema), validateBody(
       agentId: quotation.agent_id,
       startAt: quotation.coverage_start_at,
       endAt: quotation.coverage_end_at,
+      productVariantId: quotation.product_variant_id,
     });
     // Keyed by (coverage, vehicle) exactly like the quotation's own already-
     // expanded rows, so each one can be updated with its own freshly
     // resolved payable_to_bethel/applied_rate below — see the
     // applicationCoverage.createMany call further down.
     const freshRowByKey = new Map(freshlyResolvedRows.map((r) => [`${r.coverage_id}:${r.vehicle_index ?? "null"}`, r]));
+
+    // The application carries over the quotation's own coverage_amount/
+    // premium/totals verbatim, while payable_to_bethel/applied_rate come from
+    // the fresh resolve above. If the insured amount itself has moved since
+    // quoting (a vehicle's value corrected, a seat count changed, a tier
+    // re-keyed), those two halves would describe different coverages — so
+    // refuse and have the agent re-price the quotation first instead.
+    for (const c of quotation.coverages) {
+      const vehicleIndex = c.policy_quotation_vehicle_id
+        ? vehicleIndexByQuotationVehicleId.get(c.policy_quotation_vehicle_id)
+        : null;
+      const fresh = freshRowByKey.get(`${c.coverage_id}:${vehicleIndex ?? "null"}`);
+      if (!fresh || round2(Number(fresh.coverage_amount)) !== round2(Number(c.coverage_amount))) {
+        return res.status(409).json({
+          error:
+            "The insured amount for one or more coverages has changed since this quotation was priced (e.g. a vehicle's value or seat count was updated). Edit the quotation to re-price it before submitting.",
+        });
+      }
+    }
 
     // The rule the agent asked for: never let the same vehicle, or (for an
     // address-based/Property product) the same risk address, carry an
@@ -1369,7 +1439,14 @@ router.post("/:id/submit", validateParams(quotationIdParamSchema), validateBody(
     }
     const policyType = renewedPolicyId ? "RENEWAL" : "NEW_POLICY";
 
-    const result = await prisma.$transaction(async (tx) => {
+    let result;
+    try {
+      result = await prisma.$transaction(async (tx) => {
+      // Takes the quotation's row lock first — the same one PATCH /:id takes
+      // — so an in-flight edit and this conversion can't interleave. A
+      // concurrent second submit is caught by source_quotation_id's own
+      // unique index instead (P2002, mapped to 409 below).
+      await tx.policyQuotation.update({ where: { id: quotation.id }, data: { updated_at: new Date() } });
       const application = await tx.policyApplication.create({
         data: {
           insured_type: quotation.insured_type,
@@ -1449,7 +1526,17 @@ router.post("/:id/submit", validateParams(quotationIdParamSchema), validateBody(
       }
 
       return application;
-    });
+      });
+    } catch (txErr) {
+      // Not filtered on meta.target — its shape varies under the pg driver
+      // adapter, and the only other unique column written here
+      // (application_number) is a random code whose collision would be just
+      // as safe to report as a retryable conflict.
+      if (txErr?.code === "P2002") {
+        return res.status(409).json({ error: "This quotation has already been submitted as a policy application" });
+      }
+      throw txErr;
+    }
 
     // Same "notify on submission" email a fresh POST /policy-applications
     // sends — carried over from the quotation's own send_policy_to_email,

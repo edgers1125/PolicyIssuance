@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate, Link as RouterLink } from "react-router-dom";
+import { useNavigate, useSearchParams, Link as RouterLink } from "react-router-dom";
 import { Box, Paper, TextField, Button, Typography, Alert, Link } from "@mui/material";
 import { useAuth } from "../context/AuthContext";
 import { BrandMark } from "../components/BrandMark";
@@ -11,6 +11,10 @@ export function Login() {
   const [submitting, setSubmitting] = useState(false);
   const { login } = useAuth();
   const navigate = useNavigate();
+  // Set by api/client.js's 401 handler when an expired/invalid token bounced
+  // the user back here.
+  const [searchParams] = useSearchParams();
+  const sessionExpired = searchParams.get("expired") === "1";
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -81,6 +85,11 @@ export function Login() {
             </Link>
           </Typography>
 
+          {sessionExpired && !error && (
+            <Alert severity="info" sx={{ mt: 1 }}>
+              Your session has expired. Please log in again.
+            </Alert>
+          )}
           {error && (
             <Alert severity="error" sx={{ mt: 1 }}>
               {error}

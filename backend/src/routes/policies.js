@@ -710,9 +710,20 @@ router.get("/:id/renewal-prefill", requirePermission("VIEW_POLICIES"), validateP
         product_variant: {
           select: { insurance_class: { select: { id: true, class_name: true } } },
         },
-        vehicles: { select: { vehicle_id: true } },
+        vehicles: { select: { id: true, vehicle_id: true, no_of_seats_snapshot: true } },
         addresses: { select: { role: true, address_id: true } },
-        coverages: { select: { coverage_id: true, coverage_amount: true, premium_amount: true } },
+        // A coverage soft-deleted by an approved REMOVE_CLAUSE endorsement is
+        // no longer part of this policy, so it mustn't be renewed either.
+        coverages: {
+          where: { removed_at: null },
+          select: {
+            coverage_id: true,
+            coverage_amount: true,
+            premium_amount: true,
+            pricing_mode_snapshot: true,
+            policy_vehicle_id: true,
+          },
+        },
       },
     });
     if (!policy) {
@@ -751,6 +762,35 @@ router.get("/:id/renewal-prefill", requirePermission("VIEW_POLICIES"), validateP
       (new Date(policy.expiry_date).getTime() - new Date(policy.effective_date).getTime()) / 86400000
     );
 
+    // One selection per coverage (a multi-vehicle policy stores one row per
+    // vehicle for the same coverage — the wizard expects one entry each).
+    // A VEHICLE_SEATS_BASED row stores the resolved total (seats × the
+    // per-occupant tier), but the wizard's tier dropdown is keyed by the
+    // per-occupant amount itself — divide back out by the seat count it was
+    // priced at (the targeted vehicle's own snapshot, else the first
+    // vehicle's), same reconstruction POST /policy-quotations/:id/submit does.
+    const seatsByPolicyVehicleId = new Map(policy.vehicles.map((v) => [v.id, Number(v.no_of_seats_snapshot)]));
+    const renewalCoverages = [];
+    const seenCoverageIds = new Set();
+    for (const c of policy.coverages) {
+      if (seenCoverageIds.has(c.coverage_id)) continue;
+      seenCoverageIds.add(c.coverage_id);
+      let coverageAmount = c.coverage_amount;
+      if (c.pricing_mode_snapshot === "VEHICLE_SEATS_BASED") {
+        const seats = c.policy_vehicle_id
+          ? seatsByPolicyVehicleId.get(c.policy_vehicle_id)
+          : Number(policy.vehicles[0]?.no_of_seats_snapshot);
+        if (seats > 0) {
+          coverageAmount = Math.round((Number(c.coverage_amount) / seats) * 100) / 100;
+        }
+      }
+      renewalCoverages.push({
+        coverage_id: c.coverage_id,
+        coverage_amount: coverageAmount,
+        premium_amount: c.premium_amount,
+      });
+    }
+
     res.json({
       renewed_policy_id: policy.id,
       renewed_policy_number: policy.policy_number,
@@ -780,11 +820,7 @@ router.get("/:id/renewal-prefill", requirePermission("VIEW_POLICIES"), validateP
         initial_assessment_date: v.initial_assessment_date,
       })),
       coverage_period_days: coveragePeriodDays,
-      coverages: policy.coverages.map((c) => ({
-        coverage_id: c.coverage_id,
-        coverage_amount: c.coverage_amount,
-        premium_amount: c.premium_amount,
-      })),
+      coverages: renewalCoverages,
     });
   } catch (err) {
     next(err);

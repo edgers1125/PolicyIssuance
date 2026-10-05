@@ -60,6 +60,7 @@ import { currentVehicleValue, findApplicableValueTier } from "../utils/vehicleVa
 import { NumberField } from "../components/NumberField";
 import { PdfViewer } from "../components/PdfViewer";
 import { canOverrideBackdating, todayFloorLocal } from "../utils/backdating";
+import { DOC_STAMPS_RATE, VAT_RATE, LGT_RATE, computeChargeTotals, seatsBracketCharge } from "../utils/charges";
 
 const emptyCustomer = {
   first_name: "",
@@ -124,11 +125,6 @@ const emptyAddress = {
   estimated_value: "",
 };
 
-// Standard Philippine non-life insurance statutory rates, applied to total premium —
-// mirrors the same constants the backend uses when actually submitting.
-const DOC_STAMPS_RATE = 0.125;
-const VAT_RATE = 0.12;
-const LGT_RATE = 0.002;
 
 // Resolves a single vehicle's current (depreciated) value the same way the
 // server does — depreciated as of this filing's own coverage_start_at
@@ -253,12 +249,16 @@ function resolveCoverageSelection(cov, selection, vehicles, addressValue, asOf) 
         return { coverage_amount: 0, premium_amount: 0, payable_to_bethel: 0, pending: true };
       }
       // No charge up to seats_threshold_amount — the excess above it is
-      // split into seats_exceed_threshold_amount-sized brackets, each
-      // charged seats_exceed_threshold_price.
+      // split into seats_exceed_threshold_amount-sized brackets ("or fraction
+      // thereof" — a partial bracket counts whole), each charged
+      // seats_exceed_threshold_price.
       coverageAmount = seats * Number(tier.insured_amount_per_occupant);
-      const excessValue = Math.max(0, coverageAmount - Number(cov.seats_threshold_amount));
-      const brackets = Number(cov.seats_exceed_threshold_amount) > 0 ? excessValue / Number(cov.seats_exceed_threshold_amount) : 0;
-      payablePerVehicle = brackets * Number(cov.seats_exceed_threshold_price);
+      payablePerVehicle = seatsBracketCharge(
+        coverageAmount,
+        cov.seats_threshold_amount,
+        cov.seats_exceed_threshold_amount,
+        cov.seats_exceed_threshold_price
+      );
     } else {
       coverageAmount = Number(selection.coverage_amount) || 0;
       payablePerVehicle = coverageAmount * Number(cov.rate);
@@ -1088,6 +1088,12 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill, onRenewa
     lastCheckedCustomerContactRef.current = {};
     lastCheckedCompanyContactRef.current = {};
     loadParties(newAgentId).catch((err) => setError(err.message));
+    // Re-annotate the catalog with the chosen agent's own effective rates
+    // (admin-only ?agent_id=), so the live preview prices the way the server
+    // will for that agent rather than at the caller's own rates.
+    getProductCatalog(token, newAgentId || undefined)
+      .then(setCatalog)
+      .catch((err) => setError(err.message));
   }
 
   useEffect(() => {
@@ -1319,22 +1325,25 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill, onRenewa
         }
       : coverageSelections;
 
-  // Total premium is the sum of every selected coverage's resolved premium —
-  // the statutory charges below are derived from it, mirroring what the
-  // server will compute and store once this application is actually submitted.
-  const totalPremium = Object.entries(effectiveCoverageSelections).reduce((sum, [coverageId, selection]) => {
+  // Charges mirror the server's computeChargeTotals (utils/charges.js): an
+  // is_misc coverage's premium moves from Premium into Miscellaneous (on top
+  // of the variant's own flat misc_fee), while doc stamps/VAT/LGT still tax
+  // the full premium sum.
+  const chargeRows = Object.entries(effectiveCoverageSelections).flatMap(([coverageId, selection]) => {
     const cov = coverages.find((c) => c.id === coverageId);
-    if (!cov) return sum;
+    if (!cov) return [];
     const resolved = resolveCoverageSelection(cov, selection, coverageVehicles, riskAddressValue, depreciationAsOf);
-    return sum + (resolved?.premium_amount || 0);
-  }, 0);
-  const docStamps = totalPremium * DOC_STAMPS_RATE;
-  const vat = totalPremium * VAT_RATE;
-  const lgt = totalPremium * LGT_RATE;
-  // No longer agent-entered — a flat fee fixed per product variant (see
-  // ProductVariant.misc_fee), the same figure the server itself charges.
-  const miscAmount = Number(selectedVariant?.misc_fee) || 0;
-  const totalAmount = totalPremium + docStamps + vat + lgt + miscAmount;
+    return [{ premium_amount: resolved?.premium_amount || 0, is_misc: Boolean(cov.is_misc) }];
+  });
+  const {
+    grossPremium,
+    totalPremium,
+    docStamps,
+    vat,
+    lgt,
+    misc: miscAmount,
+    totalAmount,
+  } = computeChargeTotals(chargeRows, selectedVariant?.misc_fee);
 
   const selectedPartyId =
     insuredType === "INDIVIDUAL" ? newCustomer.existing_customer_id : newCompany.existing_company_id;
@@ -2266,27 +2275,35 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill, onRenewa
     coverageStartAt,
     coverageEndAt,
     vehicles: isMotor ? vehicles : [],
-    coverages: Object.entries(effectiveCoverageSelections).map(([id, sel]) => {
+    // One row per targeted vehicle, each with that vehicle's own
+    // amount/premium — the same shape a saved application's coverage rows
+    // have — so the PDF's per-vehicle Section III deductible and occupant
+    // line compute off one vehicle's figures, not a cross-vehicle sum.
+    coverages: Object.entries(effectiveCoverageSelections).flatMap(([id, sel]) => {
       const cov = coverages.find((c) => c.id === id);
-      const resolved = cov ? resolveCoverageSelection(cov, sel, coverageVehicles, riskAddressValue, depreciationAsOf) : null;
-      // Only worth spelling out which vehicle(s) a coverage applies to when
-      // there's more than one on the application — otherwise it's implicit.
+      if (!cov) return [];
       const scopedToAll = sel.vehicle_indices === null || sel.vehicle_indices === undefined;
-      const vehicleLabel =
-        coverageVehicles.length > 1
-          ? scopedToAll
-            ? " (all vehicles)"
-            : ` (${sel.vehicle_indices
-                .map((i) => coverageVehicles[i]?.plate_number || `Vehicle ${i + 1}`)
-                .join(", ")})`
-          : "";
-      return {
-        name: (cov?.coverage_name || "") + vehicleLabel,
-        clause: cov?.clause || "",
-        amount: resolved?.coverage_amount || 0,
-        premium: resolved?.premium_amount || 0,
-        pricing_mode: cov?.pricing_mode,
-      };
+      const targetIndices =
+        coverageVehicles.length === 0 ? [null] : scopedToAll ? coverageVehicles.map((_, i) => i) : sel.vehicle_indices;
+      return targetIndices.map((idx) => {
+        const resolved =
+          idx === null
+            ? resolveCoverageSelection(cov, sel, coverageVehicles, riskAddressValue, depreciationAsOf)
+            : resolveCoverageSelection(cov, { ...sel, vehicle_indices: [idx] }, coverageVehicles, riskAddressValue, depreciationAsOf);
+        // Only worth naming the vehicle when there's more than one on the
+        // application — otherwise it's implicit.
+        const vehicleLabel =
+          idx !== null && coverageVehicles.length > 1
+            ? ` (${coverageVehicles[idx]?.plate_number || `Vehicle ${idx + 1}`})`
+            : "";
+        return {
+          name: cov.coverage_name + vehicleLabel,
+          clause: cov.clause || "",
+          amount: resolved?.coverage_amount || 0,
+          premium: resolved?.premium_amount || 0,
+          pricing_mode: cov.pricing_mode,
+        };
+      });
     }),
     deductibleRate: selectedVariant?.deductible_rate,
     minimumDeductibleAmount: selectedVariant?.minimum_deductible_amount,
@@ -3660,7 +3677,7 @@ export function PolicyApplication({ onClose, onCreated, renewalPrefill, onRenewa
             </Stack>
           </Paper>
 
-          {totalPremium > 0 && (
+          {grossPremium > 0 && (
             <Paper sx={{ p: { xs: 2, sm: 3 }, borderRadius: 3 }}>
               <Typography variant="subtitle1" sx={{ fontWeight: 600, mb: 2 }}>
                 Charges

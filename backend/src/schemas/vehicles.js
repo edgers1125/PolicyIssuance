@@ -37,4 +37,10 @@ const lookupVehicleQuerySchema = z.object({
   plate_number: requiredString("plate_number"),
 });
 
-module.exports = { updateVehicleSchema, lookupVehicleQuerySchema };
+// PATCH /:id — rejects a malformed id with a 400 before it reaches Prisma
+// (where a non-uuid literal against a uuid column would 500).
+const vehicleIdParamSchema = z.object({
+  id: z.string().uuid("id must be a valid UUID"),
+});
+
+module.exports = { updateVehicleSchema, lookupVehicleQuerySchema, vehicleIdParamSchema };

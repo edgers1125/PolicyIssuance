@@ -1,0 +1,6 @@
+# UAT stack secrets (see .env.uat.example)
+.env.uat
+# Built frontend copied in by Dockerfile.uat — never committed
+backend/public
+# Local DB dumps — contain real data, never commit
+policyissuance_backup*.sql

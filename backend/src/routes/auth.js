@@ -6,6 +6,9 @@ const { signToken } = require("../utils/jwt");
 const { validateBody } = require("../middleware/validate");
 const { loginSchema, forgotPasswordSchema, setPasswordSchema } = require("../schemas/auth");
 const { sendMail } = require("../lib/mailer");
+const { requireUrlEnv } = require("../utils/env");
+
+const FRONTEND_URL = requireUrlEnv("FRONTEND_URL");
 
 const router = express.Router();
 
@@ -25,6 +28,18 @@ router.post("/login", validateBody(loginSchema), async (req, res, next) => {
 
     if (!passwordMatches) {
       return res.status(401).json({ error: "Invalid email or password" });
+    }
+
+    // Checked only after the password matches, so an unauthenticated caller
+    // can't use this to learn an account's status. A non-ACTIVE account would
+    // otherwise get a token with zero permissions (see getUserPermissionCodes)
+    // — refusing the login outright is clearer than a blank dashboard.
+    if (user.status !== "ACTIVE") {
+      const error =
+        user.status === "AWAITING_EMAIL_VERIFICATION"
+          ? "Your account hasn't been verified yet. Use the link in your invite/verification email to set your password first."
+          : "Your account is not active. Please contact your administrator.";
+      return res.status(403).json({ error });
     }
 
     const token = signToken({ userId: user.id, email: user.email });
@@ -62,7 +77,7 @@ router.post("/forgot-password", validateBody(forgotPasswordSchema), async (req, 
         },
       });
 
-      const resetLink = `${process.env.FRONTEND_URL}/set-password?token=${resetToken}`;
+      const resetLink = `${FRONTEND_URL}/set-password?token=${resetToken}`;
 
       // Always log the link too, regardless of send outcome — the same
       // fallback the invite flow relies on when SMTP is down.

@@ -404,7 +404,16 @@ export function PolicyDetailDialog({ open, policyId, policyNumber, token, onClos
     return requestType === "CANCELLATION" ? [] : queuedChanges.map(({ _key, _display, ...rest }) => rest);
   }
 
-  const canPreview = requestType === "CANCELLATION" ? Boolean(remarks.trim()) : queuedChanges.length > 0;
+  // A cancellation can never take effect before today (today itself is
+  // fine) — a UX guardrail only; the server enforces this independently.
+  // Plain "YYYY-MM-DD" strings compare correctly as text.
+  const cancellationDateTooEarly =
+    requestType === "CANCELLATION" && Boolean(effectiveDate) && effectiveDate < todayDateInput();
+
+  const canPreview =
+    requestType === "CANCELLATION"
+      ? Boolean(remarks.trim()) && Boolean(effectiveDate) && !cancellationDateTooEarly
+      : queuedChanges.length > 0;
 
   async function handlePreview() {
     setPreviewOpen(true);
@@ -676,7 +685,14 @@ export function PolicyDetailDialog({ open, policyId, policyNumber, token, onClos
                             onChange={(e) => setEffectiveDate(e.target.value)}
                             size="small"
                             fullWidth
-                            slotProps={{ inputLabel: { shrink: true } }}
+                            error={cancellationDateTooEarly}
+                            helperText={
+                              cancellationDateTooEarly ? "A cancellation can't take effect before today." : undefined
+                            }
+                            slotProps={{
+                              inputLabel: { shrink: true },
+                              htmlInput: isCancellation ? { min: todayDateInput() } : undefined,
+                            }}
                           />
 
                           {isCancellation ? (
@@ -1001,7 +1017,7 @@ export function PolicyDetailDialog({ open, policyId, policyNumber, token, onClos
             variant="contained"
             color={isCancellation ? "error" : "primary"}
             onClick={handleConfirmFile}
-            disabled={!confirmFile || filing || previewLoading || Boolean(previewError)}
+            disabled={!confirmFile || filing || previewLoading || Boolean(previewError) || cancellationDateTooEarly}
           >
             {filing ? "Filing..." : isCancellation ? "Confirm Cancellation" : "Confirm and File"}
           </Button>

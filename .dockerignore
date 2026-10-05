@@ -1,0 +1,17 @@
+# Keep the UAT build context lean and free of secrets/data.
+.git
+.vscode
+.claude
+.scratch2
+**/node_modules
+**/.env
+**/.env.*
+!.env.uat.example
+*.sql
+backend/generated
+backend/public
+backend/scripts
+backend/.agents
+backend/.claude
+backend/.windsurf
+frontend/dist

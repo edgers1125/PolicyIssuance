@@ -47,6 +47,7 @@ async function resolveCoverageRows({
   targetGrossAmount,
   miscFee,
   grossTargetCoverageId,
+  productVariantId,
 }) {
   // An individual agent linked to a company (Agent.company_id) prices off
   // that company's own AgentNetrate/AgentValuePercentageTier/
@@ -70,12 +71,28 @@ async function resolveCoverageRows({
       // charge instead of the Premium total — see routes/policyApplications.js's/
       // routes/policyQuotations.js's own split of resolvedRows by this flag.
       is_misc: true,
+      product_variant_id: true,
+      status: true,
       allowable_periods: { select: { coverage_in_days: true } },
     },
   });
   const coverageById = new Map(coverageDetails.map((c) => [c.id, c]));
   if (coverageDetails.length !== new Set(coverageIds).size) {
     throw new HttpError(400, "One or more coverages do not exist");
+  }
+  // Every coverage must actually belong to the filing's own product variant
+  // and still be ACTIVE — a soft-deleted coverage, or one borrowed from a
+  // different variant, must never be priced onto this filing just because a
+  // direct API call named its id.
+  if (productVariantId) {
+    for (const coverage of coverageDetails) {
+      if (coverage.product_variant_id !== productVariantId) {
+        throw new HttpError(400, `${coverage.coverage_name} is not offered under this product variant`);
+      }
+      if (coverage.status !== "ACTIVE") {
+        throw new HttpError(400, `${coverage.coverage_name} is no longer offered`);
+      }
+    }
   }
 
   // The whole application/quotation shares a single coverage_start_at/
@@ -250,12 +267,17 @@ async function resolveCoverageRows({
         // Total insured value for this vehicle under the picked tier — no
         // charge up to thresholdAmount; the excess above it is split into
         // exceedThresholdAmount-sized brackets, each charged
-        // exceedThresholdPrice (e.g. a ₱700,000 insured amount against a
-        // ₱350,000 threshold, ₱50,000 brackets and ₱50/bracket floors the
-        // premium at (350,000 / 50,000) * 50 = ₱350).
+        // exceedThresholdPrice "per bracket or fraction thereof" — a partial
+        // bracket counts as a whole one (Math.ceil), zero excess is zero
+        // brackets (e.g. a ₱700,000 insured amount against a ₱350,000
+        // threshold, ₱50,000 brackets and ₱50/bracket floors the premium at
+        // ceil(350,000 / 50,000) * 50 = ₱350; a ₱360,000 excess would be 8
+        // brackets, ₱400).
         const insuredValue = seats * Number(tier.insured_amount_per_occupant);
         const excessValue = Math.max(0, insuredValue - thresholdAmount);
-        const brackets = exceedThresholdAmount > 0 ? excessValue / exceedThresholdAmount : 0;
+        // The 1e-9 tolerance keeps float noise on an exact multiple (e.g.
+        // 7.0000000001) from rounding up to an extra bracket.
+        const brackets = exceedThresholdAmount > 0 ? Math.max(0, Math.ceil(excessValue / exceedThresholdAmount - 1e-9)) : 0;
         const payableToBethel = round2(brackets * exceedThresholdPrice);
         if (round2(premiumAmount) < payableToBethel) {
           throw new HttpError(400, belowBethelError(coverage.coverage_name, payableToBethel));

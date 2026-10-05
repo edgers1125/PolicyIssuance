@@ -12,6 +12,7 @@ const {
 } = require("../schemas/policyApproval");
 const { resolveVehicleRenewal, resolveRiskAddressRenewal } = require("../lib/policyConflicts");
 const { fetchByPriority } = require("../lib/priorityPagination");
+const { assertVehicleIdentifiersUnique } = require("../lib/vehicleUniqueness");
 const { computeDueDate } = require("../lib/agentPayables");
 const { applicationIdParamSchema } = require("../schemas/policyApplications");
 const {
@@ -253,11 +254,16 @@ router.get("/:id", validateParams(applicationIdParamSchema), async (req, res, ne
     // table's row-click always hits, so it's the one place this transition
     // can happen without a dedicated "start review" action. Only ever
     // advances forward (SUBMITTED -> UNDER_REVIEW, once); an application
-    // already under review or already decided is left exactly as-is.
+    // already under review or already decided is left exactly as-is. A
+    // conditional updateMany (not update) so a concurrent approve/reject that
+    // landed between the read above and this write can never be reverted.
     if (application.status === "SUBMITTED") {
-      application = await prisma.policyApplication.update({
-        where: { id: req.params.id },
+      await prisma.policyApplication.updateMany({
+        where: { id: req.params.id, status: "SUBMITTED" },
         data: { status: "UNDER_REVIEW" },
+      });
+      application = await prisma.policyApplication.findUnique({
+        where: { id: req.params.id },
         select: applicationDetailSelect,
       });
     }
@@ -406,6 +412,12 @@ router.post(
           const field = VEHICLE_FIELD_BY_CHANGE_TYPE[change_type];
           changeFrom = appVehicle.vehicle[field] ?? null;
           assertActuallyChanged(changeFrom, changeTo);
+          // Same identifier-uniqueness pre-check the create routes and
+          // PATCH /vehicles/:id run — a no-op for non-identifier fields
+          // (model/make/color/...), a friendly 409 instead of a raw unique-
+          // index 500 when a corrected plate/MV file/engine/chassis number
+          // already belongs to a different vehicle.
+          await assertVehicleIdentifiersUnique({ [field]: new_value }, { excludeVehicleId: appVehicle.vehicle_id });
           await tx.vehicle.update({ where: { id: appVehicle.vehicle_id }, data: { [field]: new_value } });
         } else if (change_type === "INSURED_ADDRESS_DETAILS") {
           const appAddress = await tx.policyApplicationAddress.findFirst({
@@ -531,6 +543,20 @@ router.post(
 // instead of writing directly to `res` (which this function no longer has)
 // — both call sites already wrap their own call in a try/catch ending with
 // sendIfHttpError(err, res).
+// Moves a still-undecided application to its terminal `status` in one
+// conditional write — must be the first statement inside the caller's
+// $transaction. 409s (rolling the transaction back) if another request
+// already decided it between the caller's own read and this write.
+async function claimPendingApplication(tx, applicationId, status) {
+  const { count } = await tx.policyApplication.updateMany({
+    where: { id: applicationId, status: { in: ["SUBMITTED", "UNDER_REVIEW"] } },
+    data: { status },
+  });
+  if (count !== 1) {
+    throw new HttpError(409, "This application has already been approved or rejected by someone else");
+  }
+}
+
 async function approveApplicationRecord({ applicationId, approverUserId, coc_number, sa_number }) {
     const application = await prisma.policyApplication.findUnique({
       where: { id: applicationId },
@@ -724,6 +750,13 @@ async function approveApplicationRecord({ applicationId, approverUserId, coc_num
     );
 
     const policy = await prisma.$transaction(async (tx) => {
+      // Claims the decision atomically before anything else is written — the
+      // status checks above ran outside this transaction, so a concurrent
+      // reject (or a second approve) could have landed since. If it did, this
+      // matches zero rows and the whole transaction rolls back, never
+      // issuing a Policy for an already-decided application.
+      await claimPendingApplication(tx, application.id, "APPROVED");
+
       const createdPolicy = await tx.policy.create({
         data: {
           policy_number: generatePolicyNumber(),
@@ -872,8 +905,6 @@ async function approveApplicationRecord({ applicationId, approverUserId, coc_num
         data: { payable: { increment: amountPayableToBethel } },
       });
 
-      await tx.policyApplication.update({ where: { id: application.id }, data: { status: "APPROVED" } });
-
       await tx.approvalHistory.create({
         data: {
           application_id: application.id,
@@ -953,9 +984,11 @@ router.post(
         return res.status(409).json({ error: "This application has already been rejected" });
       }
 
-      await prisma.$transaction([
-        prisma.policyApplication.update({ where: { id: application.id }, data: { status: "REJECTED" } }),
-        prisma.approvalHistory.create({
+      await prisma.$transaction(async (tx) => {
+        // Same atomic claim as approveApplicationRecord() — a concurrent
+        // approve that already issued a Policy makes this match zero rows.
+        await claimPendingApplication(tx, application.id, "REJECTED");
+        await tx.approvalHistory.create({
           data: {
             application_id: application.id,
             approver_id: req.user.userId,
@@ -963,8 +996,8 @@ router.post(
             comments: req.body.remarks,
             decision_date: new Date(),
           },
-        }),
-      ]);
+        });
+      });
 
       res.json({ id: application.id, status: "REJECTED" });
     } catch (err) {

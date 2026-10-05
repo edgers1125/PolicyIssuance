@@ -43,8 +43,8 @@ router.get("/overview", async (req, res, next) => {
         agent_code: a.agent_code,
         agent_name: a.agent_name,
         agent_type: a.agent_type,
-        total_payable: a.payable,
-        overdue_payable: balancesByAgentId.get(a.id)?.overduePayable || 0,
+        total_payable: Number(a.payable),
+        overdue_payable: Math.round((balancesByAgentId.get(a.id)?.overduePayable || 0) * 100) / 100,
         premiums_generated: totalsByAgentId.get(a.id)?.allTime || 0,
         premiums_generated_30d: totalsByAgentId.get(a.id)?.last30Days || 0,
       }))

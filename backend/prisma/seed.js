@@ -2,8 +2,9 @@ require("dotenv").config();
 const bcrypt = require("bcrypt");
 const { PrismaClient } = require("../generated/prisma");
 const { PrismaPg } = require("@prisma/adapter-pg");
+const { requireEnv } = require("../src/utils/env");
 
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
+const adapter = new PrismaPg({ connectionString: requireEnv("DATABASE_URL") });
 const prisma = new PrismaClient({ adapter });
 
 // A code with no dot (e.g. "MANAGE_USERS") is a top-level, page-access
@@ -227,15 +228,25 @@ async function main() {
     });
   }
 
-  const passwordHash = await bcrypt.hash("Password123!", 12);
+  // Super admin credentials come from the environment, never from source —
+  // this file is in git. `update: {}` means re-running the seed never resets
+  // an already-existing admin's password back to whatever the env says now.
+  const adminEmail = requireEnv("SEED_ADMIN_EMAIL").toLowerCase();
+  const adminPassword = requireEnv("SEED_ADMIN_PASSWORD");
+  if (adminPassword.length < 12) {
+    throw new Error("SEED_ADMIN_PASSWORD must be at least 12 characters");
+  }
+  const adminFullName = process.env.SEED_ADMIN_FULL_NAME?.trim() || "System Admin";
+
+  const passwordHash = await bcrypt.hash(adminPassword, 12);
 
   const user = await prisma.user.upsert({
-    where: { email: "admin@policyissuance.local" },
+    where: { email: adminEmail },
     update: {},
     create: {
-      email: "admin@policyissuance.local",
+      email: adminEmail,
       password_hash: passwordHash,
-      full_name: "System Admin",
+      full_name: adminFullName,
       status: "ACTIVE",
     },
   });
@@ -406,9 +417,7 @@ async function main() {
     await prisma.authorizedPaymentMethod.upsert({ where: { name }, update: {}, create: { name } });
   }
 
-  console.log("Seed complete. Log in with:");
-  console.log("  email:    admin@policyissuance.local");
-  console.log("  password: Password123!");
+  console.log(`Seed complete. Super admin: ${adminEmail} (password from SEED_ADMIN_PASSWORD).`);
 }
 
 main()

@@ -193,8 +193,15 @@ function buildPolicyApplicationPdf(props) {
     // other pricing mode (PERCENTAGE, FLAT_TIER) is a plain Coverage/Amount/
     // Premium row under Section IVA/IVB/PA/AOG & Others, same table shape as
     // before this split existed.
-    const valueCoverages = coverages.filter((c) => c.pricing_mode === "VALUE_PERCENTAGE");
-    const otherCoverages = coverages.filter((c) => c.pricing_mode !== "VALUE_PERCENTAGE");
+    // Section III ("Insured's Estimate of Value of Scheduled Vehicle" +
+    // the deductible/towing/repair-limit block) is vehicle-only — with no
+    // scheduled vehicle (e.g. Property, priced off a risk address's value)
+    // a VALUE_PERCENTAGE row is just a plain row in the Section IVA/IVB/PA/
+    // AOG & Others table instead.
+    const hasScheduledVehicle = vehicles.length > 0;
+    const isSectionIII = (c) => hasScheduledVehicle && c.pricing_mode === "VALUE_PERCENTAGE";
+    const valueCoverages = coverages.filter(isSectionIII);
+    const otherCoverages = coverages.filter((c) => !isSectionIII(c));
 
     const covCol1 = left;
     const covCol2 = left + pageWidth * 0.55;

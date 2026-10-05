@@ -11,6 +11,9 @@ const {
   updateRolePermissionsSchema,
 } = require("../schemas/users");
 const { sendMail } = require("../lib/mailer");
+const { requireUrlEnv } = require("../utils/env");
+
+const FRONTEND_URL = requireUrlEnv("FRONTEND_URL");
 
 // Shared by the new-user invite and the re-verification (email/password
 // change) cases below — both are "here's your link to set a password" mail,
@@ -351,7 +354,7 @@ router.post("/", requirePermission("MANAGE_USERS"), validateBody(createUserSchem
       });
     });
 
-    const inviteLink = `${process.env.FRONTEND_URL}/set-password?token=${inviteToken}`;
+    const inviteLink = `${FRONTEND_URL}/set-password?token=${inviteToken}`;
 
     // Always log the link too — the fallback the UI already relies on
     // (a manually-shareable link) if SMTP is down or unconfigured, so a
@@ -435,7 +438,7 @@ router.patch("/:id", requirePermission("MANAGE_USERS"), validateBody(updateUserS
       data.email_verified_at = null;
       data.invite_token = inviteToken;
       data.invite_token_expires_at = new Date(Date.now() + INVITE_TOKEN_TTL_MS);
-      inviteLink = `${process.env.FRONTEND_URL}/set-password?token=${inviteToken}`;
+      inviteLink = `${FRONTEND_URL}/set-password?token=${inviteToken}`;
     }
 
     await prisma.user.update({ where: { id }, data });

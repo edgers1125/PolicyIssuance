@@ -2,11 +2,14 @@ const prisma = require("../lib/prisma");
 
 // Union of permissions granted via the user's roles and any permissions
 // granted directly to the user (user_permissions acts as an override/extra grant).
-// An INACTIVE or SUSPENDED account loses every permission — dashboard-only —
-// regardless of what its roles/special grants would otherwise provide.
+// Any account that isn't ACTIVE (INACTIVE, SUSPENDED, or still
+// AWAITING_EMAIL_VERIFICATION) loses every permission — dashboard-only —
+// regardless of what its roles/special grants would otherwise provide. This
+// also covers a still-valid JWT issued before the account was deactivated or
+// had its email changed (which flips it back to AWAITING_EMAIL_VERIFICATION).
 async function getUserPermissionCodes(userId) {
   const user = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
-  if (!user || user.status === "INACTIVE" || user.status === "SUSPENDED") {
+  if (!user || user.status !== "ACTIVE") {
     return new Set();
   }
 

@@ -238,10 +238,20 @@ async function createApplicationRecord({ agent, body, allowBackdating = false })
 
   const productVariant = await prisma.productVariant.findUnique({
     where: { id: product_variant_id },
-    select: { misc_fee: true, gross_target_coverage_id: true, insurance_class: { select: { class_name: true } } },
+    select: {
+      misc_fee: true,
+      gross_target_coverage_id: true,
+      status: true,
+      insurance_class: { select: { class_name: true, status: true } },
+    },
   });
   if (!productVariant) {
     throw new HttpError(400, "product_variant_id does not match an existing product");
+  }
+  // A soft-deleted variant (or one under a soft-deleted class — see
+  // PATCH /manage-products/batch-delete) is no longer sold.
+  if (productVariant.status !== "ACTIVE" || productVariant.insurance_class.status !== "ACTIVE") {
+    throw new HttpError(400, "This product variant is no longer offered");
   }
   const className = productVariant.insurance_class.class_name;
   // Property carries its own risk location, separate from the address the
@@ -318,6 +328,13 @@ async function createApplicationRecord({ agent, body, allowBackdating = false })
           where: { id: v.existing_vehicle_id },
           select: { estimated_value: true, initial_assessment_date: true },
         });
+        // A not-yet-assessed vehicle being reassigned to this party gets the
+        // client-sent estimated_value written onto it (see the reassign_owner
+        // write branch below) — price off that same figure, not the stale
+        // one still on file, so the premium matches what's actually saved.
+        if (v.reassign_owner && !dbVehicle?.initial_assessment_date && v.estimated_value !== undefined) {
+          return currentVehicleValue(v.estimated_value ?? null, null);
+        }
         return currentVehicleValue(dbVehicle?.estimated_value, dbVehicle?.initial_assessment_date, startAt);
       }
       if (v.estimated_value !== undefined) {
@@ -414,6 +431,7 @@ async function createApplicationRecord({ agent, body, allowBackdating = false })
       targetGrossAmount: pricing_input_mode === "TARGET_GROSS" ? target_gross_amount : undefined,
       miscFee: productVariant.misc_fee,
       grossTargetCoverageId: productVariant.gross_target_coverage_id,
+      productVariantId: product_variant_id,
     });
 
     // Statutory charges are computed off the full sum of every coverage's
